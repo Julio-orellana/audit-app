@@ -1,0 +1,34 @@
+# Entorno virtual
+venv/
+env/
+.venv/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+
+# Django
+db.sqlite3
+db.sqlite3-journal
+staticfiles/
+media/
+
+# Backups locales de la base de datos (respaldo automático, no versionado)
+backups/*
+!backups/.gitkeep
+
+# Variables de entorno / secretos
+.env
+.env.*
+*.local
+
+# Editores / SO
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log

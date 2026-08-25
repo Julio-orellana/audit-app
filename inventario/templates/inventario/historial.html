@@ -1,0 +1,60 @@
+{% extends "base.html" %}
+{% block content %}
+<h1 style="margin:0 0 4px;font-size:22px;font-weight:800;">Historial de movimientos</h1>
+<p style="margin:0 0 24px;color:var(--ink-soft);font-size:14.5px;">Todo lo que ha entrado y salido de inventario, en un solo lugar.</p>
+
+<form method="get" class="info-card" style="display:flex;align-items:flex-end;gap:14px;padding:18px 20px;margin-bottom:18px;flex-wrap:wrap;">
+  <div>
+    <div style="font-size:12px;font-weight:700;color:var(--ink-faint);margin-bottom:6px;text-transform:uppercase;letter-spacing:.03em;">{{ form.producto.label }}</div>
+    {{ form.producto }}
+  </div>
+  <div>
+    <div style="font-size:12px;font-weight:700;color:var(--ink-faint);margin-bottom:6px;text-transform:uppercase;letter-spacing:.03em;">{{ form.fecha_desde.label }}</div>
+    {{ form.fecha_desde }}
+  </div>
+  <div>
+    <div style="font-size:12px;font-weight:700;color:var(--ink-faint);margin-bottom:6px;text-transform:uppercase;letter-spacing:.03em;">{{ form.fecha_hasta.label }}</div>
+    {{ form.fecha_hasta }}
+  </div>
+  <div style="display:flex;gap:8px;">
+    <button type="submit" class="btn btn-primary btn-sm">Filtrar</button>
+    <a href="{% url 'historial' %}" class="btn btn-sm" style="border:1.5px solid var(--border);color:var(--ink-soft);">Limpiar</a>
+  </div>
+  <span style="margin-left:auto;color:var(--ink-faint);font-size:13.5px;align-self:center;">{{ filas|length }} movimiento{{ filas|length|pluralize }}</span>
+</form>
+
+<div class="info-card" style="overflow:hidden;">
+  <div style="display:grid;grid-template-columns:1fr 1.4fr 1.3fr 0.8fr 1fr 1fr 2.2fr;padding:12px 20px;font-size:12px;font-weight:700;color:var(--ink-faint);text-transform:uppercase;letter-spacing:.03em;border-bottom:1px solid var(--border);">
+    <div>Fecha</div><div>Tipo</div><div>Producto</div><div>Cant. (unid.)</div><div>Valor unit. (Q)</div><div>Usuario</div><div>Detalle</div>
+  </div>
+  {% for fila in filas %}
+    <div style="display:grid;grid-template-columns:1fr 1.4fr 1.3fr 0.8fr 1fr 1fr 2.2fr;padding:14px 20px;align-items:center;border-bottom:1px solid var(--border);">
+      <div style="color:var(--ink-soft);font-size:13.5px;">{{ fila.fecha }}</div>
+      <div>
+        {% if fila.tipo == "Entrada" %}
+          <span class="badge-pill" style="background:var(--teal-bg);color:var(--teal);">Entrada</span>
+        {% elif fila.tipo == "Venta" %}
+          <span class="badge-pill" style="background:var(--accent);color:#fff;">Venta</span>
+        {% elif fila.tipo == "Merma" %}
+          <span class="badge-pill" style="background:var(--plum-bg);color:var(--plum);">Merma</span>
+        {% elif "sobrante" in fila.tipo %}
+          <span class="badge-pill" style="background:var(--sobrante-bg);color:var(--sobrante-ink);">{{ fila.tipo }}</span>
+        {% elif "faltante" in fila.tipo %}
+          <span class="badge-pill" style="background:var(--danger-bg);color:var(--danger-ink);">{{ fila.tipo }}</span>
+        {% elif fila.tipo == "Conteo físico" %}
+          <span class="badge-pill" style="background:var(--slate-bg);color:var(--slate);">Conteo físico</span>
+        {% else %}
+          <span class="badge-pill" style="background:var(--slate-bg);color:var(--slate);">{{ fila.tipo }}</span>
+        {% endif %}
+      </div>
+      <div style="font-weight:600;">{{ fila.producto }}</div>
+      <div class="num">{{ fila.cantidad }}</div>
+      <div class="num">{% if fila.valor_unitario is not None %}Q{{ fila.valor_unitario }}{% else %}—{% endif %}</div>
+      <div style="color:var(--ink-soft);font-size:13.5px;">{{ fila.usuario|default:"—" }}</div>
+      <div style="color:var(--ink-soft);font-size:13.5px;">{{ fila.detalle|default:"—" }}</div>
+    </div>
+  {% empty %}
+    <div style="padding:20px;color:var(--ink-faint);">Sin movimientos con estos filtros.</div>
+  {% endfor %}
+</div>
+{% endblock %}

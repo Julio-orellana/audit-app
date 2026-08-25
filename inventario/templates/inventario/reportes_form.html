@@ -1,0 +1,151 @@
+{% extends "base.html" %}
+{% load crispy_forms_tags %}
+{% block content %}
+<h1 style="margin:0 0 4px;font-size:22px;font-weight:800;">Reportes</h1>
+<p style="margin:0 0 28px;color:var(--ink-soft);font-size:14.5px;">Consulta el desempeño de tu inventario en pantalla y descarga el detalle en Excel.</p>
+
+<form method="get">
+  <input type="hidden" name="intento" value="1">
+
+  <div class="info-card" style="padding:22px 24px;margin-bottom:18px;">
+    <div style="display:flex;align-items:baseline;justify-content:space-between;margin-bottom:14px;flex-wrap:wrap;gap:6px;">
+      <div style="font-size:13px;font-weight:700;color:var(--ink-faint);text-transform:uppercase;letter-spacing:.03em;">1. Productos incluidos</div>
+      <span style="color:var(--ink-faint);font-size:13px;">Deja todo sin marcar para incluir los {{ form.productos.field.queryset.count }} productos activos.</span>
+    </div>
+    <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:20px;">
+      {% for nombre_categoria, productos_categoria in productos_por_categoria %}
+        <div>
+          <div style="font-size:12px;font-weight:700;color:var(--ink-faint);margin-bottom:8px;">{{ nombre_categoria|upper }}</div>
+          <div style="display:flex;flex-direction:column;gap:9px;">
+            {% for producto in productos_categoria %}
+              <label class="check-row">
+                <input type="checkbox" name="productos" value="{{ producto.pk }}" {% if producto.pk in productos_seleccionados_ids %}checked{% endif %}>
+                {{ producto.nombre }}
+              </label>
+            {% endfor %}
+          </div>
+        </div>
+      {% endfor %}
+    </div>
+  </div>
+
+  <div class="info-card" style="padding:22px 24px;margin-bottom:22px;">
+    <div style="font-size:13px;font-weight:700;color:var(--ink-faint);text-transform:uppercase;letter-spacing:.03em;margin-bottom:12px;">2. Periodo</div>
+    <div style="display:flex;align-items:center;gap:16px;flex-wrap:wrap;">
+      <div style="display:flex;background:oklch(95% 0.006 80);border-radius:10px;padding:4px;gap:4px;">
+        <button type="submit" name="periodo" value="hoy" class="btn" style="background:transparent;border:none;color:var(--ink-soft);font-weight:600;padding:0 20px;">Hoy</button>
+        <button type="submit" name="periodo" value="semana" class="btn" style="background:transparent;border:none;color:var(--ink-soft);font-weight:600;padding:0 20px;">Esta semana</button>
+        <button type="submit" name="periodo" value="mes" class="btn" style="background:transparent;border:none;color:var(--ink-soft);font-weight:600;padding:0 20px;">Este mes</button>
+      </div>
+      <span style="color:var(--ink-faint);font-size:13.5px;">o un rango personalizado —</span>
+      <div style="display:flex;align-items:center;gap:8px;">
+        {{ form.fecha_inicio|as_crispy_field }}
+        <span style="color:var(--ink-faint);margin-top:-8px;">–</span>
+        {{ form.fecha_fin|as_crispy_field }}
+      </div>
+      <button type="submit" class="btn btn-primary btn-sm">Ver estadísticas</button>
+    </div>
+  </div>
+
+</form>
+
+{% if fecha_inicio %}
+  <div style="display:flex;align-items:baseline;justify-content:space-between;margin-bottom:14px;">
+    <h2 style="margin:0;font-size:18px;font-weight:800;">Vista rápida en pantalla</h2>
+    <span style="color:var(--ink-faint);font-size:13.5px;">{{ fecha_inicio }} – {{ fecha_fin }} · {{ num_productos_incluidos }} producto{{ num_productos_incluidos|pluralize }}</span>
+  </div>
+
+  <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin-bottom:18px;">
+    <div class="info-card" style="padding:18px 20px;">
+      <div style="font-size:12.5px;color:var(--ink-faint);font-weight:600;margin-bottom:6px;">Invertido (Q)</div>
+      <div class="num" style="font-size:26px;font-weight:800;">Q{{ resumen.totales.invertido }}</div>
+    </div>
+    <div class="info-card" style="padding:18px 20px;">
+      <div style="font-size:12.5px;color:var(--ink-faint);font-weight:600;margin-bottom:6px;">Ingreso (Q)</div>
+      <div class="num" style="font-size:26px;font-weight:800;">Q{{ resumen.totales.ingreso }}</div>
+    </div>
+    <div class="info-card" style="padding:18px 20px;">
+      <div style="font-size:12.5px;color:var(--ink-faint);font-weight:600;margin-bottom:6px;">Ganancia neta (Q)</div>
+      <div class="num" style="font-size:26px;font-weight:800;{% if resumen.totales.ganancia_neta < 0 %}color:var(--danger-ink);{% else %}color:var(--success);{% endif %}">Q{{ resumen.totales.ganancia_neta }}</div>
+    </div>
+    <div class="info-card" style="padding:18px 20px;">
+      <div style="font-size:12.5px;color:var(--ink-faint);font-weight:600;margin-bottom:6px;">Unidades vendidas</div>
+      <div class="num" style="font-size:26px;font-weight:800;">{{ resumen.totales.unidades_vendidas }}</div>
+    </div>
+  </div>
+
+  <div style="display:grid;grid-template-columns:{% if puntos_linea %}1.1fr 1fr{% else %}1fr{% endif %};gap:16px;margin-bottom:24px;">
+
+    <div class="info-card" style="padding:22px 24px;">
+      <div style="font-size:14px;font-weight:700;margin-bottom:18px;">Ganancia neta por producto (Q){% if barras|length == 8 %} — top 8{% endif %}</div>
+      {% if barras %}
+      <div style="display:flex;align-items:flex-end;gap:14px;height:180px;padding:0 4px;">
+        {% for fila in barras %}
+          <div style="flex:1;display:flex;flex-direction:column;align-items:center;gap:8px;">
+            <span class="num" style="font-size:11.5px;font-weight:700;{% if fila.es_negativa %}color:var(--danger-ink);{% else %}color:var(--success);{% endif %}">{% if fila.es_negativa %}-{% endif %}Q{{ fila.ganancia_neta|floatformat:2|cut:"-" }}</span>
+            <div style="width:100%;height:{{ fila.barra_pct }}%;min-height:2px;background:{% if fila.es_negativa %}var(--danger){% else %}var(--success){% endif %};opacity:{% if forloop.first %}1{% else %}0.75{% endif %};border-radius:6px 6px 0 0;"></div>
+            <span style="font-size:11.5px;color:var(--ink-faint);text-align:center;">{{ fila.producto_nombre }}</span>
+          </div>
+        {% endfor %}
+      </div>
+      {% else %}
+        <p style="color:var(--ink-faint);font-size:13.5px;margin:0;">Sin movimientos en este periodo.</p>
+      {% endif %}
+    </div>
+
+    {% if puntos_linea %}
+    <div class="info-card" style="padding:22px 24px;">
+      <div style="font-size:14px;font-weight:700;margin-bottom:10px;">Ventas por día — ingreso en Q</div>
+      <svg width="100%" height="180" viewBox="0 0 440 180" preserveAspectRatio="none">
+        <polygon points="{{ area_linea }}" fill="var(--accent)" opacity="0.08"/>
+        <polyline points="{{ puntos_linea }}" fill="none" stroke="var(--accent)" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+        {% if pico_valor %}
+          <circle cx="{{ pico_x }}" cy="{{ pico_y }}" r="4" fill="var(--accent-dark)"/>
+          <text x="{{ pico_x }}" y="{{ pico_y }}" dy="-8" text-anchor="middle" font-size="12" font-weight="700" fill="var(--accent-dark)">Q{{ pico_valor }}</text>
+        {% endif %}
+      </svg>
+      <div style="display:flex;justify-content:space-between;color:var(--ink-faint);font-size:11.5px;margin-top:4px;">
+        <span>{{ etiqueta_primer_dia }}</span><span>{{ etiqueta_ultimo_dia }}</span>
+      </div>
+    </div>
+    {% endif %}
+  </div>
+
+  <div class="info-card" style="overflow:hidden;margin-bottom:24px;">
+    <div style="display:grid;grid-template-columns:1.6fr 1fr 1fr 1fr 1fr;padding:12px 20px;font-size:12px;font-weight:700;color:var(--ink-faint);text-transform:uppercase;letter-spacing:.03em;border-bottom:1px solid var(--border);">
+      <div>Producto</div><div>Comprado (unid.)</div><div>Vendido (unid.)</div><div>Merma (unid.)</div><div>Ganancia neta (Q)</div>
+    </div>
+    {% for fila in resumen.productos %}
+      <div style="display:grid;grid-template-columns:1.6fr 1fr 1fr 1fr 1fr;padding:11px 20px;align-items:center;border-bottom:1px solid var(--border);font-size:13.5px;">
+        <div style="font-weight:600;">{{ fila.producto_nombre }}</div>
+        <div class="num">{{ fila.unidades_compradas }}</div>
+        <div class="num">{{ fila.unidades_vendidas }}</div>
+        <div class="num">{{ fila.unidades_merma }}</div>
+        <div class="num" style="font-weight:700;{% if fila.ganancia_neta < 0 %}color:var(--danger-ink);{% else %}color:var(--success);{% endif %}">Q{{ fila.ganancia_neta }}</div>
+      </div>
+    {% empty %}
+      <div style="padding:16px 20px;color:var(--ink-faint);">Sin productos incluidos.</div>
+    {% endfor %}
+    {% if resumen.productos %}
+      <div style="display:grid;grid-template-columns:1.6fr 1fr 1fr 1fr 1fr;padding:12px 20px;align-items:center;font-size:13.5px;font-weight:800;background:oklch(96% 0.006 80);">
+        <div>TOTAL</div>
+        <div class="num">{{ resumen.totales.unidades_compradas }}</div>
+        <div class="num">{{ resumen.totales.unidades_vendidas }}</div>
+        <div class="num">{{ resumen.totales.unidades_merma }}</div>
+        <div class="num" style="{% if resumen.totales.ganancia_neta < 0 %}color:var(--danger-ink);{% else %}color:var(--success);{% endif %}">Q{{ resumen.totales.ganancia_neta }}</div>
+      </div>
+    {% endif %}
+  </div>
+
+  <div style="background:var(--navy);border-radius:16px;padding:28px 32px;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:16px;">
+    <div>
+      <div style="color:#fff;font-size:16px;font-weight:800;margin-bottom:4px;">Descargar Excel</div>
+      <div style="color:oklch(78% 0.02 255);font-size:13.5px;">Resumen simplificado + detalle de movimientos, de los {{ num_productos_incluidos }} producto{{ num_productos_incluidos|pluralize }} incluidos.</div>
+    </div>
+    <a href="{{ descarga_url }}" class="btn" style="display:flex;align-items:center;gap:10px;background:var(--accent);color:#fff;border:none;border-radius:11px;padding:0 26px;min-height:52px;font-size:15px;font-weight:700;white-space:nowrap;">
+      <svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="M7 10l5 5 5-5"/><path d="M12 15V3"/></svg>
+      Descargar Excel
+    </a>
+  </div>
+{% endif %}
+{% endblock %}

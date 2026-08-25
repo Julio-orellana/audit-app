@@ -1,0 +1,21 @@
+{% extends "base.html" %}
+{% load crispy_forms_tags %}
+{% block content %}
+<div style="display:flex;gap:32px;align-items:flex-start;flex-wrap:wrap;">
+  <div class="form-card" style="flex:0 0 560px;">
+    <h1 class="form-card-title">Registrar un conteo físico</h1>
+    <p class="form-card-subtitle">
+      Cuenta las botellas de verdad y anota el número aquí. Al guardar, te mostramos la diferencia contra
+      el stock teórico y, si hay diferencia, puedes generar el ajuste desde ahí mismo.
+    </p>
+    <form method="post">
+      {% csrf_token %}
+      {{ form|crispy }}
+      <div style="display:flex;gap:12px;margin-top:8px;">
+        <button type="submit" class="btn btn-primary">Guardar</button>
+        <a href="{% url 'historial' %}" class="btn btn-link">Cancelar</a>
+      </div>
+    </form>
+  </div>
+</div>
+{% endblock %}

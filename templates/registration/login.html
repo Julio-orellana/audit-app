@@ -1,0 +1,18 @@
+{% extends "base.html" %}
+{% load crispy_forms_tags %}
+{% block content %}
+<div style="max-width:400px;margin:60px auto 0;">
+  <div class="form-card" style="padding:40px 36px;">
+    <div style="display:flex;align-items:center;gap:10px;margin-bottom:6px;">
+      <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="var(--accent-dark)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M8 2h8l1 5-1 3v10a2 2 0 0 1-2 2H10a2 2 0 0 1-2-2V10L7 7z"/><path d="M8 10h8"/></svg>
+      <h1 style="margin:0;font-size:20px;font-weight:800;">Iniciar sesión</h1>
+    </div>
+    <p class="form-card-subtitle" style="margin-bottom:22px;">Auditoría de inventario — ¡Ay Lupita!</p>
+    <form method="post">
+      {% csrf_token %}
+      {{ form|crispy }}
+      <button type="submit" class="btn btn-primary w-100 mt-2">Entrar</button>
+    </form>
+  </div>
+</div>
+{% endblock %}

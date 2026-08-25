@@ -1,0 +1,157 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>{% block title %}Auditoría Aylupita{% endblock %}</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link href="https://fonts.googleapis.com/css2?family=Public+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+    <style>
+      :root{
+        --accent:oklch(58% 0.15 45); --accent-dark:oklch(46% 0.15 45); --accent-tint:oklch(95% 0.03 45);
+        --ink:oklch(20% 0.015 60); --ink-soft:oklch(46% 0.02 60); --ink-faint:oklch(64% 0.014 60);
+        --paper:oklch(97.3% 0.006 80); --surface:#ffffff; --border:oklch(90% 0.008 70);
+        --navy:oklch(26% 0.03 255);
+        --danger:oklch(52% 0.19 25); --danger-bg:oklch(93% 0.055 40); --danger-ink:oklch(38% 0.16 25);
+        --success:oklch(48% 0.10 150);
+        --teal:oklch(52% 0.08 195); --teal-bg:oklch(94% 0.03 195);
+        --plum:oklch(46% 0.10 20); --plum-bg:oklch(93% 0.035 20);
+        --violet:oklch(48% 0.06 290); --violet-bg:oklch(93% 0.02 290);
+        --slate:oklch(48% 0.07 230); --slate-bg:oklch(93% 0.025 230);
+        --sobrante:oklch(45% 0.16 250); --sobrante-bg:oklch(93% 0.05 250); --sobrante-ink:oklch(38% 0.15 250);
+        --info-bg:oklch(95% 0.012 255); --info-border:oklch(84% 0.03 255); --info-ink:oklch(40% 0.07 255);
+      }
+      *{box-sizing:border-box;}
+      body{
+        margin:0; font-family:'Public Sans',-apple-system,'Segoe UI',Roboto,sans-serif;
+        background:var(--paper); color:var(--ink); -webkit-font-smoothing:antialiased;
+      }
+      a{color:var(--accent-dark); text-decoration:none;}
+      a:hover{color:var(--accent); text-decoration:underline;}
+      .num{font-variant-numeric:tabular-nums;}
+
+      /* Navbar */
+      .app-navbar{
+        display:flex; align-items:center; justify-content:space-between;
+        height:64px; padding:0 32px; background:var(--navy); color:#fff;
+      }
+      .app-navbar .brand{
+        display:flex; align-items:center; gap:10px; font-weight:800; font-size:17px;
+        letter-spacing:.2px; color:#fff;
+      }
+      .app-navbar .brand:hover{color:#fff; text-decoration:none;}
+      .app-navbar .brand .accent-word{color:oklch(75% 0.11 55);}
+      .app-nav-links{display:flex; align-items:center; gap:26px; margin-left:36px; flex-wrap:wrap;}
+      .app-nav-links a{
+        color:rgba(255,255,255,.72); font-size:14.5px; font-weight:500; white-space:nowrap;
+      }
+      .app-nav-links a:hover, .app-nav-links a.active{color:#fff; text-decoration:none;}
+      .app-nav-links a.help-link{
+        display:flex; align-items:center; gap:6px; color:oklch(82% 0.09 60); font-weight:700;
+      }
+      .app-nav-links a.help-link:hover{color:oklch(88% 0.09 60);}
+      .app-navbar-right{display:flex; align-items:center; gap:14px; font-size:14px;}
+      .app-navbar-right .username{color:rgba(255,255,255,.7);}
+      .btn-nav-exit{
+        background:rgba(255,255,255,.1); border:1px solid rgba(255,255,255,.2); color:#fff;
+        padding:0 18px; min-height:44px; border-radius:8px; font-size:13.5px; font-weight:600;
+        display:inline-flex; align-items:center; cursor:pointer;
+      }
+      .btn-nav-exit:hover{background:rgba(255,255,255,.18); color:#fff;}
+      .btn-nav-enter{
+        background:var(--accent); border:none; color:#fff; padding:0 18px; min-height:44px;
+        border-radius:8px; font-size:14px; font-weight:700; display:inline-flex; align-items:center;
+      }
+      .btn-nav-enter:hover{background:var(--accent-dark); color:#fff; text-decoration:none;}
+
+      /* Page shell */
+      .app-page{padding:32px 40px 64px; max-width:1400px; margin:0 auto;}
+
+      /* Buttons */
+      .btn-primary{ background:var(--accent) !important; border-color:var(--accent) !important; }
+      .btn-primary:hover, .btn-primary:focus{ background:var(--accent-dark) !important; border-color:var(--accent-dark) !important; }
+      .btn-outline-primary{ color:var(--accent-dark) !important; border-color:var(--accent) !important; }
+      .btn-outline-primary:hover{ background:var(--accent) !important; border-color:var(--accent) !important; color:#fff !important; }
+      .btn-lg{ min-height:56px; }
+      .btn{ min-height:44px; display:inline-flex; align-items:center; justify-content:center; }
+      .btn-sm{ min-height:38px; }
+
+      /* Forms */
+      .form-control, .form-select{ border-color:var(--border); border-radius:9px; }
+      .form-control:focus, .form-select:focus{ border-color:var(--accent); box-shadow:0 0 0 .2rem var(--accent-tint); }
+
+      /* Cards */
+      .info-card{ background:var(--surface); border:1px solid var(--border); border-radius:14px; }
+      .form-card{ background:var(--surface); border:1px solid var(--border); border-radius:16px; padding:36px 40px; }
+      .form-card-title{ font-size:22px; font-weight:800; margin:0 0 6px; }
+      .form-card-subtitle{ margin:0 0 28px; color:var(--ink-soft); font-size:14.5px; line-height:1.5; }
+
+      /* Segmented pill control (used for MovimientoSalida.tipo) */
+      .pill-group{ display:flex; background:oklch(95% 0.006 80); border-radius:10px; padding:4px; gap:4px; }
+      .pill-option{ flex:1; position:relative; cursor:pointer; }
+      .pill-option input{ position:absolute; opacity:0; width:100%; height:100%; margin:0; cursor:pointer; }
+      .pill-option span{
+        display:block; text-align:center; padding:10px 0; border-radius:7px; font-weight:600;
+        font-size:14px; color:var(--ink-faint);
+      }
+      .pill-option input:checked + span{ background:var(--accent); color:#fff; font-weight:700; }
+      .pill-option input:focus-visible + span{ outline:2px solid var(--accent-dark); outline-offset:1px; }
+
+      /* Badges (movement types) */
+      .badge-pill{ display:inline-flex; align-items:center; padding:4px 11px; border-radius:100px; font-size:12.5px; font-weight:700; }
+
+      /* Alerts */
+      .alert{ border-radius:10px; }
+
+      /* Checkbox lists (Reportes product selector) */
+      .check-row{ display:flex; align-items:center; gap:9px; font-size:14px; cursor:pointer; }
+      .check-row input{ width:17px; height:17px; accent-color:var(--accent); cursor:pointer; }
+    </style>
+</head>
+<body>
+<nav class="app-navbar">
+  <div style="display:flex;align-items:center;">
+    <a class="brand" href="{% url 'home' %}">
+      <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M8 2h8l1 5-1 3v10a2 2 0 0 1-2 2H10a2 2 0 0 1-2-2V10L7 7z"/><path d="M8 10h8"/></svg>
+      Auditoría <span class="accent-word">¡Ay Lupita!</span>
+    </a>
+    {% if user.is_authenticated %}
+    <div class="app-nav-links">
+      <a href="{% url 'home' %}">Inicio</a>
+      <a href="{% url 'categoria_list' %}">Categorías</a>
+      <a href="{% url 'producto_list' %}">Productos</a>
+      <a href="{% url 'historial' %}">Historial</a>
+      <a href="{% url 'reportes' %}">Reportes</a>
+      <a href="{% url 'instrucciones' %}" class="help-link">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></svg>
+        Instrucciones
+      </a>
+    </div>
+    {% endif %}
+  </div>
+  <div class="app-navbar-right">
+    {% if user.is_authenticated %}
+      <span class="username">{{ user.username }}</span>
+      <form method="post" action="{% url 'logout' %}" class="d-flex mb-0">
+        {% csrf_token %}
+        <button class="btn-nav-exit" type="submit">Salir</button>
+      </form>
+    {% else %}
+      <a class="btn-nav-enter" href="{% url 'login' %}">Entrar</a>
+    {% endif %}
+  </div>
+</nav>
+
+<div class="app-page">
+  {% if messages %}
+    {% for message in messages %}
+      <div class="alert alert-{{ message.tags|default:'info' }}">{{ message }}</div>
+    {% endfor %}
+  {% endif %}
+  {% block content %}{% endblock %}
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
+</body>
+</html>

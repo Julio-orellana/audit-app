@@ -1,0 +1,139 @@
+{% extends "base.html" %}
+{% block content %}
+<style>
+  .instr-item{ background:var(--surface); border:1px solid var(--border); border-radius:14px; margin-bottom:12px; overflow:hidden; }
+  .instr-item[open]{ border-color:var(--accent); border-width:1.5px; }
+  .instr-item summary{
+    display:flex; align-items:center; gap:14px; padding:18px 24px; cursor:pointer; list-style:none;
+  }
+  .instr-item summary::-webkit-details-marker{ display:none; }
+  .instr-icon{ width:38px; height:38px; border-radius:10px; display:flex; align-items:center; justify-content:center; flex-shrink:0; }
+  .instr-title{ font-size:15.5px; font-weight:700; }
+  .instr-item[open] .instr-title{ font-size:16px; font-weight:800; }
+  .instr-desc{ font-size:13px; color:var(--ink-soft); }
+  .instr-chevron{ margin-left:auto; color:var(--ink-faint); transition:transform .15s; flex-shrink:0; }
+  .instr-item[open] .instr-chevron{ transform:rotate(180deg); }
+  .instr-body{ padding:0 24px 26px 78px; }
+  .instr-step{ display:flex; gap:12px; margin-bottom:10px; }
+  .instr-step:last-child{ margin-bottom:0; }
+  .instr-step-n{
+    flex-shrink:0; width:22px; height:22px; border-radius:50%; background:var(--accent-tint);
+    color:var(--accent-dark); font-size:12px; font-weight:800; display:flex; align-items:center; justify-content:center;
+  }
+</style>
+
+<h1 style="margin:0 0 6px;font-size:24px;font-weight:800;">Instrucciones</h1>
+<p style="margin:0 0 32px;color:var(--ink-soft);font-size:15px;max-width:760px;">
+  Guía rápida de cada función, pensada para consultar mientras trabajas — no hace falta memorizar nada.
+</p>
+
+<div style="max-width:920px;">
+
+  <details class="instr-item" open>
+    <summary>
+      <div class="instr-icon" style="background:var(--accent-tint);">
+        <svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="var(--accent-dark)" stroke-width="2.2" stroke-linecap="round"><path d="M9 11l3 3L22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/></svg>
+      </div>
+      <div>
+        <div class="instr-title">Conteo físico y ajustes</div>
+        <div class="instr-desc">El corazón de la auditoría — así se detectan y corrigen las diferencias.</div>
+      </div>
+      <svg class="instr-chevron" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path d="m6 9 6 6 6-6"/></svg>
+    </summary>
+    <div class="instr-body">
+      <p style="margin:0 0 14px;font-size:14px;color:var(--ink-soft);line-height:1.6;">
+        Cada cierto tiempo (recomendado: una vez por semana) cuentas físicamente las botellas de un producto
+        y lo registras aquí. El sistema compara ese número contra el <strong>stock teórico</strong>
+        (lo que "debería" haber según las compras y salidas registradas).
+      </p>
+      <div class="instr-step"><span class="instr-step-n">1</span><span style="font-size:14px;">Ve a <strong>Registrar conteo físico</strong> y anota cuántas botellas contaste de verdad.</span></div>
+      <div class="instr-step"><span class="instr-step-n">2</span><span style="font-size:14px;">El sistema te muestra la <strong>diferencia</strong>: si sobraron o si faltaron unidades.</span></div>
+      <div class="instr-step"><span class="instr-step-n">3</span><span style="font-size:14px;">Si hay diferencia, aparece un botón <strong>"Generar ajuste"</strong> — úsalo para que el stock quede correcto y quede registro de por qué cambió.</span></div>
+      <div class="instr-step"><span class="instr-step-n">4</span><span style="font-size:14px;">Si no generas el ajuste, verás una <strong style="color:var(--accent-dark);">alerta roja</strong> en el dashboard hasta que lo resuelvas.</span></div>
+    </div>
+  </details>
+
+  <details class="instr-item">
+    <summary>
+      <div class="instr-icon" style="background:var(--teal-bg);">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="var(--teal)" stroke-width="2.2" stroke-linecap="round"><path d="M21 12V7a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2h9"/><path d="M3 7l9 6 9-6"/></svg>
+      </div>
+      <div>
+        <div class="instr-title">Registrar una entrada (compra)</div>
+        <div class="instr-desc">Cuando llega mercadería del proveedor.</div>
+      </div>
+      <svg class="instr-chevron" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path d="m6 9 6 6 6-6"/></svg>
+    </summary>
+    <div class="instr-body">
+      <p style="margin:0;font-size:14px;color:var(--ink-soft);line-height:1.6;">
+        Anota producto, fecha, cantidad, costo unitario y (opcional) proveedor. El costo puede variar de una
+        compra a otra — el sistema calcula automáticamente el <strong>costo promedio ponderado</strong> con
+        todas las compras registradas, así que no necesitas calcular nada a mano.
+      </p>
+    </div>
+  </details>
+
+  <details class="instr-item">
+    <summary>
+      <div class="instr-icon" style="background:var(--accent-tint);">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="var(--accent-dark)" stroke-width="2.2" stroke-linecap="round"><path d="M3 3h2l2.6 12.6a2 2 0 0 0 2 1.4h8.8a2 2 0 0 0 2-1.6L22 8H6"/><circle cx="9" cy="21" r="1"/><circle cx="18" cy="21" r="1"/></svg>
+      </div>
+      <div>
+        <div class="instr-title">Registrar una venta o una merma</div>
+        <div class="instr-desc">Ventas del día a día, y roturas o pérdidas que sí requieren un motivo.</div>
+      </div>
+      <svg class="instr-chevron" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path d="m6 9 6 6 6-6"/></svg>
+    </summary>
+    <div class="instr-body">
+      <p style="margin:0;font-size:14px;color:var(--ink-soft);line-height:1.6;">
+        En <strong>Registrar salida</strong>, elige el producto, la fecha, y el tipo: <strong>Venta</strong> (se
+        valúa al precio de venta actual), o <strong>Merma</strong> (rotura, derrame o vencimiento — se valúa al
+        costo, ya que no genera ingreso). Para mermas y ajustes, el <strong>motivo</strong> es obligatorio: escribe
+        algo breve y claro, te sirve como respaldo si después revisas los números.
+      </p>
+    </div>
+  </details>
+
+  <details class="instr-item">
+    <summary>
+      <div class="instr-icon" style="background:var(--danger-bg);">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="var(--danger-ink)" stroke-width="2.2" stroke-linecap="round"><path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0Z"/><path d="M12 9v4M12 17h.01"/></svg>
+      </div>
+      <div>
+        <div class="instr-title">Qué significa la fila roja en el dashboard</div>
+        <div class="instr-desc">Un producto tiene un conteo con diferencia que todavía no tiene ajuste.</div>
+      </div>
+      <svg class="instr-chevron" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path d="m6 9 6 6 6-6"/></svg>
+    </summary>
+    <div class="instr-body">
+      <p style="margin:0;font-size:14px;color:var(--ink-soft);line-height:1.6;">
+        El rojo/ámbar en esta app se usa <strong>solo</strong> para esto — nunca lo vas a ver decorando otra
+        pantalla. Si un producto aparece resaltado, haz clic en <strong>"Revisar"</strong> para ver la
+        diferencia y decidir si generar el ajuste.
+      </p>
+    </div>
+  </details>
+
+  <details class="instr-item">
+    <summary>
+      <div class="instr-icon" style="background:oklch(94% 0.03 255);">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="oklch(45% 0.1 255)" stroke-width="2.2" stroke-linecap="round"><path d="M3 3v18h18"/><rect x="7" y="12" width="3" height="6"/><rect x="12" y="8" width="3" height="10"/><rect x="17" y="5" width="3" height="13"/></svg>
+      </div>
+      <div>
+        <div class="instr-title">Cómo generar un reporte</div>
+        <div class="instr-desc">Elige el periodo, elige los productos, y descarga el Excel o revisa las gráficas en pantalla.</div>
+      </div>
+      <svg class="instr-chevron" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path d="m6 9 6 6 6-6"/></svg>
+    </summary>
+    <div class="instr-body">
+      <p style="margin:0;font-size:14px;color:var(--ink-soft);line-height:1.6;">
+        En <strong>Reportes</strong>, elige un periodo rápido (Hoy / Esta semana / Este mes) o un rango
+        personalizado — por ejemplo, para ver junio completo aunque ya estés en agosto. Luego elige qué
+        productos incluir (déjalo vacío para incluir todos). Vas a ver las estadísticas y gráficas directamente
+        en pantalla; si necesitas el detalle completo, descarga el Excel con el botón al final.
+      </p>
+    </div>
+  </details>
+
+</div>
+{% endblock %}

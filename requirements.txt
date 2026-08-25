@@ -1,0 +1,6 @@
+Django
+openpyxl
+pywebview
+waitress
+django-crispy-forms
+crispy-bootstrap5

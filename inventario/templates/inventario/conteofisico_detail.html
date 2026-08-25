@@ -1,0 +1,41 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="form-card" style="max-width:560px;">
+  <h1 class="form-card-title">Conteo físico — {{ conteo.producto }}</h1>
+
+  <table style="width:100%;margin-bottom:20px;">
+    <tr><th style="text-align:left;color:var(--ink-soft);font-weight:600;padding:8px 0;width:200px;">Fecha</th><td>{{ conteo.fecha }}</td></tr>
+    <tr><th style="text-align:left;color:var(--ink-soft);font-weight:600;padding:8px 0;">Cantidad contada</th><td class="num">{{ conteo.cantidad_contada }}</td></tr>
+    <tr><th style="text-align:left;color:var(--ink-soft);font-weight:600;padding:8px 0;">Stock teórico a la fecha</th><td class="num">{{ stock_teorico }}</td></tr>
+    <tr>
+      <th style="text-align:left;color:var(--ink-soft);font-weight:600;padding:8px 0;">Diferencia</th>
+      <td>
+        {% if conteo.diferencia > 0 %}
+          <span class="badge-pill" style="background:var(--sobrante-bg);color:var(--sobrante-ink);">+{{ conteo.diferencia }} (sobrante)</span>
+        {% elif conteo.diferencia < 0 %}
+          <span class="badge-pill" style="background:var(--danger-bg);color:var(--danger-ink);">{{ conteo.diferencia }} (faltante)</span>
+        {% else %}
+          <span class="badge-pill" style="background:oklch(93% 0.03 150);color:var(--success);">0 (cuadra)</span>
+        {% endif %}
+      </td>
+    </tr>
+    {% if conteo.notas %}
+    <tr><th style="text-align:left;color:var(--ink-soft);font-weight:600;padding:8px 0;">Notas</th><td>{{ conteo.notas }}</td></tr>
+    {% endif %}
+  </table>
+
+  {% if conteo.ajuste_generado %}
+    <div class="alert alert-secondary">Ya se generó un ajuste para este conteo: {{ conteo.ajuste_generado }}</div>
+  {% elif conteo.diferencia != 0 %}
+    <form method="post" action="{% url 'conteofisico_generar_ajuste' conteo.pk %}">
+      {% csrf_token %}
+      <button type="submit" class="btn" style="background:var(--danger);color:#fff;">Generar ajuste</button>
+    </form>
+    <p style="color:var(--ink-faint);font-size:13px;margin:10px 0 0;">
+      Corrige el stock teórico para que coincida con el conteo físico, sea que haya sobrado o faltado producto.
+    </p>
+  {% endif %}
+
+  <a href="{% url 'historial' %}" class="btn btn-link mt-3" style="padding-left:0;">Ver historial</a>
+</div>
+{% endblock %}

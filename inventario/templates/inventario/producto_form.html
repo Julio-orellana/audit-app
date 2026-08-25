@@ -1,0 +1,19 @@
+{% extends "base.html" %}
+{% load crispy_forms_tags %}
+{% block content %}
+<div class="form-card" style="max-width:620px;">
+  <h1 class="form-card-title">{% if object %}Editar producto{% else %}Nuevo producto{% endif %}</h1>
+  <p class="form-card-subtitle">
+    Los campos "Producto base" y "Unidades por paquete" solo aplican a paquetes como los cubetazos
+    (ej. una cubeta de 7 botellas de Gallo) — déjalos vacíos para un producto individual.
+  </p>
+  <form method="post">
+    {% csrf_token %}
+    {{ form|crispy }}
+    <div style="display:flex;gap:12px;margin-top:8px;">
+      <button type="submit" class="btn btn-primary">Guardar</button>
+      <a href="{% url 'producto_list' %}" class="btn btn-link">Cancelar</a>
+    </div>
+  </form>
+</div>
+{% endblock %}

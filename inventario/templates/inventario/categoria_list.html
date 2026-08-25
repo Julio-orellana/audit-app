@@ -1,0 +1,35 @@
+{% extends "base.html" %}
+{% block content %}
+<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:18px;">
+  <h1 style="margin:0;font-size:22px;font-weight:800;">Categorías</h1>
+  <a href="{% url 'categoria_create' %}" class="btn btn-primary btn-sm">+ Nueva categoría</a>
+</div>
+<div class="info-card" style="overflow:hidden;">
+  <div style="display:grid;grid-template-columns:2fr 1fr 1.4fr;padding:12px 20px;font-size:12px;font-weight:700;color:var(--ink-faint);text-transform:uppercase;letter-spacing:.03em;border-bottom:1px solid var(--border);">
+    <div>Nombre</div><div>Estado</div><div></div>
+  </div>
+  {% for categoria in categorias %}
+    <div style="display:grid;grid-template-columns:2fr 1fr 1.4fr;padding:14px 20px;align-items:center;border-bottom:1px solid var(--border);">
+      <div style="font-weight:600;">{{ categoria.nombre }}</div>
+      <div>
+        {% if categoria.activo %}
+          <span class="badge-pill" style="background:oklch(93% 0.03 150);color:var(--success);">Activo</span>
+        {% else %}
+          <span class="badge-pill" style="background:oklch(93% 0.006 80);color:var(--ink-faint);">Inactivo</span>
+        {% endif %}
+      </div>
+      <div style="text-align:right;">
+        <a href="{% url 'categoria_update' categoria.pk %}" class="btn btn-sm" style="border:1.5px solid var(--border);color:var(--ink-soft);">Editar</a>
+        <form method="post" action="{% url 'categoria_toggle' categoria.pk %}" class="d-inline">
+          {% csrf_token %}
+          <button type="submit" class="btn btn-sm" style="{% if categoria.activo %}border:1.5px solid var(--danger);color:var(--danger-ink);{% else %}border:1.5px solid var(--success);color:var(--success);{% endif %}">
+            {% if categoria.activo %}Desactivar{% else %}Activar{% endif %}
+          </button>
+        </form>
+      </div>
+    </div>
+  {% empty %}
+    <div style="padding:20px;color:var(--ink-faint);">Sin categorías todavía.</div>
+  {% endfor %}
+</div>
+{% endblock %}
