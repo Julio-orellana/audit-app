@@ -9,9 +9,13 @@ antes de levantar el servidor.
 """
 import shutil
 from datetime import datetime
-from pathlib import Path
 
-BASE_DIR = Path(__file__).resolve().parent
+from runtime_paths import carpeta_escribible
+
+# Empaquetado con PyInstaller, __file__ resolvería dentro del bundle de
+# solo lectura (sys._MEIPASS) — hay que usar la carpeta del .exe real,
+# donde vive (y debe seguir viviendo) la base de datos.
+BASE_DIR = carpeta_escribible()
 DB_PATH = BASE_DIR / "db.sqlite3"
 BACKUPS_DIR = BASE_DIR / "backups"
 

@@ -10,10 +10,39 @@ For the full list of settings and their values, see
 https://docs.djangoproject.com/en/6.1/ref/settings/
 """
 
+import sys
 from pathlib import Path
 
-# Build paths inside the project like this: BASE_DIR / 'subdir'.
-BASE_DIR = Path(__file__).resolve().parent.parent
+import dj_database_url
+import environ
+
+# runtime_paths vive en la raíz del proyecto (junto a manage.py), no dentro
+# del paquete auditoria_aylupita — hace falta en sys.path explícitamente
+# porque, empaquetado con PyInstaller, el mecanismo normal de import de
+# Django (vía manage.py) no interviene.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from runtime_paths import carpeta_codigo, carpeta_escribible  # noqa: E402
+
+# BASE_DIR: carpeta de solo lectura con el código, templates y estáticos.
+# Sin empaquetar es la raíz del proyecto de siempre; empaquetada con
+# PyInstaller es la carpeta del bundle (sys._MEIPASS) — nunca la carpeta
+# real donde vive el .exe, que puede no ser escribible.
+BASE_DIR = carpeta_codigo()
+
+# BASE_DIR_ESCRIBIBLE: carpeta donde SÍ se puede crear o modificar archivos
+# (base de datos, media). Sin empaquetar es la misma que BASE_DIR;
+# empaquetada, es la carpeta donde vive el .exe real — la única que el
+# usuario controla y que persiste entre ejecuciones.
+BASE_DIR_ESCRIBIBLE = carpeta_escribible()
+
+# .env vive junto al .exe real (o en la raíz del proyecto en desarrollo,
+# donde BASE_DIR_ESCRIBIBLE == BASE_DIR) — nunca dentro del bundle de solo
+# lectura, y nunca se sube a git (confirmar en .gitignore). Si no existe
+# (ej. una máquina sin Postgres configurado todavía), read_env() no hace
+# nada y simplemente se usan las variables de entorno del sistema, si las
+# hay — de ahí cae al fallback de SQLite más abajo.
+env = environ.Env()
+environ.Env.read_env(str(BASE_DIR_ESCRIBIBLE / ".env"))
 
 
 # Quick-start development settings - unsuitable for production
