@@ -2,6 +2,7 @@
 venv/
 env/
 .venv/
+.env
 
 # Python
 __pycache__/
@@ -19,9 +20,19 @@ media/
 backups/*
 !backups/.gitkeep
 
+# Respaldo completo periódico de la base en la nube (prompt 23) — contiene
+# datos reales, nunca se sube a git
+backups_completos/*
+!backups_completos/.gitkeep
+
+# Salida de PyInstaller (se regenera con build_exe.bat / app.spec)
+build/
+dist/
+
 # Variables de entorno / secretos
 .env
 .env.*
+!.env.example
 *.local
 
 # Editores / SO
@@ -32,3 +43,8 @@ Thumbs.db
 
 # Logs
 *.log
+
+#Archivos
+EMPAQUETADO.md
+DESARROLLO.md
+DIAGNOSTICO_GENERAL.md
