@@ -104,13 +104,43 @@ WSGI_APPLICATION = 'auditoria_aylupita.wsgi.application'
 
 # Database
 # https://docs.djangoproject.com/en/6.1/ref/settings/#databases
+#
+# Postgres en la nube (Neon) si hay DATABASE_URL en el entorno/.env;
+# si no, SQLite local como respaldo de desarrollo (prompt 18) — así se
+# puede seguir probando sin nube si hace falta, sin tocar código.
+#
+# manage.py migrate usa DIRECT_DATABASE_URL en vez de DATABASE_URL cuando
+# está definida: Neon recomienda la conexión directa (sin el pooler
+# pgbouncer) específicamente para migraciones, mientras que la app en uso
+# normal sí debe pasar por el pooler. Nota: app_desktop.py también corre
+# "migrate" en cada arranque (self-healing en un equipo nuevo, prompt 13b)
+# pero NO pasa por manage.py — ese arranque usa DATABASE_URL (el pooler)
+# igual que el resto de la app. En la práctica un migrate sin nada
+# pendiente es una operación liviana que no debería toparse con las
+# limitaciones del pooler, pero si algún día da problemas ahí, es el
+# lugar a revisar.
+_es_comando_migrate = len(sys.argv) > 1 and sys.argv[1] == "migrate"
 
-DATABASES = {
-    'default': {
-        'ENGINE': 'django.db.backends.sqlite3',
-        'NAME': BASE_DIR / 'db.sqlite3',
+_database_url = env("DATABASE_URL", default=None)
+_direct_database_url = env("DIRECT_DATABASE_URL", default=None)
+
+if _database_url:
+    _url_para_conectar = _direct_database_url if (_es_comando_migrate and _direct_database_url) else _database_url
+    DATABASES = {
+        "default": dj_database_url.parse(_url_para_conectar, conn_max_age=60, ssl_require=True)
     }
-}
+    # Detecta una conexión persistente muerta (ej. el cómputo serverless de
+    # Neon se suspendió por inactividad) y la reabre en vez de fallar la
+    # siguiente request — dj_database_url.parse() no siempre expone este
+    # parámetro según la versión instalada, se fija aparte por seguridad.
+    DATABASES["default"]["CONN_HEALTH_CHECKS"] = True
+else:
+    DATABASES = {
+        'default': {
+            'ENGINE': 'django.db.backends.sqlite3',
+            'NAME': BASE_DIR_ESCRIBIBLE / 'db.sqlite3',
+        }
+    }
 
 
 # Password validation
@@ -149,6 +179,13 @@ USE_TZ = True
 
 STATIC_URL = 'static/'
 STATICFILES_DIRS = [BASE_DIR / 'static']
+
+# Media: no hay ningún FileField/ImageField en el catálogo actual, pero se
+# deja definido (relativo a la carpeta escribible, no al bundle) para que
+# cualquier subida de archivo que se agregue a futuro caiga en el lugar
+# correcto sin tener que recordar este mismo problema de rutas.
+MEDIA_URL = 'media/'
+MEDIA_ROOT = BASE_DIR_ESCRIBIBLE / 'media'
 
 
 # Default primary key field type
