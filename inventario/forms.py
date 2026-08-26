@@ -3,6 +3,21 @@ from django import forms
 from .models import Categoria, ConteoFisico, LoteCompra, MovimientoSalida, Producto
 
 
+def _queryset_producto_activo_o_actual(instance):
+    """
+    Solo productos activos, más el producto ya asignado a esta instancia
+    si se está editando un registro existente que referencia uno ya
+    desactivado (prompt 22, punto 4.4) — así un producto desactivado
+    nunca aparece como opción para un registro NUEVO, pero un registro ya
+    guardado que lo referencia se sigue pudiendo ver/editar sin que el
+    formulario lo rechace como "opción inválida".
+    """
+    queryset = Producto.objects.filter(activo=True)
+    if instance.pk and instance.producto_id:
+        queryset = queryset | Producto.objects.filter(pk=instance.producto_id)
+    return queryset
+
+
 class CategoriaForm(forms.ModelForm):
     class Meta:
         model = Categoria
@@ -41,6 +56,10 @@ class LoteCompraForm(forms.ModelForm):
             "fecha": forms.DateInput(attrs={"type": "date"}),
             "notas": forms.Textarea(attrs={"rows": 3}),
         }
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.fields["producto"].queryset = _queryset_producto_activo_o_actual(self.instance)
 
 
 class MovimientoSalidaForm(forms.ModelForm):
@@ -100,8 +119,17 @@ class ConteoFisicoForm(forms.ModelForm):
             "notas": forms.Textarea(attrs={"rows": 3}),
         }
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.fields["producto"].queryset = _queryset_producto_activo_o_actual(self.instance)
+
 
 class HistorialFiltroForm(forms.Form):
+    # A propósito NO se restringe a activo=True: es un filtro de
+    # búsqueda sobre el histórico, no un formulario de registrar algo
+    # nuevo — se debe poder seguir filtrando por un producto ya
+    # desactivado para ver su historial completo (ver prompt 22, punto 4.4,
+    # que sí restringe los formularios de ESCRITURA).
     producto = forms.ModelChoiceField(
         queryset=Producto.objects.all(),
         required=False,

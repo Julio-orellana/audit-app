@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Ocurrió un error — Auditoría Aylupita</title>
+  <!--
+    Django renderiza esta plantilla SIN contexto (ni siquiera "request",
+    a diferencia de 403.html) — no puede extender base.html: el usuario
+    y el rol no estarían disponibles ahí y darían un navbar engañoso.
+    Por eso es una página autocontenida, con los mismos colores de marca
+    puestos a mano. El enlace de abajo es un href normal a propósito, no
+    una etiqueta de URL con nombre — esas tampoco funcionarían sin contexto.
+  -->
+  <style>
+    body {
+      margin: 0; min-height: 100vh; display: flex; align-items: center; justify-content: center;
+      font-family: -apple-system, 'Segoe UI', Roboto, sans-serif;
+      background: oklch(97.3% 0.006 80); color: oklch(20% 0.015 60);
+    }
+    .tarjeta {
+      background: #fff; border: 1px solid oklch(90% 0.008 70); border-radius: 16px;
+      padding: 40px 36px; max-width: 440px; text-align: center;
+    }
+    h1 { font-size: 20px; font-weight: 800; margin: 16px 0 8px; }
+    p { font-size: 14.5px; color: oklch(46% 0.02 60); line-height: 1.5; margin: 0 0 24px; }
+    a { display: inline-block; background: oklch(58% 0.15 45); color: #fff; text-decoration: none;
+        padding: 12px 22px; border-radius: 8px; font-weight: 700; font-size: 14px; }
+    a:hover { background: oklch(46% 0.15 45); }
+  </style>
+</head>
+<body>
+  <div class="tarjeta">
+    <svg width="36" height="36" viewBox="0 0 24 24" fill="none" stroke="oklch(52% 0.19 25)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M12 8v5"/><circle cx="12" cy="16" r="0.5" fill="oklch(52% 0.19 25)"/></svg>
+    <h1>Ocurrió un error</h1>
+    <p>Algo falló al procesar tu solicitud. No se perdió ningún dato — intenta de nuevo, y si el problema sigue, avísale al administrador del sistema.</p>
+    <a href="/">Volver a Inicio</a>
+  </div>
+</body>
+</html>

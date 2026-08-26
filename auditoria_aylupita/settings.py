@@ -52,7 +52,11 @@ environ.Env.read_env(str(BASE_DIR_ESCRIBIBLE / ".env"))
 SECRET_KEY = 'django-insecure-1s^p=s9_-%a%6il%+%_3e_gjtd1_j_+06ebyqs^ou7pan&#_!i'
 
 # SECURITY WARNING: don't run with debug turned on in production!
-DEBUG = True
+# Se lee de .env (prompt 22) — False por defecto si no está definida, así
+# que una máquina sin .env configurado (ej. el .exe entregado al auditor)
+# nunca corre con DEBUG=True por accidente. Actívalo explícitamente solo
+# en tu propio .env de desarrollo local: DEBUG=True
+DEBUG = env.bool("DEBUG", default=False)
 
 ALLOWED_HOSTS = ["127.0.0.1", "localhost"]
 

@@ -15,6 +15,9 @@
   <div>
     <div style="font-size:12px;font-weight:700;color:var(--ink-faint);margin-bottom:6px;text-transform:uppercase;letter-spacing:.03em;">{{ form.fecha_hasta.label }}</div>
     {{ form.fecha_hasta }}
+    {% if form.fecha_hasta.errors %}
+      <div class="text-danger small mt-1">{{ form.fecha_hasta.errors|join:", " }}</div>
+    {% endif %}
   </div>
   <div style="display:flex;gap:8px;">
     <button type="submit" class="btn btn-primary btn-sm">Filtrar</button>
