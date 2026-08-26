@@ -1,0 +1,24 @@
+{% extends "base.html" %}
+{% block content %}
+<h1 style="margin:0 0 4px;font-size:26px;font-weight:800;">{{ saludo }}, {{ user.get_full_name|default:user.username|capfirst }}</h1>
+<p style="margin:0 0 28px;color:var(--ink-soft);font-size:15px;">{{ hoy|date }}</p>
+
+<div style="margin-bottom:32px;">
+  <a href="{% url 'movimientosalida_create' %}" class="btn-lg" style="display:inline-flex;align-items:center;gap:10px;background:var(--accent);color:#fff;border:none;border-radius:12px;padding:0 22px;font-size:15px;font-weight:700;min-height:56px;">
+    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M3 3h2l2.6 12.6a2 2 0 0 0 2 1.4h8.8a2 2 0 0 0 2-1.6L22 8H6"/><circle cx="9" cy="21" r="1"/><circle cx="18" cy="21" r="1"/></svg>
+    Registrar venta
+  </a>
+</div>
+
+<h2 style="margin:0 0 14px;font-size:18px;font-weight:800;">Catálogo</h2>
+<div class="info-card" style="padding:24px 28px;">
+  {% for nombre_categoria, productos in productos_por_categoria %}
+    <p style="margin:0 0 16px;line-height:1.7;font-size:15px;">
+      <strong>{{ nombre_categoria }}:</strong>
+      ({% for producto in productos %}{{ producto.nombre }} — Q{{ producto.precio_venta_actual }}{% if not forloop.last %}, {% endif %}{% endfor %})
+    </p>
+  {% empty %}
+    <p style="margin:0;color:var(--ink-faint);">Sin productos activos todavía.</p>
+  {% endfor %}
+</div>
+{% endblock %}

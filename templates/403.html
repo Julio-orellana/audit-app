@@ -1,0 +1,13 @@
+{% extends "base.html" %}
+{% block title %}Acceso no permitido — Auditoría Aylupita{% endblock %}
+{% block content %}
+<div class="form-card" style="max-width:520px;margin:48px auto;text-align:center;">
+  <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="var(--danger)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="margin-bottom:16px;"><circle cx="12" cy="12" r="10"/><path d="M4.9 4.9l14.2 14.2"/></svg>
+  <h1 class="form-card-title" style="text-align:center;">No tienes permiso para ver esta página</h1>
+  <p class="form-card-subtitle" style="text-align:center;">
+    Tu usuario no tiene el rol necesario para esta sección. Si crees que deberías tener acceso,
+    consulta con el administrador del sistema.
+  </p>
+  <a href="{% url 'home' %}" class="btn btn-primary">Volver a Inicio</a>
+</div>
+{% endblock %}

@@ -1,7 +1,7 @@
 from datetime import date
 from decimal import Decimal
 
-from django.contrib.auth.models import User
+from django.contrib.auth.models import Group, User
 from django.test import TestCase
 from django.urls import reverse
 
@@ -22,6 +22,11 @@ class HistorialCompletoTests(TestCase):
 
     def setUp(self):
         self.user = User.objects.create_user(username="auditor_test", password="clave-de-prueba-123")
+        # Historial requiere rol admin/auditor desde el prompt 16 — sin
+        # grupo, el usuario de prueba recibiría 403 en vez del 200 que
+        # estos tests verifican.
+        grupo_auditor, _ = Group.objects.get_or_create(name="auditor")
+        self.user.groups.add(grupo_auditor)
         self.categoria = Categoria.objects.create(nombre="Categoría de prueba")
         self.producto = Producto.objects.create(
             nombre="Producto de prueba",

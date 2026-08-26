@@ -55,11 +55,26 @@ class MovimientoSalidaForm(forms.ModelForm):
             "tipo": forms.RadioSelect,
         }
 
+    def __init__(self, *args, permitir_todos_los_tipos=True, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.fields["producto"].queryset = _queryset_producto_activo_o_actual(self.instance)
+        self.permitir_todos_los_tipos = permitir_todos_los_tipos
+        if not permitir_todos_los_tipos:
+            # Un vendedor solo puede registrar ventas: se restringe la
+            # única opción mostrada (no solo se oculta con CSS) y clean()
+            # de todas formas rechaza cualquier otro valor que llegue en
+            # el POST, así se haya manipulado el HTML a mano.
+            self.fields["tipo"].choices = [("venta", "Venta")]
+            self.fields["tipo"].initial = "venta"
+
     def clean(self):
         cleaned_data = super().clean()
         tipo = cleaned_data.get("tipo")
         motivo = cleaned_data.get("motivo")
         cantidad = cleaned_data.get("cantidad")
+
+        if not self.permitir_todos_los_tipos and tipo != "venta":
+            self.add_error("tipo", "Como vendedor, solo puedes registrar ventas.")
 
         if tipo in ("merma", "ajuste") and not motivo:
             self.add_error(
