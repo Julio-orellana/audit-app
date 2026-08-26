@@ -25,7 +25,7 @@ class ProductoAdmin(admin.ModelAdmin):
         "precio_venta_actual",
         "activo",
         "producto_base",
-        "unidades_por_paquete",
+        "factor_equivalencia",
     )
     list_filter = ("categoria", "activo")
     search_fields = ("nombre",)

@@ -18,8 +18,19 @@ class ProductoForm(forms.ModelForm):
             "precio_venta_actual",
             "activo",
             "producto_base",
-            "unidades_por_paquete",
+            "factor_equivalencia",
         ]
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Solo un producto base real (no otro derivado) puede elegirse como
+        # producto_base — evita encadenar derivados desde el propio formulario
+        # (Producto.clean() lo bloquearía de todas formas, pero así ni
+        # siquiera aparece como opción). Tampoco puede elegirse a sí mismo.
+        queryset_base = Producto.objects.filter(producto_base__isnull=True)
+        if self.instance.pk:
+            queryset_base = queryset_base.exclude(pk=self.instance.pk)
+        self.fields["producto_base"].queryset = queryset_base
 
 
 class LoteCompraForm(forms.ModelForm):

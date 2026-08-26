@@ -13,11 +13,12 @@ from inventario.models import Categoria, Producto
 #   base nuevo en Cervezas con un precio placeholder (Q20, igual a Modelo
 #   lata/Montecarlo) porque no se confirmó su precio real. AJUSTAR EN EL
 #   ADMIN cuando se tenga el precio verdadero.
-# - Los cubetazos son paquetes de 7 unidades del producto base (confirmado
-#   por el usuario para las 6 cubetas), registrados vía producto_base /
-#   unidades_por_paquete en Producto. El descuento automático del stock del
-#   producto base al vender un cubetazo se implementa en el flujo de
-#   registro de ventas, no en este comando.
+# - Los cubetazos son paquetes de varias unidades del producto base,
+#   registrados vía producto_base / factor_equivalencia en Producto (ver
+#   prompt 15 — stock_teorico() del producto base descuenta automáticamente
+#   las ventas de cada cubetazo). Solo "Cubeta corona" tiene el número real
+#   de botellas confirmado (7); el resto queda en 1 como placeholder hasta
+#   que el auditor/administrador lo ajuste desde el formulario de producto.
 # - "Cubeta normal gallo" y "Cubetazo gallo" se asumen ambos sobre la
 #   botella "Gallo" (no la lata "Gallo lata"), por ser cubetas de botella.
 # - entradas, frescos_naturales y micheladas_y_piconas quedan fuera: son
@@ -49,16 +50,14 @@ GASEOSAS = [
     ("Coca cola", "10"),
 ]
 
-UNIDADES_POR_CUBETAZO = 7
-
-# (nombre del cubetazo, precio, nombre del producto base en Cervezas)
+# (nombre del cubetazo, precio, nombre del producto base en Cervezas, factor_equivalencia)
 CUBETAZOS = [
-    ("Cubeta dorada draft", "110", "Dorada draf"),
-    ("Cubeta corona", "110", "Corona"),
-    ("Cubeta monte carlo", "110", "Montecarlo"),
-    ("Cubeta normal gallo", "90", "Gallo"),
-    ("Cubeta tecate", "75", "Tecate original"),
-    ("Cubetazo gallo", "75", "Gallo"),
+    ("Cubeta dorada draft", "110", "Dorada draf", 1),
+    ("Cubeta corona", "110", "Corona", 7),
+    ("Cubeta monte carlo", "110", "Montecarlo", 1),
+    ("Cubeta normal gallo", "90", "Gallo", 1),
+    ("Cubeta tecate", "75", "Tecate original", 1),
+    ("Cubetazo gallo", "75", "Gallo", 1),
 ]
 
 
@@ -100,7 +99,7 @@ class Command(BaseCommand):
             )
             creados_productos += created
 
-        for nombre, precio, nombre_base in CUBETAZOS:
+        for nombre, precio, nombre_base, factor_equivalencia in CUBETAZOS:
             _, created = Producto.objects.get_or_create(
                 nombre=nombre,
                 defaults={
@@ -108,7 +107,7 @@ class Command(BaseCommand):
                     "precio_venta_actual": Decimal(precio),
                     "activo": True,
                     "producto_base": productos_base[nombre_base],
-                    "unidades_por_paquete": UNIDADES_POR_CUBETAZO,
+                    "factor_equivalencia": factor_equivalencia,
                 },
             )
             creados_productos += created
