@@ -174,5 +174,30 @@
 </footer>
 
 <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
+<script>
+  // Protección de doble-submit, capa de frontend (prompt 21): deshabilita
+  // el botón de enviar apenas se hace clic, para bajar la probabilidad de
+  // un doble clic accidental en "Guardar"/"Generar ajuste"/etc. No es la
+  // protección real (el usuario puede recargar y reenviar) — esa es el
+  // token de un solo uso en el backend (ver inventario/antiduplicado.py);
+  // esto es solo para que el caso más común (doble clic) ni siquiera
+  // llegue a mandar un segundo request.
+  document.addEventListener("submit", function (evento) {
+    var boton = evento.target.querySelector('button[type="submit"]');
+    if (!boton || boton.disabled) {
+      return;
+    }
+    boton.disabled = true;
+    var textoOriginal = boton.textContent;
+    boton.textContent = "Guardando...";
+    // Salvavidas: si por lo que sea el formulario no termina de navegar
+    // (ej. el envío falla y el navegador se queda en la misma página sin
+    // recargar), no se deja el botón inhabilitado para siempre.
+    setTimeout(function () {
+      boton.disabled = false;
+      boton.textContent = textoOriginal;
+    }, 8000);
+  });
+</script>
 </body>
 </html>

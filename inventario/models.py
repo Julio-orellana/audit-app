@@ -215,7 +215,18 @@ class ConteoFisico(models.Model):
     cantidad_contada = models.PositiveIntegerField()
     registrado_por = models.ForeignKey(User, on_delete=models.SET_NULL, null=True)
     notas = models.TextField(blank=True, null=True)
-    ajuste_generado = models.ForeignKey(MovimientoSalida, on_delete=models.SET_NULL, null=True, blank=True)
+    # OneToOneField = ForeignKey(unique=True) (prompt 21): capa de
+    # protección a nivel de base de datos, independiente del código —
+    # nunca deja que dos ConteoFisico distintos terminen apuntando al
+    # mismo MovimientoSalida, sin importar por dónde se haya escrito.
+    # Postgres permite múltiples NULL en una columna única (el caso
+    # normal: la mayoría de conteos no tienen ajuste todavía), así que
+    # esto no cambia nada del comportamiento actual — solo cierra una vía
+    # de corrupción. No previene por sí sola la condición de carrera
+    # original (un mismo conteo generando dos MovimientoSalida distintos)
+    # — eso lo resuelve select_for_update() en generar_ajuste() (ver
+    # views.py).
+    ajuste_generado = models.OneToOneField(MovimientoSalida, on_delete=models.SET_NULL, null=True, blank=True)
     creado_en = models.DateTimeField(auto_now_add=True)
 
     @property
