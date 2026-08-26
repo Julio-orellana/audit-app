@@ -3,18 +3,29 @@
 {% block content %}
 <div style="display:flex;gap:32px;align-items:flex-start;flex-wrap:wrap;">
   <div class="form-card" style="flex:0 0 560px;">
-    <h1 class="form-card-title">Registrar una salida</h1>
+    <h1 class="form-card-title">{% if rol_usuario == "vendedor" %}Registrar una venta{% else %}Registrar una salida{% endif %}</h1>
     <p class="form-card-subtitle">
-      Usa este formulario para registrar una <strong>venta</strong>, una <strong>merma</strong>
-      (rotura, derrame o vencimiento) o un <strong>ajuste</strong> manual.
+      {% if rol_usuario == "vendedor" %}
+        Registra aquí cada venta realizada.
+      {% else %}
+        Usa este formulario para registrar una <strong>venta</strong>, una <strong>merma</strong>
+        (rotura, derrame o vencimiento) o un <strong>ajuste</strong> manual.
+      {% endif %}
     </p>
 
     <form method="post">
       {% csrf_token %}
+      <input type="hidden" name="token_formulario" value="{{ token_formulario }}">
 
       {{ form.producto|as_crispy_field }}
       {{ form.fecha|as_crispy_field }}
 
+      {% if rol_usuario == "vendedor" %}
+        {{ form.tipo.as_hidden }}
+        {% if form.tipo.errors %}
+          <div class="text-danger small mt-1 mb-3">{{ form.tipo.errors|join:", " }}</div>
+        {% endif %}
+      {% else %}
       <div class="mb-3">
         <label class="form-label fw-bold" style="font-size:13.5px;color:var(--ink-soft);">Tipo de salida</label>
         <div class="pill-group">
@@ -29,21 +40,25 @@
           <div class="text-danger small mt-1">{{ form.tipo.errors|join:", " }}</div>
         {% endif %}
       </div>
+      {% endif %}
 
       {{ form.cantidad|as_crispy_field }}
 
+      {% if rol_usuario != "vendedor" %}
       <div style="background:var(--accent-tint);border:1px solid oklch(88% 0.05 45);border-radius:10px;padding:16px;margin-bottom:1rem;">
         {{ form.motivo|as_crispy_field }}
         <p style="margin:6px 0 0;font-size:12.5px;color:var(--accent-dark);font-weight:600;">Obligatorio para mermas y ajustes.</p>
       </div>
+      {% endif %}
 
       <div style="display:flex;gap:12px;margin-top:8px;">
         <button type="submit" class="btn btn-primary">Guardar</button>
-        <a href="{% url 'historial' %}" class="btn btn-link">Cancelar</a>
+        <a href="{% if rol_usuario == "vendedor" %}{% url 'home' %}{% else %}{% url 'historial' %}{% endif %}" class="btn btn-link">Cancelar</a>
       </div>
     </form>
   </div>
 
+  {% if rol_usuario != "vendedor" %}
   <div class="info-card" style="flex:1;min-width:260px;padding:20px 22px;background:var(--info-bg);border-color:var(--info-border);">
     <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px;">
       <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="var(--info-ink)" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></svg>
@@ -54,5 +69,6 @@
       solo si necesitas corregir el stock manualmente, fuera de un conteo.
     </p>
   </div>
+  {% endif %}
 </div>
 {% endblock %}

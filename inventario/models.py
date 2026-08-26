@@ -1,4 +1,5 @@
 # inventario/models.py
+from django.core.exceptions import ValidationError
 from django.db import models
 from django.contrib.auth.models import User
 from django.db.models import Sum, F
@@ -30,23 +31,24 @@ class Producto(models.Model):
     activo = models.BooleanField(default=True)
     creado_en = models.DateTimeField(auto_now_add=True)
 
-    # Equivalencia para paquetes (ej. cubetazos): si este producto es un
-    # paquete de varias unidades de otro producto, producto_base indica cuál
-    # y unidades_por_paquete cuántas unidades físicas contiene. El descuento
-    # automático del stock del producto base al vender un paquete se
-    # implementa en el flujo de registro de ventas (no en este modelo).
+    # Relación de equivalencia: un producto derivado es el MISMO producto
+    # físico que producto_base, solo empacado o cobrado distinto (ej. una
+    # variante de precio, o un cubetazo de varias botellas). No tiene
+    # inventario propio — factor_equivalencia dice cuántas unidades de
+    # producto_base consume vender 1 unidad de este producto (ver
+    # stock_teorico() y costo_promedio() más abajo, donde se resuelve el
+    # descuento real contra el producto base).
     producto_base = models.ForeignKey(
         "self",
-        on_delete=models.SET_NULL,
+        on_delete=models.PROTECT,
         null=True,
         blank=True,
-        related_name="paquetes",
-        help_text="Si este producto es un paquete (ej. cubetazo), el producto individual que contiene.",
+        related_name="derivados",
+        help_text="Si este producto es una variante de precio o un paquete (ej. cubetazo) de otro, el producto base real.",
     )
-    unidades_por_paquete = models.PositiveIntegerField(
-        null=True,
-        blank=True,
-        help_text="Cantidad de unidades del producto_base que contiene este paquete.",
+    factor_equivalencia = models.PositiveIntegerField(
+        default=1,
+        help_text="Unidades de producto_base que consume vender 1 unidad de este producto.",
     )
 
     class Meta:
@@ -55,8 +57,34 @@ class Producto(models.Model):
     def __str__(self):
         return self.nombre
 
+    def clean(self):
+        super().clean()
+        if self.producto_base_id:
+            if self.pk and self.producto_base_id == self.pk:
+                raise ValidationError({"producto_base": "Un producto no puede ser su propio producto base."})
+            if self.producto_base.producto_base_id is not None:
+                raise ValidationError({
+                    "producto_base": (
+                        f"'{self.producto_base}' ya es un producto derivado de "
+                        f"'{self.producto_base.producto_base}' — no se puede encadenar. "
+                        f"Selecciona directamente el producto base real."
+                    )
+                })
+            if self.factor_equivalencia < 1:
+                # PositiveIntegerField permite 0 a nivel de Django, pero 0
+                # aquí significaría "esta venta no consume nada del
+                # producto base" (división por cero en stock_teorico()).
+                raise ValidationError({"factor_equivalencia": "El factor de equivalencia debe ser al menos 1."})
+
     def costo_promedio(self, hasta_fecha=None):
-        """Costo promedio ponderado de las compras registradas hasta una fecha (o todas)."""
+        """
+        Costo promedio ponderado. Un producto derivado no tiene compras
+        propias — su costo es el del producto base, multiplicado por
+        cuántas unidades base consume (factor_equivalencia).
+        """
+        if self.producto_base_id is not None:
+            return (self.producto_base.costo_promedio(hasta_fecha) * self.factor_equivalencia).quantize(Decimal("0.01"))
+
         qs = self.lotes_compra.all()
         if hasta_fecha:
             qs = qs.filter(fecha__lte=hasta_fecha)
@@ -69,7 +97,23 @@ class Producto(models.Model):
         return (agregado["total_costo"] / agregado["total_unidades"]).quantize(Decimal("0.01"))
 
     def stock_teorico(self, hasta_fecha=None):
-        """Balance teórico = total comprado - total salido (ventas + mermas + ajustes), a una fecha dada."""
+        """
+        Para un producto BASE (producto_base=None): inventario real —
+        compras propias, menos salidas propias, menos las salidas de cada
+        producto derivado de este (ventas/mermas/ajustes registrados bajo
+        el nombre del derivado, convertidas a unidades base con su
+        factor_equivalencia). Esta es la fuente de verdad del stock físico.
+
+        Para un producto DERIVADO (producto_base != None): no tiene
+        inventario propio real. Lo que se devuelve aquí es solo
+        INFORMATIVO — el stock del producto base traducido a "cuántos de
+        este derivado alcanzarían" (división entera) — nunca una fuente
+        de verdad independiente.
+        """
+        if self.producto_base_id is not None:
+            stock_base = self.producto_base.stock_teorico(hasta_fecha)
+            return stock_base // self.factor_equivalencia
+
         compras = self.lotes_compra.all()
         salidas = self.movimientos_salida.all()
         if hasta_fecha:
@@ -77,7 +121,16 @@ class Producto(models.Model):
             salidas = salidas.filter(fecha__lte=hasta_fecha)
         total_compras = compras.aggregate(t=Sum("cantidad"))["t"] or 0
         total_salidas = salidas.aggregate(t=Sum("cantidad"))["t"] or 0
-        return total_compras - total_salidas
+
+        total_salidas_derivados = 0
+        for derivado in self.derivados.all():
+            salidas_derivado = derivado.movimientos_salida.all()
+            if hasta_fecha:
+                salidas_derivado = salidas_derivado.filter(fecha__lte=hasta_fecha)
+            cantidad_derivado = salidas_derivado.aggregate(t=Sum("cantidad"))["t"] or 0
+            total_salidas_derivados += cantidad_derivado * derivado.factor_equivalencia
+
+        return total_compras - total_salidas - total_salidas_derivados
 
 
 class LoteCompra(models.Model):
@@ -93,6 +146,16 @@ class LoteCompra(models.Model):
 
     class Meta:
         ordering = ["-fecha", "-creado_en"]
+
+    def clean(self):
+        super().clean()
+        if self.producto_id and self.producto.producto_base_id is not None:
+            raise ValidationError({
+                "producto": (
+                    f"'{self.producto}' es una variante de '{self.producto.producto_base}' — "
+                    f"registra las compras sobre '{self.producto.producto_base}', no sobre esta variante."
+                )
+            })
 
     def __str__(self):
         return f"{self.producto} +{self.cantidad} ({self.fecha})"
@@ -152,7 +215,18 @@ class ConteoFisico(models.Model):
     cantidad_contada = models.PositiveIntegerField()
     registrado_por = models.ForeignKey(User, on_delete=models.SET_NULL, null=True)
     notas = models.TextField(blank=True, null=True)
-    ajuste_generado = models.ForeignKey(MovimientoSalida, on_delete=models.SET_NULL, null=True, blank=True)
+    # OneToOneField = ForeignKey(unique=True) (prompt 21): capa de
+    # protección a nivel de base de datos, independiente del código —
+    # nunca deja que dos ConteoFisico distintos terminen apuntando al
+    # mismo MovimientoSalida, sin importar por dónde se haya escrito.
+    # Postgres permite múltiples NULL en una columna única (el caso
+    # normal: la mayoría de conteos no tienen ajuste todavía), así que
+    # esto no cambia nada del comportamiento actual — solo cierra una vía
+    # de corrupción. No previene por sí sola la condición de carrera
+    # original (un mismo conteo generando dos MovimientoSalida distintos)
+    # — eso lo resuelve select_for_update() en generar_ajuste() (ver
+    # views.py).
+    ajuste_generado = models.OneToOneField(MovimientoSalida, on_delete=models.SET_NULL, null=True, blank=True)
     creado_en = models.DateTimeField(auto_now_add=True)
 
     @property
@@ -162,6 +236,35 @@ class ConteoFisico(models.Model):
 
     def __str__(self):
         return f"Conteo {self.producto} ({self.fecha}): {self.cantidad_contada}"
+
+
+class CorreccionHistorial(models.Model):
+    """
+    Registro obligatorio de cada edición o eliminación de un LoteCompra,
+    MovimientoSalida o ConteoFisico ya guardado (prompt 17). Cambia
+    conscientemente la regla original de que un reporte de un mes cerrado
+    nunca cambia: ahora sí puede cambiar si un admin corrige algo, pero
+    siempre queda constancia de quién, cuándo, qué y por qué — nunca se
+    crea uno de estos sin el cambio real aplicado en la misma transacción,
+    ni viceversa (ver las vistas de corrección en views.py).
+    """
+    ACCION_CHOICES = (("edicion", "Edición"), ("eliminacion", "Eliminación"))
+
+    tipo_registro = models.CharField(max_length=30)  # "LoteCompra", "MovimientoSalida", "ConteoFisico"
+    registro_id = models.PositiveIntegerField()
+    accion = models.CharField(max_length=15, choices=ACCION_CHOICES)
+    datos_anteriores = models.JSONField()
+    datos_nuevos = models.JSONField(null=True, blank=True)
+    motivo = models.TextField()
+    realizado_por = models.ForeignKey(User, on_delete=models.SET_NULL, null=True)
+    fecha = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        verbose_name_plural = "Correcciones al historial"
+        ordering = ["-fecha"]
+
+    def __str__(self):
+        return f"{self.get_accion_display()} {self.tipo_registro} #{self.registro_id} ({self.fecha:%Y-%m-%d})"
 
 
 class ReferenciaVentaImportada(models.Model):

@@ -1,0 +1,13 @@
+{% extends "base.html" %}
+{% block title %}No se pudo completar la consulta — Auditoría Aylupita{% endblock %}
+{% block content %}
+<div class="form-card" style="max-width:520px;margin:48px auto;text-align:center;">
+  <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="var(--danger)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="margin-bottom:16px;"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2z"/><path d="M12 8v5"/><circle cx="12" cy="16" r="0.5" fill="var(--danger)"/></svg>
+  <h1 class="form-card-title" style="text-align:center;">No se pudo completar la consulta</h1>
+  <p class="form-card-subtitle" style="text-align:center;">
+    Hubo un problema momentáneo de conexión con la base de datos. No se perdió ningún dato —
+    intenta de nuevo en unos segundos.
+  </p>
+  <a href="{% url 'home' %}" class="btn btn-primary">Volver a Inicio</a>
+</div>
+{% endblock %}

@@ -107,6 +107,17 @@
       /* Checkbox lists (Reportes product selector) */
       .check-row{ display:flex; align-items:center; gap:9px; font-size:14px; cursor:pointer; }
       .check-row input{ width:17px; height:17px; accent-color:var(--accent); cursor:pointer; }
+
+      /* Footer */
+      html, body{ height:100%; }
+      body{ display:flex; flex-direction:column; min-height:100vh; }
+      .app-page{ flex:1 0 auto; }
+      .app-footer{
+        flex-shrink:0; text-align:center; padding:16px 24px 20px; margin-top:24px;
+        border-top:1px solid var(--border); font-size:11.5px; line-height:1.6; color:var(--ink-faint);
+      }
+      .app-footer a{ color:var(--ink-faint); text-decoration:underline; }
+      .app-footer a:hover{ color:var(--ink-soft); }
     </style>
 </head>
 <body>
@@ -119,10 +130,15 @@
     {% if user.is_authenticated %}
     <div class="app-nav-links">
       <a href="{% url 'home' %}">Inicio</a>
+      {% if rol_usuario != "vendedor" %}
       <a href="{% url 'categoria_list' %}">Categorías</a>
       <a href="{% url 'producto_list' %}">Productos</a>
       <a href="{% url 'historial' %}">Historial</a>
       <a href="{% url 'reportes' %}">Reportes</a>
+      {% if rol_usuario == "admin" %}
+      <a href="{% url 'correcciones_historial' %}">Correcciones</a>
+      {% endif %}
+      {% endif %}
       <a href="{% url 'instrucciones' %}" class="help-link">
         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></svg>
         Instrucciones
@@ -152,6 +168,36 @@
   {% block content %}{% endblock %}
 </div>
 
+<footer class="app-footer">
+  Desarrollado por Julio Orellana | <a href="mailto:julioes134@outlook.es">julioes134@outlook.es</a><br>
+  Todos los derechos reservados. Se prohíbe la utilización de este sistema sin la autorización debida; hacerlo podría constituir un delito de derechos de autor.
+</footer>
+
 <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
+<script>
+  // Protección de doble-submit, capa de frontend (prompt 21): deshabilita
+  // el botón de enviar apenas se hace clic, para bajar la probabilidad de
+  // un doble clic accidental en "Guardar"/"Generar ajuste"/etc. No es la
+  // protección real (el usuario puede recargar y reenviar) — esa es el
+  // token de un solo uso en el backend (ver inventario/antiduplicado.py);
+  // esto es solo para que el caso más común (doble clic) ni siquiera
+  // llegue a mandar un segundo request.
+  document.addEventListener("submit", function (evento) {
+    var boton = evento.target.querySelector('button[type="submit"]');
+    if (!boton || boton.disabled) {
+      return;
+    }
+    boton.disabled = true;
+    var textoOriginal = boton.textContent;
+    boton.textContent = "Guardando...";
+    // Salvavidas: si por lo que sea el formulario no termina de navegar
+    // (ej. el envío falla y el navegador se queda en la misma página sin
+    // recargar), no se deja el botón inhabilitado para siempre.
+    setTimeout(function () {
+      boton.disabled = false;
+      boton.textContent = textoOriginal;
+    }, 8000);
+  });
+</script>
 </body>
 </html>

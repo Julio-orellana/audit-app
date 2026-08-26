@@ -61,7 +61,10 @@
   </div>
   {% for fila in filas_alerta %}
     <div style="display:grid;grid-template-columns:2.4fr 1.1fr 1.1fr 1.3fr 1.8fr;padding:18px 20px;align-items:center;border-bottom:1px solid var(--border);background:{% if fila.alerta.diferencia > 0 %}var(--sobrante-bg){% else %}var(--danger-bg){% endif %};">
-      <div style="font-weight:600;">{{ fila.producto.nombre }}</div>
+      <div style="font-weight:600;">
+        {{ fila.producto.nombre }}
+        {% if fila.producto.producto_base %}<span style="display:block;font-weight:500;font-size:12px;color:var(--ink-faint);">variante de {{ fila.producto.producto_base.nombre }}</span>{% endif %}
+      </div>
       <div class="num">{{ fila.stock_teorico }}</div>
       <div class="num">Q{{ fila.costo_promedio }}</div>
       <div><span style="color:var(--ink-soft);font-size:14px;">{{ fila.ultimo_conteo.fecha }}</span></div>
@@ -100,7 +103,10 @@
       <div style="padding:9px 20px;background:oklch(96% 0.006 80);font-size:12.5px;font-weight:700;color:var(--ink-soft);">{{ fila.producto.categoria.nombre|upper }}</div>
     {% endifchanged %}
     <div style="display:grid;grid-template-columns:2.4fr 1.1fr 1.1fr 1.3fr;padding:13px 20px;align-items:center;border-bottom:1px solid var(--border);">
-      <div style="font-weight:600;">{{ fila.producto.nombre }}</div>
+      <div style="font-weight:600;">
+        {{ fila.producto.nombre }}
+        {% if fila.producto.producto_base %}<span style="display:block;font-weight:500;font-size:12px;color:var(--ink-faint);">variante de {{ fila.producto.producto_base.nombre }}</span>{% endif %}
+      </div>
       <div class="num">{{ fila.stock_teorico }}</div>
       <div class="num">Q{{ fila.costo_promedio }}</div>
       <div>

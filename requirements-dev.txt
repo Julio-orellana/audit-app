@@ -1,0 +1,5 @@
+# Dependencias de desarrollo/empaquetado — no se instalan en el equipo del
+# auditor. Se usan solo en la máquina donde se compila el .exe con
+# PyInstaller (ver EMPAQUETADO.md).
+-r requirements.txt
+pyinstaller

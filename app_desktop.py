@@ -25,6 +25,16 @@ def _preparar_django():
     import django
 
     django.setup()
+
+    # Aplica migraciones pendientes en cada arranque. Es barato y no hace
+    # nada si ya están aplicadas (comando idempotente) — pero es lo que
+    # permite que el .exe funcione con un doble clic en una máquina nueva,
+    # sin que nadie tenga que abrir una terminal y correr
+    # "manage.py migrate" a mano la primera vez.
+    from django.core.management import call_command
+
+    call_command("migrate", run_syncdb=True, verbosity=0, interactive=False)
+
     from django.core.wsgi import get_wsgi_application
 
     return get_wsgi_application()

@@ -1,0 +1,46 @@
+{% extends "base.html" %}
+{% block content %}
+<h1 style="margin:0 0 4px;font-size:22px;font-weight:800;">Correcciones al historial</h1>
+<p style="margin:0 0 24px;color:var(--ink-soft);font-size:14.5px;">
+  Cada edición o eliminación de un registro ya guardado (solo disponible para admin) queda aquí, con el
+  antes y el después, quién la hizo, cuándo y por qué.
+</p>
+
+{% for fila in filas %}
+  {% with correccion=fila.correccion %}
+  <div class="info-card" style="padding:20px 22px;margin-bottom:16px;">
+    <div style="display:flex;justify-content:space-between;align-items:baseline;flex-wrap:wrap;gap:8px;margin-bottom:10px;">
+      <div>
+        <span class="badge-pill" style="background:{% if correccion.accion == 'eliminacion' %}var(--danger-bg){% else %}var(--accent-tint){% endif %};color:{% if correccion.accion == 'eliminacion' %}var(--danger-ink){% else %}var(--accent-dark){% endif %};">{{ correccion.get_accion_display }}</span>
+        <strong style="margin-left:8px;">{{ correccion.tipo_registro }} #{{ correccion.registro_id }}</strong>
+      </div>
+      <span style="color:var(--ink-faint);font-size:13px;">{{ correccion.fecha }} · {{ correccion.realizado_por.username|default:"(usuario eliminado)" }}</span>
+    </div>
+    <p style="margin:0 0 12px;font-size:14px;"><strong>Motivo:</strong> {{ correccion.motivo }}</p>
+
+    {% if fila.cambios %}
+      <table class="table table-sm" style="margin:0;">
+        <thead><tr><th>Campo</th><th>Antes</th><th>Después</th></tr></thead>
+        <tbody>
+          {% for campo, antes, despues in fila.cambios %}
+          <tr><td>{{ campo }}</td><td>{{ antes|default:"—" }}</td><td>{{ despues|default:"—" }}</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    {% elif correccion.accion == "eliminacion" %}
+      <table class="table table-sm" style="margin:0;">
+        <tbody>
+          {% for campo, valor in correccion.datos_anteriores.items %}
+          <tr><td style="width:220px;color:var(--ink-soft);">{{ campo }}</td><td>{{ valor|default:"—" }}</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    {% else %}
+      <p style="margin:0;color:var(--ink-faint);font-size:13px;">Sin cambios detectados en los campos guardados.</p>
+    {% endif %}
+  </div>
+  {% endwith %}
+{% empty %}
+  <div class="info-card" style="padding:20px;color:var(--ink-faint);">Todavía no hay correcciones registradas.</div>
+{% endfor %}
+{% endblock %}

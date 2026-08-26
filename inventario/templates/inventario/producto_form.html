@@ -4,8 +4,11 @@
 <div class="form-card" style="max-width:620px;">
   <h1 class="form-card-title">{% if object %}Editar producto{% else %}Nuevo producto{% endif %}</h1>
   <p class="form-card-subtitle">
-    Los campos "Producto base" y "Unidades por paquete" solo aplican a paquetes como los cubetazos
-    (ej. una cubeta de 7 botellas de Gallo) — déjalos vacíos para un producto individual.
+    "Producto base" y "Factor de equivalencia" son para un producto que en realidad es el mismo
+    producto físico que otro, solo empacado o cobrado distinto — una variante de precio (ej. "Sprite
+    colaboradores" a Q6, la misma botella que "Sprite") o un paquete (ej. una cubeta de 7 botellas de
+    Gallo). El factor es cuántas unidades del producto base consume vender 1 unidad de este producto.
+    Déjalo en 1 y "Producto base" vacío para un producto normal, con inventario propio.
   </p>
   <form method="post">
     {% csrf_token %}

@@ -79,11 +79,17 @@
     <div class="info-card" style="padding:22px 24px;">
       <div style="font-size:14px;font-weight:700;margin-bottom:18px;">Ganancia neta por producto (Q){% if barras|length == 8 %} — top 8{% endif %}</div>
       {% if barras %}
-      <div style="display:flex;align-items:flex-end;gap:14px;height:180px;padding:0 4px;">
+      <div style="display:flex;align-items:flex-end;gap:14px;padding:0 4px;">
         {% for fila in barras %}
           <div style="flex:1;display:flex;flex-direction:column;align-items:center;gap:8px;">
             <span class="num" style="font-size:11.5px;font-weight:700;{% if fila.es_negativa %}color:var(--danger-ink);{% else %}color:var(--success);{% endif %}">{% if fila.es_negativa %}-{% endif %}Q{{ fila.ganancia_neta|floatformat:2|cut:"-" }}</span>
-            <div style="width:100%;height:{{ fila.barra_pct }}%;min-height:2px;background:{% if fila.es_negativa %}var(--danger){% else %}var(--success){% endif %};opacity:{% if forloop.first %}1{% else %}0.75{% endif %};border-radius:6px 6px 0 0;"></div>
+            <!-- La barra necesita un "carril" con altura FIJA en px: un % de
+                 alto en un padre con altura auto (el div flex-column de
+                 arriba) no se resuelve en CSS y la barra colapsa a una
+                 línea delgada — por eso el carril de abajo fija 120px. -->
+            <div style="width:100%;height:120px;display:flex;align-items:flex-end;">
+              <div style="width:100%;height:{{ fila.barra_pct }}%;min-height:2px;background:{% if fila.es_negativa %}var(--danger){% else %}var(--success){% endif %};opacity:{% if forloop.first %}1{% else %}0.75{% endif %};border-radius:6px 6px 0 0;"></div>
+            </div>
             <span style="font-size:11.5px;color:var(--ink-faint);text-align:center;">{{ fila.producto_nombre }}</span>
           </div>
         {% endfor %}

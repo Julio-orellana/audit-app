@@ -21,7 +21,7 @@
         {% endif %}
       </div>
       <div style="color:var(--ink-soft);font-size:13.5px;">
-        {% if producto.producto_base %}{{ producto.producto_base }} × {{ producto.unidades_por_paquete }}{% else %}—{% endif %}
+        {% if producto.producto_base %}{{ producto.producto_base }} × {{ producto.factor_equivalencia }}{% else %}—{% endif %}
       </div>
       <div style="text-align:right;">
         <a href="{% url 'producto_update' producto.pk %}" class="btn btn-sm" style="border:1.5px solid var(--border);color:var(--ink-soft);">Editar</a>

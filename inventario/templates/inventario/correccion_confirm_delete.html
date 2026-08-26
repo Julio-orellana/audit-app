@@ -1,0 +1,34 @@
+{% extends "base.html" %}
+{% load crispy_forms_tags %}
+{% block content %}
+<div class="form-card" style="max-width:620px;">
+  <h1 class="form-card-title">Eliminar {{ titulo_registro }}</h1>
+  <p class="form-card-subtitle">
+    Vas a eliminar permanentemente este registro ya guardado. Esto es una corrección administrativa —
+    queda registrada en <a href="{% url 'correcciones_historial' %}">Correcciones al historial</a> con el
+    motivo, quién la hizo y cuándo.
+  </p>
+
+  {% if bloqueo %}
+    <div class="alert alert-danger">{{ bloqueo }}</div>
+    <a href="{% url 'historial' %}" class="btn btn-link">Volver a Historial</a>
+  {% else %}
+    {% if advertencia %}
+      <div class="alert alert-warning">{{ advertencia }}</div>
+    {% endif %}
+
+    <div style="background:var(--danger-bg);border:1px solid oklch(80% 0.09 40);border-radius:10px;padding:16px;margin-bottom:1rem;font-size:14px;color:var(--danger-ink);">
+      <strong>{{ object }}</strong>
+    </div>
+
+    <form method="post">
+      {% csrf_token %}
+      {{ form|crispy }}
+      <div style="display:flex;gap:12px;margin-top:8px;">
+        <button type="submit" class="btn" style="background:var(--danger);color:#fff;border:none;">Eliminar definitivamente</button>
+        <a href="{% url 'historial' %}" class="btn btn-link">Cancelar</a>
+      </div>
+    </form>
+  {% endif %}
+</div>
+{% endblock %}

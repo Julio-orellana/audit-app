@@ -12,7 +12,8 @@ siempre el valor ya guardado en cada MovimientoSalida, que es un snapshot
 congelado al momento del registro. Así, un reporte de un mes cerrado da
 siempre los mismos números sin importar cuándo se genere.
 """
-from datetime import timedelta
+from collections import defaultdict
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 
 from django.db.models import F, Sum
@@ -20,6 +21,95 @@ from django.db.models import F, Sum
 from .models import ConteoFisico, LoteCompra, MovimientoSalida, Producto
 
 DOS_DECIMALES = Decimal("0.01")
+
+
+class MotorStockCosto:
+    """
+    Calcula stock_teorico() y costo_promedio() de CUALQUIER cantidad de
+    productos, cada uno a su propia fecha de corte si hace falta, con una
+    cantidad FIJA de 3 consultas sin importar cuántos productos,
+    movimientos o fechas de corte distintas se pidan después (prompt 18b
+    — el dashboard, Reportes e Historial disparaban una consulta por
+    producto/conteo antes de esto).
+
+    Se construye una sola vez por request: trae TODOS los productos
+    (id, producto_base_id, factor_equivalencia) y TODAS las filas de
+    LoteCompra/MovimientoSalida del sistema como (producto_id, fecha,
+    cantidad[, costo_unitario]) — 3 consultas — y a partir de ahí calcula
+    cualquier stock_teorico(producto_id, hasta_fecha)/costo_promedio(...)
+    en memoria, sin volver a tocar la base de datos.
+
+    Por qué se trae TODO (no solo los productos/fechas que se van a pedir
+    hoy): un producto derivado necesita el stock de su base aunque esa
+    base no esté en la lista pedida (ej. un producto inactivo), y un
+    conteo físico puede pedir stock a una fecha de corte arbitraria y
+    distinta para cada uno (Historial). Filtrar de antemano exigiría
+    adivinar qué se va a necesitar; traer todo es 1 consulta más grande
+    en vez de N consultas chicas, y para el volumen de datos real de esta
+    app (un restaurante, decenas de productos) es información que cabe
+    cómoda en memoria — mucho más barato que una consulta por producto
+    contra una base remota.
+
+    Reproduce EXACTAMENTE la misma lógica que Producto.stock_teorico()/
+    costo_promedio() (ver models.py), incluida la resolución de productos
+    derivados del prompt 15 — verificado método por método contra la
+    versión original antes de reemplazarla en las vistas (ver
+    inventario/tests.py, ParidadMotorStockCostoTests).
+    """
+
+    def __init__(self):
+        self._mapa = {
+            p["id"]: (p["producto_base_id"], p["factor_equivalencia"])
+            for p in Producto.objects.values("id", "producto_base_id", "factor_equivalencia")
+        }
+        self._derivados_por_base = defaultdict(list)
+        for pid, (base_id, factor) in self._mapa.items():
+            if base_id is not None:
+                self._derivados_por_base[base_id].append((pid, factor))
+
+        self._compras_por_producto = defaultdict(list)
+        for producto_id, fecha, cantidad, costo_unitario in LoteCompra.objects.values_list(
+            "producto_id", "fecha", "cantidad", "costo_unitario"
+        ):
+            self._compras_por_producto[producto_id].append((fecha, cantidad, costo_unitario))
+
+        self._salidas_por_producto = defaultdict(list)
+        for producto_id, fecha, cantidad in MovimientoSalida.objects.values_list("producto_id", "fecha", "cantidad"):
+            self._salidas_por_producto[producto_id].append((fecha, cantidad))
+
+    def _suma_hasta(self, filas, hasta_fecha, indice_cantidad=1):
+        if hasta_fecha is None:
+            return sum(fila[indice_cantidad] for fila in filas)
+        return sum(fila[indice_cantidad] for fila in filas if fila[0] <= hasta_fecha)
+
+    def stock_teorico(self, producto_id, hasta_fecha=None):
+        base_id, factor = self._mapa[producto_id]
+        if base_id is not None:
+            return self.stock_teorico(base_id, hasta_fecha) // factor
+
+        total_compras = self._suma_hasta(self._compras_por_producto.get(producto_id, []), hasta_fecha)
+        total_salidas = self._suma_hasta(self._salidas_por_producto.get(producto_id, []), hasta_fecha)
+
+        total_salidas_derivados = 0
+        for derivado_id, derivado_factor in self._derivados_por_base.get(producto_id, []):
+            cantidad_derivado = self._suma_hasta(self._salidas_por_producto.get(derivado_id, []), hasta_fecha)
+            total_salidas_derivados += cantidad_derivado * derivado_factor
+
+        return total_compras - total_salidas - total_salidas_derivados
+
+    def costo_promedio(self, producto_id, hasta_fecha=None):
+        base_id, factor = self._mapa[producto_id]
+        if base_id is not None:
+            return (self.costo_promedio(base_id, hasta_fecha) * factor).quantize(DOS_DECIMALES)
+
+        filas = self._compras_por_producto.get(producto_id, [])
+        if hasta_fecha is not None:
+            filas = [f for f in filas if f[0] <= hasta_fecha]
+        total_unidades = sum(cantidad for _fecha, cantidad, _costo in filas)
+        if not total_unidades:
+            return Decimal("0.00")
+        total_costo = sum(cantidad * costo for _fecha, cantidad, costo in filas)
+        return (total_costo / total_unidades).quantize(DOS_DECIMALES)
 
 
 def _money(valor):
@@ -127,20 +217,101 @@ def resumen_general(fecha_inicio, fecha_fin, productos=None):
     fecha_fin]. Si `productos` es None, usa todos los productos activos.
 
     Devuelve un dict: {"productos": [...], "totales": {...}}
-    - "productos": una lista de dicts, cada uno es el resultado de
-      resumen_producto() más "producto" (la instancia), "producto_nombre" y
-      "categoria" (nombre de categoría).
+    - "productos": una lista de dicts, con las mismas claves que devolvía
+      resumen_producto() (calculadas aquí en lote, no llamándolo por
+      producto — ver nota de rendimiento abajo) más "producto" (la
+      instancia), "producto_nombre" y "categoria" (nombre de categoría).
     - "totales": un dict con la suma de cada clave financiera/de unidades
       (no incluye stock_teorico_al_cierre, ver nota arriba).
+
+    Rendimiento (prompt 18b): antes llamaba resumen_producto() —y por lo
+    tanto sus propios .aggregate()+stock_teorico()— una vez POR PRODUCTO,
+    disparando una cantidad de consultas proporcional a la cantidad de
+    productos (219 consultas con 26 productos, medido en el prompt 20).
+    Aquí se calculan las 4 agregaciones financieras (compras, ventas,
+    mermas, ajustes) de TODOS los productos del rango en una sola
+    consulta cada una, agrupadas por producto_id — y el stock al cierre
+    con un único MotorStockCosto compartido — así el total de consultas
+    queda fijo (8) sin importar cuántos productos se incluyan. Los
+    números que devuelve son idénticos a los de resumen_producto() (ver
+    inventario/tests.py, ParidadResumenGeneralTests) — solo cambia cómo
+    se calculan, nunca el resultado.
     """
     if productos is None:
-        productos = Producto.objects.filter(activo=True).select_related("categoria")
+        productos = list(Producto.objects.filter(activo=True).select_related("categoria"))
+    else:
+        # Se vuelve a consultar con select_related("categoria") así el
+        # acceso a producto.categoria.nombre más abajo no dispare una
+        # consulta por producto cuando `productos` viene de afuera (ej.
+        # la selección específica del formulario de Reportes) sin
+        # traerla ya resuelta.
+        productos = list(
+            Producto.objects.filter(pk__in=[p.pk for p in productos]).select_related("categoria")
+        )
+
+    producto_ids = [p.pk for p in productos]
+
+    def _agrupar_por_producto(queryset, **anotaciones):
+        return {
+            fila["producto_id"]: fila
+            for fila in queryset.filter(producto_id__in=producto_ids).values("producto_id").annotate(**anotaciones)
+        }
+
+    compras_por_producto = _agrupar_por_producto(
+        LoteCompra.objects.filter(fecha__gte=fecha_inicio, fecha__lte=fecha_fin),
+        unidades=Sum("cantidad"),
+        invertido=Sum(F("cantidad") * F("costo_unitario")),
+    )
+    ventas_por_producto = _agrupar_por_producto(
+        MovimientoSalida.objects.filter(fecha__gte=fecha_inicio, fecha__lte=fecha_fin, tipo="venta"),
+        unidades=Sum("cantidad"),
+        ingreso=Sum(F("cantidad") * F("precio_venta_unitario")),
+        costo=Sum(F("cantidad") * F("costo_unitario_snapshot")),
+    )
+    mermas_por_producto = _agrupar_por_producto(
+        MovimientoSalida.objects.filter(fecha__gte=fecha_inicio, fecha__lte=fecha_fin, tipo="merma"),
+        unidades=Sum("cantidad"),
+        perdida=Sum(F("cantidad") * F("costo_unitario_snapshot")),
+    )
+    # Mismo signo que _unidades_ajuste_con_signo(): positivo si sobró.
+    ajustes_por_producto = {
+        fila["producto_id"]: -(fila["total"] or 0)
+        for fila in MovimientoSalida.objects.filter(
+            producto_id__in=producto_ids, fecha__gte=fecha_inicio, fecha__lte=fecha_fin, tipo="ajuste"
+        )
+        .values("producto_id")
+        .annotate(total=Sum("cantidad"))
+    }
+
+    motor = MotorStockCosto()
 
     filas = []
     totales = {clave: (Decimal("0.00") if clave in _CLAVES_MONETARIAS else 0) for clave in _CLAVES_SUMABLES}
 
     for producto in productos:
-        resumen = resumen_producto(producto, fecha_inicio, fecha_fin)
+        compras = compras_por_producto.get(producto.pk, {})
+        ventas = ventas_por_producto.get(producto.pk, {})
+        mermas = mermas_por_producto.get(producto.pk, {})
+
+        ingreso = _money(ventas.get("ingreso"))
+        costo_de_lo_vendido = _money(ventas.get("costo"))
+        ganancia_bruta = _money(ingreso - costo_de_lo_vendido)
+        perdida_por_merma = _money(mermas.get("perdida"))
+        ganancia_neta = _money(ganancia_bruta - perdida_por_merma)
+
+        resumen = {
+            "unidades_compradas": compras.get("unidades") or 0,
+            "invertido": _money(compras.get("invertido")),
+            "unidades_vendidas": ventas.get("unidades") or 0,
+            "ingreso": ingreso,
+            "costo_de_lo_vendido": costo_de_lo_vendido,
+            "ganancia_bruta": ganancia_bruta,
+            "unidades_merma": mermas.get("unidades") or 0,
+            "perdida_por_merma": perdida_por_merma,
+            "unidades_ajuste": ajustes_por_producto.get(producto.pk, 0),
+            "ganancia_neta": ganancia_neta,
+            "stock_teorico_al_cierre": motor.stock_teorico(producto.pk, hasta_fecha=fecha_fin),
+        }
         filas.append(
             {
                 "producto": producto,
@@ -210,6 +381,8 @@ def movimientos_periodo(fecha_inicio, fecha_fin, productos=None, descendente=Tru
                 "usuario": lote.registrado_por.username if lote.registrado_por else "",
                 "detalle": detalle,
                 "creado_en": lote.creado_en,
+                "tipo_registro": "LoteCompra",
+                "registro_id": lote.pk,
             }
         )
 
@@ -236,31 +409,46 @@ def movimientos_periodo(fecha_inicio, fecha_fin, productos=None, descendente=Tru
                 "usuario": salida.registrado_por.username if salida.registrado_por else "",
                 "detalle": salida.motivo or "",
                 "creado_en": salida.creado_en,
+                "tipo_registro": "MovimientoSalida",
+                "registro_id": salida.pk,
             }
         )
 
-    for conteo in conteos_qs:
-        diferencia = conteo.diferencia
-        detalle = f"Contado: {conteo.cantidad_contada} · Diferencia: {diferencia:+d}"
-        if conteo.ajuste_generado_id:
-            detalle += " · ajuste generado"
-        elif diferencia != 0:
-            detalle += " · pendiente de ajuste"
-        if conteo.notas:
-            detalle += f" · {conteo.notas}"
+    conteos = list(conteos_qs)
+    if conteos:
+        # MotorStockCosto se construye UNA vez (3 consultas fijas) y
+        # resuelve conteo.diferencia para cada conteo en memoria — antes,
+        # la property ConteoFisico.diferencia disparaba su propio
+        # stock_teorico(hasta_fecha=...) por cada conteo mostrado (33
+        # consultas con 5 conteos, medido en el prompt 20; crecía 1:1 con
+        # la cantidad de conteos en el rango). El resultado es idéntico a
+        # conteo.diferencia (mismo MotorStockCosto que resumen_general(),
+        # ver ParidadResumenGeneralTests) — solo cambia cómo se calcula.
+        motor = MotorStockCosto()
+        for conteo in conteos:
+            diferencia = conteo.cantidad_contada - motor.stock_teorico(conteo.producto_id, hasta_fecha=conteo.fecha)
+            detalle = f"Contado: {conteo.cantidad_contada} · Diferencia: {diferencia:+d}"
+            if conteo.ajuste_generado_id:
+                detalle += " · ajuste generado"
+            elif diferencia != 0:
+                detalle += " · pendiente de ajuste"
+            if conteo.notas:
+                detalle += f" · {conteo.notas}"
 
-        filas.append(
-            {
-                "fecha": conteo.fecha,
-                "tipo": "Conteo físico",
-                "producto": conteo.producto,
-                "cantidad": conteo.cantidad_contada,
-                "valor_unitario": None,
-                "usuario": conteo.registrado_por.username if conteo.registrado_por else "",
-                "detalle": detalle,
-                "creado_en": conteo.creado_en,
-            }
-        )
+            filas.append(
+                {
+                    "fecha": conteo.fecha,
+                    "tipo": "Conteo físico",
+                    "producto": conteo.producto,
+                    "cantidad": conteo.cantidad_contada,
+                    "valor_unitario": None,
+                    "usuario": conteo.registrado_por.username if conteo.registrado_por else "",
+                    "detalle": detalle,
+                    "creado_en": conteo.creado_en,
+                    "tipo_registro": "ConteoFisico",
+                    "registro_id": conteo.pk,
+                }
+            )
 
     filas.sort(key=lambda f: (f["fecha"], f["creado_en"]), reverse=descendente)
     return filas
@@ -287,7 +475,75 @@ def serie_diaria_ventas(fecha_inicio, fecha_fin, productos=None):
     return serie
 
 
-def alertas_conteo_fisico():
+def snapshot_registro(instance):
+    """
+    Representación JSON-serializable de un LoteCompra/MovimientoSalida/
+    ConteoFisico, para guardar en CorreccionHistorial.datos_anteriores /
+    datos_nuevos (prompt 17). Incluye el valor crudo de cada campo (una
+    FK queda como su id, igual que en la base de datos) más el nombre del
+    producto relacionado en texto plano, para que la vista de
+    correcciones siga siendo legible aunque ese producto se renombre o
+    se desactive más adelante.
+    """
+    datos = {}
+    for field in instance._meta.fields:
+        valor = field.value_from_object(instance)
+        if isinstance(valor, Decimal):
+            valor = str(valor)
+        elif isinstance(valor, (datetime, date)):
+            valor = valor.isoformat()
+        datos[field.name] = valor
+    if getattr(instance, "producto_id", None):
+        datos["producto_nombre"] = instance.producto.nombre
+    if getattr(instance, "registrado_por_id", None):
+        datos["registrado_por_username"] = instance.registrado_por.username
+    return datos
+
+
+def productos_activos_por_categoria():
+    """
+    Productos activos agrupados por categoría, en orden — misma agrupación
+    que usa el selector de productos de Reportes y el catálogo reducido
+    del dashboard de un vendedor (ver home_vendedor.html).
+
+    Devuelve una lista de (nombre_categoria, [productos]).
+    """
+    productos = (
+        Producto.objects.filter(activo=True)
+        .select_related("categoria")
+        .order_by("categoria__nombre", "nombre")
+    )
+    grupos = {}
+    orden = []
+    for producto in productos:
+        nombre_cat = producto.categoria.nombre
+        if nombre_cat not in grupos:
+            grupos[nombre_cat] = []
+            orden.append(nombre_cat)
+        grupos[nombre_cat].append(producto)
+    return [(nombre, grupos[nombre]) for nombre in orden]
+
+
+def conteos_activos_por_producto():
+    """
+    Todos los ConteoFisico de productos ACTIVOS, agrupados por
+    producto_id y ordenados de más antiguo a más reciente — 1 sola
+    consulta. Compartida entre alertas_conteo_fisico() y home() (que
+    también necesita el último conteo de cada producto), para no repetir
+    la misma consulta dos veces en el mismo request.
+    """
+    agrupado = defaultdict(list)
+    conteos = (
+        ConteoFisico.objects.filter(producto__activo=True)
+        .select_related("producto", "registrado_por")
+        .order_by("producto_id", "fecha", "creado_en")
+    )
+    for conteo in conteos:
+        agrupado[conteo.producto_id].append(conteo)
+    return agrupado
+
+
+def alertas_conteo_fisico(motor=None, conteos_por_producto=None):
     """
     Productos activos con AL MENOS UN ConteoFisico sin resolver: diferencia
     distinta de 0 y sin ajuste_generado.
@@ -308,22 +564,35 @@ def alertas_conteo_fisico():
       en total (normalmente 1; más de 1 solo si se dejaron varios conteos
       sin generar su ajuste antes de seguir contando).
     Ordenados por fecha del conteo pendiente más antiguo (más urgente primero).
+
+    Rendimiento (prompt 18b): antes recorría cada producto activo y por
+    cada uno consultaba sus conteos_fisicos más la property .diferencia
+    de cada conteo (consultas proporcionales a productos y conteos).
+    Ahora usa un MotorStockCosto compartido (3 consultas fijas) y una
+    única consulta de conteos — o la que ya trae el llamador via
+    `conteos_por_producto`/`motor`, para no repetirla (ver home()).
     """
+    motor = motor or MotorStockCosto()
+    if conteos_por_producto is None:
+        conteos_por_producto = conteos_activos_por_producto()
+
     alertas = []
-    for producto in Producto.objects.filter(activo=True):
-        pendientes = [
-            conteo
-            for conteo in producto.conteos_fisicos.order_by("fecha", "creado_en")
-            if conteo.ajuste_generado_id is None and conteo.diferencia != 0
-        ]
+    for producto_id, conteos in conteos_por_producto.items():
+        pendientes = []
+        for conteo in conteos:
+            if conteo.ajuste_generado_id is not None:
+                continue
+            diferencia = conteo.cantidad_contada - motor.stock_teorico(producto_id, hasta_fecha=conteo.fecha)
+            if diferencia != 0:
+                pendientes.append((conteo, diferencia))
         if not pendientes:
             continue
-        conteo_mas_antiguo = pendientes[0]
+        conteo_mas_antiguo, diferencia_mas_antigua = pendientes[0]
         alertas.append(
             {
-                "producto": producto,
+                "producto": conteo_mas_antiguo.producto,
                 "conteo": conteo_mas_antiguo,
-                "diferencia": conteo_mas_antiguo.diferencia,
+                "diferencia": diferencia_mas_antigua,
                 "total_pendientes": len(pendientes),
             }
         )

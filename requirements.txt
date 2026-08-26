@@ -4,3 +4,7 @@ pywebview
 waitress
 django-crispy-forms
 crispy-bootstrap5
+reportlab
+psycopg[binary]
+dj-database-url
+django-environ
