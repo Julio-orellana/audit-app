@@ -116,6 +116,54 @@ class HistorialFiltroForm(forms.Form):
         widget=forms.DateInput(attrs={"type": "date", "class": "form-control"}),
     )
 
+    def clean(self):
+        cleaned_data = super().clean()
+        fecha_desde = cleaned_data.get("fecha_desde")
+        fecha_hasta = cleaned_data.get("fecha_hasta")
+        if fecha_desde and fecha_hasta and fecha_desde > fecha_hasta:
+            self.add_error("fecha_hasta", "La fecha final no puede ser anterior a la fecha inicial.")
+        return cleaned_data
+
+
+class MotivoCorreccionForm(forms.Form):
+    """
+    Motivo obligatorio de una corrección administrativa (edición o
+    eliminación de un registro ya guardado, prompt 17) — separado de
+    cualquier campo "motivo"/"notas" propio del modelo (ese es el motivo
+    de la venta/merma/ajuste original, no el de por qué se está
+    corrigiendo ahora). CharField sin required=False, así que Django ya
+    rechaza un envío vacío por su cuenta.
+    """
+    motivo_correccion = forms.CharField(
+        label="Motivo de la corrección",
+        widget=forms.Textarea(attrs={"rows": 3, "class": "form-control"}),
+        help_text="Obligatorio: explica por qué se corrige o elimina este registro ya guardado.",
+    )
+
+
+class LoteCompraCorreccionForm(LoteCompraForm):
+    motivo_correccion = forms.CharField(
+        label="Motivo de la corrección",
+        widget=forms.Textarea(attrs={"rows": 3}),
+        help_text="Obligatorio: explica por qué se corrige este registro ya guardado.",
+    )
+
+
+class MovimientoSalidaCorreccionForm(MovimientoSalidaForm):
+    motivo_correccion = forms.CharField(
+        label="Motivo de la corrección",
+        widget=forms.Textarea(attrs={"rows": 3}),
+        help_text="Obligatorio: explica por qué se corrige este registro ya guardado.",
+    )
+
+
+class ConteoFisicoCorreccionForm(ConteoFisicoForm):
+    motivo_correccion = forms.CharField(
+        label="Motivo de la corrección",
+        widget=forms.Textarea(attrs={"rows": 3}),
+        help_text="Obligatorio: explica por qué se corrige este registro ya guardado.",
+    )
+
 
 class ReporteForm(forms.Form):
     fecha_inicio = forms.DateField(

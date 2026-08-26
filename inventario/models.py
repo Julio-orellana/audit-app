@@ -227,6 +227,35 @@ class ConteoFisico(models.Model):
         return f"Conteo {self.producto} ({self.fecha}): {self.cantidad_contada}"
 
 
+class CorreccionHistorial(models.Model):
+    """
+    Registro obligatorio de cada edición o eliminación de un LoteCompra,
+    MovimientoSalida o ConteoFisico ya guardado (prompt 17). Cambia
+    conscientemente la regla original de que un reporte de un mes cerrado
+    nunca cambia: ahora sí puede cambiar si un admin corrige algo, pero
+    siempre queda constancia de quién, cuándo, qué y por qué — nunca se
+    crea uno de estos sin el cambio real aplicado en la misma transacción,
+    ni viceversa (ver las vistas de corrección en views.py).
+    """
+    ACCION_CHOICES = (("edicion", "Edición"), ("eliminacion", "Eliminación"))
+
+    tipo_registro = models.CharField(max_length=30)  # "LoteCompra", "MovimientoSalida", "ConteoFisico"
+    registro_id = models.PositiveIntegerField()
+    accion = models.CharField(max_length=15, choices=ACCION_CHOICES)
+    datos_anteriores = models.JSONField()
+    datos_nuevos = models.JSONField(null=True, blank=True)
+    motivo = models.TextField()
+    realizado_por = models.ForeignKey(User, on_delete=models.SET_NULL, null=True)
+    fecha = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        verbose_name_plural = "Correcciones al historial"
+        ordering = ["-fecha"]
+
+    def __str__(self):
+        return f"{self.get_accion_display()} {self.tipo_registro} #{self.registro_id} ({self.fecha:%Y-%m-%d})"
+
+
 class ReferenciaVentaImportada(models.Model):
     """
     Opcional (fase posterior, no implementar todavía en el flujo funcional):

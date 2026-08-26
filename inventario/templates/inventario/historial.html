@@ -51,7 +51,21 @@
       <div class="num">{{ fila.cantidad }}</div>
       <div class="num">{% if fila.valor_unitario is not None %}Q{{ fila.valor_unitario }}{% else %}—{% endif %}</div>
       <div style="color:var(--ink-soft);font-size:13.5px;">{{ fila.usuario|default:"—" }}</div>
-      <div style="color:var(--ink-soft);font-size:13.5px;">{{ fila.detalle|default:"—" }}</div>
+      <div style="color:var(--ink-soft);font-size:13.5px;">
+        {{ fila.detalle|default:"—" }}
+        {% if rol_usuario == "admin" %}
+          {% if fila.tipo_registro == "LoteCompra" %}
+            <a href="{% url 'lotecompra_correccion_editar' fila.registro_id %}" style="margin-left:8px;">Editar</a>
+            · <a href="{% url 'lotecompra_correccion_eliminar' fila.registro_id %}" style="color:var(--danger-ink);">Eliminar</a>
+          {% elif fila.tipo_registro == "MovimientoSalida" %}
+            <a href="{% url 'movimientosalida_correccion_editar' fila.registro_id %}" style="margin-left:8px;">Editar</a>
+            · <a href="{% url 'movimientosalida_correccion_eliminar' fila.registro_id %}" style="color:var(--danger-ink);">Eliminar</a>
+          {% elif fila.tipo_registro == "ConteoFisico" %}
+            <a href="{% url 'conteofisico_correccion_editar' fila.registro_id %}" style="margin-left:8px;">Editar</a>
+            · <a href="{% url 'conteofisico_correccion_eliminar' fila.registro_id %}" style="color:var(--danger-ink);">Eliminar</a>
+          {% endif %}
+        {% endif %}
+      </div>
     </div>
   {% empty %}
     <div style="padding:20px;color:var(--ink-faint);">Sin movimientos con estos filtros.</div>

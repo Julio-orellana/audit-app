@@ -1,0 +1,25 @@
+{% extends "base.html" %}
+{% load crispy_forms_tags %}
+{% block content %}
+<div class="form-card" style="max-width:620px;">
+  <h1 class="form-card-title">Corregir {{ titulo_registro }}</h1>
+  <p class="form-card-subtitle">
+    Estás editando un registro ya guardado. Esto es una corrección administrativa — queda registrada en
+    <a href="{% url 'correcciones_historial' %}">Correcciones al historial</a> con el antes y el después,
+    quién la hizo y por qué.
+  </p>
+
+  {% if advertencia %}
+    <div class="alert alert-warning">{{ advertencia }}</div>
+  {% endif %}
+
+  <form method="post">
+    {% csrf_token %}
+    {{ form|crispy }}
+    <div style="display:flex;gap:12px;margin-top:8px;">
+      <button type="submit" class="btn btn-primary">Guardar corrección</button>
+      <a href="{% url 'historial' %}" class="btn btn-link">Cancelar</a>
+    </div>
+  </form>
+</div>
+{% endblock %}
