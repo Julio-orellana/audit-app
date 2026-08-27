@@ -20,7 +20,20 @@ from django.core.exceptions import PermissionDenied
 
 
 def _tiene_rol(user, roles):
-    return user.is_authenticated and user.groups.filter(name__in=roles).exists()
+    if not user.is_authenticated:
+        return False
+    if hasattr(user, "_rol_cache"):
+        # Prompt 19: cuando el usuario viene resuelto desde la caché
+        # offline (sin conexión — ver BackendConRespaldoOffline.get_user()
+        # en inventario/offline.py), no existe una consulta de grupos real
+        # que hacer — _rol_cache YA es la única fuente de verdad posible
+        # en ese caso. Usarla también aquí (antes esta función siempre
+        # consultaba .groups directo, sin pasar por rol_de()) es lo que
+        # hace posible que RequiereRol/requiere_rol sigan funcionando sin
+        # conexión — de otro modo la cola offline nunca llegaría a
+        # aplicarse: la request moriría aquí, antes que en la vista.
+        return user._rol_cache in roles
+    return user.groups.filter(name__in=roles).exists()
 
 
 def rol_de(user):
@@ -30,12 +43,27 @@ def rol_de(user):
     admin > auditor > vendedor; alguien sin ninguno de los tres grupos se
     trata como vendedor — el más restringido — para nunca mostrar de más
     por accidente ante un usuario sin rol asignado.
+
+    Se cachea en el propio objeto `user` (prompt 24): dentro de una misma
+    request, rol_de() se llama más de una vez con el mismo usuario (la
+    vista y, después, el context processor que expone "rol_usuario" a la
+    plantilla) — sin esto, cada llamada repetía la(s) misma(s) consulta(s)
+    de grupo, pagando otra vez la latencia de red fija contra Neon por
+    algo que no cambia dentro de una request. Mismo patrón que ya usa el
+    propio ModelBackend de Django para cachear permisos en el usuario
+    (_perm_cache) — seguro porque AuthenticationMiddleware arma un
+    usuario nuevo (y por lo tanto sin caché) en cada request.
     """
+    if hasattr(user, "_rol_cache"):
+        return user._rol_cache
     if user.groups.filter(name="admin").exists():
-        return "admin"
-    if user.groups.filter(name="auditor").exists():
-        return "auditor"
-    return "vendedor"
+        rol = "admin"
+    elif user.groups.filter(name="auditor").exists():
+        rol = "auditor"
+    else:
+        rol = "vendedor"
+    user._rol_cache = rol
+    return rol
 
 
 def RequiereRol(*roles):

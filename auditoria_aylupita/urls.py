@@ -15,12 +15,16 @@ Including another URLconf
     2. Add a URL to urlpatterns:  path('blog/', include('blog.urls'))
 """
 from django.contrib import admin
-from django.contrib.auth import views as auth_views
 from django.urls import include, path
+
+from inventario.views import LoginConRespaldoOfflineView, LogoutConRespaldoOfflineView
 
 urlpatterns = [
     path('admin/', admin.site.urls),
-    path('login/', auth_views.LoginView.as_view(), name='login'),
-    path('logout/', auth_views.LogoutView.as_view(), name='logout'),
+    # Login/logout propios (prompt 19b, punto 1): iniciar sesión SÍ
+    # funciona sin conexión, validando contra la caché local de
+    # credenciales de esta máquina — ver inventario/offline.py.
+    path('login/', LoginConRespaldoOfflineView.as_view(), name='login'),
+    path('logout/', LogoutConRespaldoOfflineView.as_view(), name='logout'),
     path('', include('inventario.urls')),
 ]

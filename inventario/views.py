@@ -1,3 +1,4 @@
+import json
 from datetime import date, timedelta
 from decimal import Decimal
 from urllib.parse import urlencode
@@ -5,6 +6,8 @@ from urllib.parse import urlencode
 from django.contrib import messages
 from django.contrib.auth.decorators import login_required
 from django.contrib.auth.mixins import LoginRequiredMixin
+from django.contrib.auth import SESSION_KEY
+from django.contrib.auth.views import LoginView, LogoutView
 from django.db import transaction
 from django.http import HttpResponse
 from django.shortcuts import get_object_or_404, redirect, render
@@ -28,9 +31,25 @@ from .forms import (
 )
 from .antiduplicado import ProteccionDobleSubmitMixin
 from .models import Categoria, ConteoFisico, CorreccionHistorial, LoteCompra, MovimientoSalida, Producto
+from .offline import (
+    ALIAS_LOCAL,
+    CLAVE_SESION_OFFLINE,
+    ColaOfflineMixin,
+    ERRORES_DE_CONEXION,
+    completar_snapshot_offline,
+    contar_pendientes,
+    hay_conexion,
+)
 from .permisos import RequiereRol, requiere_rol, rol_de
 from .reportes import generar_reporte_excel
-from .resiliencia import ManejoErrorConexionMixin, ReintentoEscrituraMixin, manejar_error_conexion
+from .resiliencia import (
+    ManejoErrorConexionMixin,
+    ReintentoEscrituraMixin,
+    RequiereConexionMixin,
+    funciona_sin_conexion,
+    manejar_error_conexion,
+    requiere_conexion,
+)
 from .services import (
     MotorStockCosto,
     alertas_conteo_fisico,
@@ -52,13 +71,80 @@ def _saludo_segun_hora():
     return "Buenas noches"
 
 
+class LoginConRespaldoOfflineView(LoginView):
+    """
+    Inicio de sesión que TAMBIÉN funciona sin conexión (prompt 19b,
+    punto 1).
+
+    La validación en sí la hace BackendConRespaldoOffline
+    (inventario/offline.py): con internet valida contra Neon como
+    siempre; sin internet valida contra la caché local de credenciales
+    de esta máquina. Aquí solo queda resolver el último detalle: la
+    señal user_logged_in de Django dispara update_last_login(), que
+    escribe en auth_user — y eso, sin conexión, revienta DESPUÉS de que
+    la sesión ya quedó correctamente establecida. Se atrapa ese caso
+    concreto (verificando que la sesión sí quedó) en vez de dejar que
+    tumbe un inicio de sesión que en realidad funcionó.
+    """
+    funciona_sin_conexion = True
+
+    def form_valid(self, form):
+        entro_sin_conexion = getattr(form.get_user(), "_resuelto_offline", False)
+        try:
+            respuesta = super().form_valid(form)
+        except ERRORES_DE_CONEXION:
+            if not self.request.session.get(SESSION_KEY):
+                # La sesión NO llegó a establecerse: esto no es el caso
+                # de last_login, es un fallo real — que lo tome el
+                # middleware global y muestre la pantalla clara.
+                raise
+            respuesta = redirect(self.get_success_url())
+        if entro_sin_conexion:
+            self.request.session[CLAVE_SESION_OFFLINE] = True
+            messages.info(
+                self.request,
+                "Entraste sin conexión a internet. Puedes registrar movimientos "
+                "normalmente: se guardan en este equipo y se sincronizan solos "
+                "en cuanto vuelva la conexión.",
+            )
+        return respuesta
+
+
+class LogoutConRespaldoOfflineView(LogoutView):
+    """
+    Cerrar sesión no toca la base (la sesión vive en archivo, ver
+    SESSION_ENGINE en settings.py), así que funciona igual sin conexión.
+    La subclase existe solo para dejarlo clasificado explícitamente
+    (prompt 19b, punto 4).
+    """
+    funciona_sin_conexion = True
+
+
+@funciona_sin_conexion
 @login_required
 @manejar_error_conexion
 def home(request):
+    if not hay_conexion():
+        # Dashboard básico offline (prompt 19): mismo catálogo cacheado
+        # reducido (nombre + precio, sin cifras financieras — esas no se
+        # pueden calcular sin conexión) para CUALQUIER rol, no solo
+        # vendedor — admin/auditor pierden su dashboard completo mientras
+        # dure el corte, pero siguen viendo el catálogo y pueden seguir
+        # registrando movimientos (la cola offline los guarda igual).
+        return _home_offline(request)
     if rol_de(request.user) == "vendedor":
         return _home_vendedor(request)
 
-    productos = list(Producto.objects.filter(activo=True).select_related("categoria"))
+    # select_related("producto_base") (prompt 24): home.html muestra
+    # "Producto base: X" bajo cada producto derivado — sin esto, acceder a
+    # fila.producto.producto_base en el template dispara una consulta
+    # perdida POR CADA producto derivado del catálogo (7 en el catálogo
+    # actual), algo que el diagnóstico de rendimiento del prompt 18b no
+    # detectó porque solo contaba consultas totales sin desglosar de
+    # dónde salían — cada una de esas consultas paga la misma latencia de
+    # red fija que cualquier otra contra Neon, así que 7 de más sí se
+    # sienten en un navegador real aunque no sean muchas en total.
+    productos = list(Producto.objects.filter(activo=True).select_related("categoria", "producto_base"))
 
     # Consultas fijas (prompt 18b): un MotorStockCosto (3 consultas) y una
     # sola consulta de conteos, compartidos entre el cálculo de stock/costo,
@@ -94,7 +180,7 @@ def home(request):
     filas_alerta.sort(key=lambda f: f["alerta"]["conteo"].fecha)
 
     hoy = timezone.localdate()
-    totales_hoy = resumen_general(hoy, hoy)["totales"]
+    totales_hoy = resumen_general(hoy, hoy, motor=motor)["totales"]
 
     context = {
         "filas_alerta": filas_alerta,
@@ -118,6 +204,25 @@ def _home_vendedor(request):
         "hoy": timezone.localdate(),
         "saludo": _saludo_segun_hora(),
         "productos_por_categoria": productos_activos_por_categoria(),
+        "pendientes": contar_pendientes(),
+    }
+    return render(request, "inventario/home_vendedor.html", context)
+
+
+def _home_offline(request):
+    """
+    Mismo template reducido que _home_vendedor() (prompt 19) — el
+    catálogo cacheado en "local_disco" es lo único que se puede mostrar
+    con confianza sin conexión, sea cual sea el rol. "modo_offline" en el
+    contexto agrega el aviso — nunca se pasa True en el uso normal, así
+    que un vendedor con conexión ve exactamente lo mismo que siempre.
+    """
+    context = {
+        "hoy": timezone.localdate(),
+        "saludo": _saludo_segun_hora(),
+        "productos_por_categoria": productos_activos_por_categoria(alias=ALIAS_LOCAL),
+        "pendientes": contar_pendientes(),
+        "modo_offline": True,
     }
     return render(request, "inventario/home_vendedor.html", context)
 
@@ -128,20 +233,20 @@ def _home_vendedor(request):
 # vendedor no tiene acceso — su propio catálogo reducido vive en
 # home_vendedor.html.
 
-class CategoriaListView(RequiereRol("admin", "auditor"), generic.ListView):
+class CategoriaListView(RequiereRol("admin", "auditor"), RequiereConexionMixin, generic.ListView):
     model = Categoria
     template_name = "inventario/categoria_list.html"
     context_object_name = "categorias"
 
 
-class CategoriaCreateView(RequiereRol("admin", "auditor"), generic.CreateView):
+class CategoriaCreateView(RequiereRol("admin", "auditor"), RequiereConexionMixin, generic.CreateView):
     model = Categoria
     form_class = CategoriaForm
     template_name = "inventario/categoria_form.html"
     success_url = reverse_lazy("categoria_list")
 
 
-class CategoriaUpdateView(RequiereRol("admin", "auditor"), generic.UpdateView):
+class CategoriaUpdateView(RequiereRol("admin", "auditor"), RequiereConexionMixin, generic.UpdateView):
     model = Categoria
     form_class = CategoriaForm
     template_name = "inventario/categoria_form.html"
@@ -149,6 +254,7 @@ class CategoriaUpdateView(RequiereRol("admin", "auditor"), generic.UpdateView):
 
 
 @requiere_rol("admin", "auditor")
+@requiere_conexion
 @require_POST
 def categoria_toggle_activo(request, pk):
     categoria = get_object_or_404(Categoria, pk=pk)
@@ -159,21 +265,21 @@ def categoria_toggle_activo(request, pk):
 
 # --- Producto ----------------------------------------------------------------
 
-class ProductoListView(RequiereRol("admin", "auditor"), generic.ListView):
+class ProductoListView(RequiereRol("admin", "auditor"), RequiereConexionMixin, generic.ListView):
     model = Producto
     template_name = "inventario/producto_list.html"
     context_object_name = "productos"
     queryset = Producto.objects.select_related("categoria", "producto_base")
 
 
-class ProductoCreateView(RequiereRol("admin", "auditor"), generic.CreateView):
+class ProductoCreateView(RequiereRol("admin", "auditor"), RequiereConexionMixin, generic.CreateView):
     model = Producto
     form_class = ProductoForm
     template_name = "inventario/producto_form.html"
     success_url = reverse_lazy("producto_list")
 
 
-class ProductoUpdateView(RequiereRol("admin", "auditor"), generic.UpdateView):
+class ProductoUpdateView(RequiereRol("admin", "auditor"), RequiereConexionMixin, generic.UpdateView):
     model = Producto
     form_class = ProductoForm
     template_name = "inventario/producto_form.html"
@@ -181,6 +287,7 @@ class ProductoUpdateView(RequiereRol("admin", "auditor"), generic.UpdateView):
 
 
 @requiere_rol("admin", "auditor")
+@requiere_conexion
 @require_POST
 def producto_toggle_activo(request, pk):
     producto = get_object_or_404(Producto, pk=pk)
@@ -191,20 +298,28 @@ def producto_toggle_activo(request, pk):
 
 # --- LoteCompra --------------------------------------------------------------
 
-class LoteCompraCreateView(ProteccionDobleSubmitMixin, ReintentoEscrituraMixin, RequiereRol("admin", "auditor"), generic.CreateView):
+class LoteCompraCreateView(ProteccionDobleSubmitMixin, ColaOfflineMixin, ReintentoEscrituraMixin, RequiereRol("admin", "auditor"), generic.CreateView):
+    # Funciona sin conexión vía ColaOfflineMixin (prompt 19/19b): la
+    # entrada se guarda en la cola local y se sincroniza sola.
+    funciona_sin_conexion = True
     model = LoteCompra
     form_class = LoteCompraForm
     template_name = "inventario/lotecompra_form.html"
     success_url = reverse_lazy("historial")
 
     def form_valid(self, form):
-        form.instance.registrado_por = self.request.user
+        # .registrado_por_id (no .registrado_por = ...): en modo offline
+        # (prompt 19) self.request.user puede ser un UsuarioOffline, no
+        # una instancia real de auth.User — asignarlo directo al FK
+        # revienta con ValueError. Asignar el id crudo funciona igual en
+        # ambos casos (con conexión real o con el respaldo offline).
+        form.instance.registrado_por_id = self.request.user.pk
         return super().form_valid(form)
 
 
 # --- MovimientoSalida ----------------------------------------------------------
 
-class MovimientoSalidaCreateView(ProteccionDobleSubmitMixin, ReintentoEscrituraMixin, RequiereRol("admin", "auditor", "vendedor"), generic.CreateView):
+class MovimientoSalidaCreateView(ProteccionDobleSubmitMixin, ColaOfflineMixin, ReintentoEscrituraMixin, RequiereRol("admin", "auditor", "vendedor"), generic.CreateView):
     """
     admin/auditor pueden registrar los 3 tipos (venta/merma/ajuste). Un
     vendedor solo puede registrar ventas — MovimientoSalidaForm recibe
@@ -212,6 +327,8 @@ class MovimientoSalidaCreateView(ProteccionDobleSubmitMixin, ReintentoEscrituraM
     rechaza en el backend cualquier tipo distinto de "venta" así se
     manipule el HTML o se mande el campo a mano (ver MovimientoSalidaForm).
     """
+    # Funciona sin conexión vía ColaOfflineMixin (prompt 19/19b).
+    funciona_sin_conexion = True
     model = MovimientoSalida
     form_class = MovimientoSalidaForm
     template_name = "inventario/movimientosalida_form.html"
@@ -235,13 +352,52 @@ class MovimientoSalidaCreateView(ProteccionDobleSubmitMixin, ReintentoEscrituraM
         return redirect(self.get_success_url())
 
     def form_valid(self, form):
-        form.instance.registrado_por = self.request.user
-        return super().form_valid(form)
+        # .registrado_por_id (no .registrado_por = ...): en modo offline
+        # (prompt 19) self.request.user puede ser un UsuarioOffline, no
+        # una instancia real de auth.User — asignarlo directo al FK
+        # revienta con ValueError. Asignar el id crudo funciona igual en
+        # ambos casos (con conexión real o con el respaldo offline).
+        form.instance.registrado_por_id = self.request.user.pk
+        if rol_de(self.request.user) == "vendedor":
+            # Igual que el tipo (ver docstring de la clase): un vendedor
+            # no puede elegir fecha, ni siquiera mandando un HTML
+            # manipulado o una fecha distinta a mano en el POST — esto
+            # ignora lo que haya llegado y siempre fuerza la de hoy
+            # (prompt 29). El campo aparece oculto en el formulario, pero
+            # esa es solo la capa visual; esta es la que de verdad cuenta.
+            # Se calcula ANTES del chequeo de conexión de abajo: la fecha
+            # de una venta offline sigue siendo la de HOY (momento de
+            # creación local), nunca la del momento en que sincronice
+            # (prompt 19, punto 7).
+            form.instance.fecha = timezone.localdate()
+        if not hay_conexion():
+            # MovimientoSalida.save() normalmente calcula
+            # costo_unitario_snapshot/precio_venta_unitario consultando la
+            # base — sin conexión eso nunca se alcanza a ejecutar. Se
+            # completa aquí desde la caché local del catálogo (prompt 19)
+            # ANTES de que ColaOfflineMixin (más abajo en la cadena)
+            # encole la instancia, para que quede con un snapshot
+            # "congelado" al momento real de la venta.
+            completar_snapshot_offline(form.instance)
+        respuesta = super().form_valid(form)
+        mensajes_por_tipo = {
+            "venta": "Venta registrada correctamente.",
+            "merma": "Merma registrada correctamente.",
+            "ajuste": "Ajuste registrado correctamente.",
+        }
+        messages.success(self.request, mensajes_por_tipo.get(form.instance.tipo, "Salida registrada correctamente."))
+        return respuesta
+
+    def form_invalid(self, form):
+        messages.error(self.request, "No se pudo registrar: revisa los datos marcados abajo.")
+        return super().form_invalid(form)
 
 
 # --- ConteoFisico --------------------------------------------------------------
 
-class ConteoFisicoCreateView(ProteccionDobleSubmitMixin, ReintentoEscrituraMixin, RequiereRol("admin", "auditor"), generic.CreateView):
+class ConteoFisicoCreateView(ProteccionDobleSubmitMixin, ColaOfflineMixin, ReintentoEscrituraMixin, RequiereRol("admin", "auditor"), generic.CreateView):
+    # Funciona sin conexión vía ColaOfflineMixin (prompt 19/19b).
+    funciona_sin_conexion = True
     model = ConteoFisico
     form_class = ConteoFisicoForm
     template_name = "inventario/conteofisico_form.html"
@@ -251,11 +407,16 @@ class ConteoFisicoCreateView(ProteccionDobleSubmitMixin, ReintentoEscrituraMixin
     success_url = reverse_lazy("home")
 
     def form_valid(self, form):
-        form.instance.registrado_por = self.request.user
+        # .registrado_por_id (no .registrado_por = ...): en modo offline
+        # (prompt 19) self.request.user puede ser un UsuarioOffline, no
+        # una instancia real de auth.User — asignarlo directo al FK
+        # revienta con ValueError. Asignar el id crudo funciona igual en
+        # ambos casos (con conexión real o con el respaldo offline).
+        form.instance.registrado_por_id = self.request.user.pk
         return super().form_valid(form)
 
 
-class ConteoFisicoDetailView(RequiereRol("admin", "auditor"), generic.DetailView):
+class ConteoFisicoDetailView(RequiereRol("admin", "auditor"), RequiereConexionMixin, generic.DetailView):
     model = ConteoFisico
     template_name = "inventario/conteofisico_detail.html"
     context_object_name = "conteo"
@@ -267,6 +428,7 @@ class ConteoFisicoDetailView(RequiereRol("admin", "auditor"), generic.DetailView
 
 
 @requiere_rol("admin", "auditor")
+@requiere_conexion
 @require_POST
 def generar_ajuste(request, pk):
     # Condición de carrera (prompt 21, hallazgo 4.1 del diagnóstico): dos
@@ -314,7 +476,7 @@ def generar_ajuste(request, pk):
 # usar RequiereRol("admin") — exclusivo de administrador, ni el auditor
 # puede editar o borrar lo ya registrado (ver reglas de rol del prompt 16).
 
-class HistorialView(ManejoErrorConexionMixin, RequiereRol("admin", "auditor"), generic.TemplateView):
+class HistorialView(RequiereRol("admin", "auditor"), RequiereConexionMixin, ManejoErrorConexionMixin, generic.TemplateView):
     template_name = "inventario/historial.html"
 
     def get_context_data(self, **kwargs):
@@ -343,7 +505,7 @@ class HistorialView(ManejoErrorConexionMixin, RequiereRol("admin", "auditor"), g
 
 # --- Reportes --------------------------------------------------------------
 
-class ReporteView(ManejoErrorConexionMixin, RequiereRol("admin", "auditor"), generic.View):
+class ReporteView(RequiereRol("admin", "auditor"), RequiereConexionMixin, ManejoErrorConexionMixin, generic.View):
     """
     GET sin periodo/rango: muestra el formulario de selección (periodo +
     productos).
@@ -547,6 +709,8 @@ class ReporteView(ManejoErrorConexionMixin, RequiereRol("admin", "auditor"), gen
 # --- Instrucciones -----------------------------------------------------------
 
 class InstruccionesView(LoginRequiredMixin, generic.TemplateView):
+    # Contenido estático: no consulta la base, funciona sin conexión.
+    funciona_sin_conexion = True
     template_name = "inventario/instrucciones.html"
 
 
@@ -559,9 +723,17 @@ class InstruccionesView(LoginRequiredMixin, generic.TemplateView):
 # snapshot antes/después en la MISMA transacción que el cambio real —
 # nunca puede quedar uno sin el otro.
 
-class CorreccionUpdateView(RequiereRol("admin"), generic.UpdateView):
-    """Base compartida para editar un registro ya guardado. Cada subclase
-    solo define model/form_class/titulo_registro."""
+class CorreccionUpdateView(RequiereRol("admin"), RequiereConexionMixin, ManejoErrorConexionMixin, generic.UpdateView):
+    """
+    Base compartida para editar un registro ya guardado. Cada subclase
+    solo define model/form_class/titulo_registro.
+
+    ManejoErrorConexionMixin (no ColaOfflineMixin): editar/eliminar
+    historial NUNCA pasa por la cola offline, bajo ninguna circunstancia
+    (decisión explícita del prompt 19 — un mensaje claro pidiendo
+    conexión es lo único que corresponde aquí, la operación en sí se
+    bloquea del todo).
+    """
     template_name = "inventario/correccion_form.html"
     success_url = reverse_lazy("historial")
     titulo_registro = "registro"
@@ -580,7 +752,10 @@ class CorreccionUpdateView(RequiereRol("admin"), generic.UpdateView):
         return super().post(request, *args, **kwargs)
 
     def form_valid(self, form):
-        motivo = form.cleaned_data["motivo_correccion"]
+        # MovimientoSalidaCorreccionForm no tiene "motivo_correccion" —
+        # reutiliza el campo "motivo" del modelo, ver su docstring en
+        # forms.py.
+        motivo = form.cleaned_data.get("motivo_correccion") or form.cleaned_data["motivo"]
         tipo_registro = type(self.object).__name__
         with transaction.atomic():
             response = super().form_valid(form)
@@ -604,6 +779,17 @@ class LoteCompraCorreccionUpdateView(CorreccionUpdateView):
 
 
 class MovimientoSalidaCorreccionUpdateView(CorreccionUpdateView):
+    """
+    precio_venta_unitario/costo_unitario_snapshot (prompt 28): al crear un
+    MovimientoSalida, MovimientoSalida.save() los calcula del producto —
+    pero solo "si están vacíos", pensado para la creación. Al EDITAR ya
+    tienen un valor (el snapshot original), así que ese guard nunca
+    recalculaba nada al cambiar el producto — el precio/costo del
+    producto ANTERIOR quedaba pegado al nuevo, corrompiendo el reporte
+    financiero de ese movimiento (ver diagnóstico del prompt 28: el
+    stock_teorico() del producto base SÍ se recalculaba bien solo — es
+    live, no cacheado — el bug real era únicamente este).
+    """
     model = MovimientoSalida
     form_class = MovimientoSalidaCorreccionForm
     titulo_registro = "salida"
@@ -618,7 +804,43 @@ class MovimientoSalidaCorreccionUpdateView(CorreccionUpdateView):
                 f"cantidad aquí no actualiza la diferencia ya calculada de ese conteo — a partir de "
                 f"ahora quedarían desalineados si no corriges también el conteo."
             )
+        # Vista previa en el formulario (prompt 28, punto 2): precio/costo
+        # DE HOY de cada producto seleccionable, para que el admin vea de
+        # inmediato qué se aplicaría si deja los campos en blanco — el
+        # cálculo real al guardar usa costo_promedio(hasta_fecha=<fecha
+        # del movimiento>), que puede diferir de "hoy" si hubo compras
+        # después de esa fecha; el texto en la plantilla aclara eso.
+        precios = {
+            str(producto.pk): {
+                "nombre": producto.nombre,
+                "precio": str(producto.precio_venta_actual),
+                "costo": str(producto.costo_promedio()),
+            }
+            for producto in context["form"].fields["producto"].queryset
+        }
+        context["precios_productos_json"] = json.dumps(precios)
         return context
+
+    def form_valid(self, form):
+        producto_anterior_id = self._snapshot_antes["producto"]
+        producto_cambio = producto_anterior_id != form.instance.producto_id
+
+        precio_a_mano = form.cleaned_data.get("precio_venta_unitario")
+        costo_a_mano = form.cleaned_data.get("costo_unitario_snapshot")
+
+        if precio_a_mano is not None:
+            form.instance.precio_venta_unitario = precio_a_mano
+        elif producto_cambio and form.instance.tipo == "venta":
+            form.instance.precio_venta_unitario = form.instance.producto.precio_venta_actual
+
+        if costo_a_mano is not None:
+            form.instance.costo_unitario_snapshot = costo_a_mano
+        elif producto_cambio:
+            form.instance.costo_unitario_snapshot = form.instance.producto.costo_promedio(
+                hasta_fecha=form.instance.fecha
+            )
+
+        return super().form_valid(form)
 
 
 class ConteoFisicoCorreccionUpdateView(CorreccionUpdateView):
@@ -637,7 +859,7 @@ class ConteoFisicoCorreccionUpdateView(CorreccionUpdateView):
         return context
 
 
-class CorreccionDeleteView(RequiereRol("admin"), generic.DeleteView):
+class CorreccionDeleteView(RequiereRol("admin"), RequiereConexionMixin, ManejoErrorConexionMixin, generic.DeleteView):
     """
     Base compartida para eliminar un registro ya guardado. No usa el flujo
     de confirmación por defecto de DeleteView (un solo POST sin más) —
@@ -645,6 +867,9 @@ class CorreccionDeleteView(RequiereRol("admin"), generic.DeleteView):
     puede usar para la relación ConteoFisico.ajuste_generado (prompt 17,
     punto 5): _bloqueo_eliminacion() para impedirla del todo, o
     _advertencia_eliminacion() para avisar sin impedirla.
+
+    ManejoErrorConexionMixin, igual que CorreccionUpdateView — eliminar
+    historial tampoco pasa nunca por la cola offline (prompt 19).
     """
     form_class = MotivoCorreccionForm
     template_name = "inventario/correccion_confirm_delete.html"
@@ -734,7 +959,7 @@ class ConteoFisicoCorreccionDeleteView(CorreccionDeleteView):
         return None
 
 
-class CorreccionHistorialListView(RequiereRol("admin"), generic.ListView):
+class CorreccionHistorialListView(RequiereRol("admin"), RequiereConexionMixin, generic.ListView):
     model = CorreccionHistorial
     template_name = "inventario/correccion_historial_list.html"
     context_object_name = "correcciones"
@@ -751,8 +976,11 @@ class CorreccionHistorialListView(RequiereRol("admin"), generic.ListView):
                 cambios = [
                     (campo, valor_antes, correccion.datos_nuevos.get(campo))
                     for campo, valor_antes in correccion.datos_anteriores.items()
-                    if valor_antes != correccion.datos_nuevos.get(campo)
+                    if campo != "motivo" and valor_antes != correccion.datos_nuevos.get(campo)
                 ]
-            filas.append({"correccion": correccion, "cambios": cambios})
+            datos_anteriores = {
+                campo: valor for campo, valor in correccion.datos_anteriores.items() if campo != "motivo"
+            }
+            filas.append({"correccion": correccion, "cambios": cambios, "datos_anteriores": datos_anteriores})
         context["filas"] = filas
         return context

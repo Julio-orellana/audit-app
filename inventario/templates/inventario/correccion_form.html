@@ -16,10 +16,48 @@
   <form method="post">
     {% csrf_token %}
     {{ form|crispy }}
+    {% if precios_productos_json %}
+      <p id="vista-previa-precio-costo" style="margin:-8px 0 16px;font-size:13.5px;color:var(--ink-soft);background:oklch(96% 0.006 80);border-radius:8px;padding:10px 14px;"></p>
+    {% endif %}
     <div style="display:flex;gap:12px;margin-top:8px;">
       <button type="submit" class="btn btn-primary">Guardar corrección</button>
       <a href="{% url 'historial' %}" class="btn btn-link">Cancelar</a>
     </div>
   </form>
 </div>
+
+{% if precios_productos_json %}
+<script>
+  // Vista previa de precio/costo (prompt 28): puramente informativa, no
+  // rellena ningún campo — solo muestra qué se aplicaría si "Precio de
+  // venta unitario"/"Costo unitario" se dejan en blanco y el producto
+  // cambió. El costo mostrado aquí es el de HOY (costo_promedio() sin
+  // fecha de corte); el que de verdad se guarda al confirmar usa la
+  // fecha del movimiento (arriba), que puede dar un número distinto si
+  // hubo compras después de esa fecha.
+  (function () {
+    var datos = {{ precios_productos_json|safe }};
+    var selectProducto = document.getElementById("id_producto");
+    var previa = document.getElementById("vista-previa-precio-costo");
+    if (!selectProducto || !previa) {
+      return;
+    }
+    function actualizar() {
+      var info = datos[selectProducto.value];
+      if (!info) {
+        previa.textContent = "";
+        return;
+      }
+      previa.textContent = (
+        'Si dejas "Precio de venta unitario" y "Costo unitario" en blanco, y cambiaste el producto, ' +
+        'se aplicará el de "' + info.nombre + '": precio de venta Q' + info.precio + ", costo promedio Q" +
+        info.costo + " (costo de hoy, como vista previa — el valor real que se guarda usa la fecha del " +
+        "movimiento de arriba)."
+      );
+    }
+    selectProducto.addEventListener("change", actualizar);
+    actualizar();
+  })();
+</script>
+{% endif %}
 {% endblock %}

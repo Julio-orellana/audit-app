@@ -1,4 +1,6 @@
 # inventario/models.py
+import uuid as uuid_lib
+
 from django.core.exceptions import ValidationError
 from django.db import models
 from django.contrib.auth.models import User
@@ -50,6 +52,16 @@ class Producto(models.Model):
         default=1,
         help_text="Unidades de producto_base que consume vender 1 unidad de este producto.",
     )
+    # costo_promedio_cache (prompt 19): SOLO se usa en la copia local
+    # offline del catálogo (alias "local_disco", ver inventario/offline.py)
+    # — contra Neon (alias "default") siempre queda en None y nunca se lee
+    # ni se escribe en el uso normal online. costo_promedio() es un método
+    # calculado (agrega LoteCompra), no algo que se pueda copiar tal cual
+    # a la caché local sin conexión — este campo guarda el último valor
+    # calculado en el refresco de caché más reciente (con conexión), para
+    # que MovimientoSalidaCreateView pueda armar un costo_unitario_snapshot
+    # razonable al encolar una venta sin conexión.
+    costo_promedio_cache = models.DecimalField(max_digits=8, decimal_places=2, null=True, blank=True, editable=False)
 
     class Meta:
         ordering = ["categoria__nombre", "nombre"]
@@ -135,6 +147,11 @@ class Producto(models.Model):
 
 class LoteCompra(models.Model):
     """Cada ingreso manual de inventario (ej: '1000 Gallo el 24/08')."""
+    # uuid (prompt 19): identifica el registro de forma única desde el
+    # momento en que se crea LOCALMENTE, antes de que llegue a la nube —
+    # la cola de sincronización offline lo usa como clave para que un
+    # reintento nunca cree un duplicado remoto (ver inventario/offline.py).
+    uuid = models.UUIDField(default=uuid_lib.uuid4, unique=True, editable=False)
     producto = models.ForeignKey(Producto, on_delete=models.PROTECT, related_name="lotes_compra")
     fecha = models.DateField()
     cantidad = models.PositiveIntegerField()
@@ -172,6 +189,7 @@ class MovimientoSalida(models.Model):
         ("merma", "Merma / Pérdida"),
         ("ajuste", "Ajuste por conteo físico"),
     )
+    uuid = models.UUIDField(default=uuid_lib.uuid4, unique=True, editable=False)
     producto = models.ForeignKey(Producto, on_delete=models.PROTECT, related_name="movimientos_salida")
     fecha = models.DateField()
     tipo = models.CharField(max_length=10, choices=TIPO_CHOICES, default="venta")
@@ -210,6 +228,7 @@ class ConteoFisico(models.Model):
     contra lo contado a mano; si hay diferencia, permite generar un
     MovimientoSalida tipo 'ajuste' para cuadrar el sistema y dejar rastro.
     """
+    uuid = models.UUIDField(default=uuid_lib.uuid4, unique=True, editable=False)
     producto = models.ForeignKey(Producto, on_delete=models.PROTECT, related_name="conteos_fisicos")
     fecha = models.DateField()
     cantidad_contada = models.PositiveIntegerField()
@@ -228,6 +247,16 @@ class ConteoFisico(models.Model):
     # views.py).
     ajuste_generado = models.OneToOneField(MovimientoSalida, on_delete=models.SET_NULL, null=True, blank=True)
     creado_en = models.DateTimeField(auto_now_add=True)
+
+    def clean(self):
+        super().clean()
+        if self.producto_id and self.producto.producto_base_id is not None:
+            raise ValidationError({
+                "producto": (
+                    f"'{self.producto}' es una variante/paquete de '{self.producto.producto_base}' — "
+                    f"registra el conteo físico sobre '{self.producto.producto_base}', no sobre esta variante."
+                )
+            })
 
     @property
     def diferencia(self):
@@ -282,3 +311,81 @@ class ReferenciaVentaImportada(models.Model):
 
     def __str__(self):
         return f"{self.producto_nombre} ({self.fecha}): {self.cantidad_reportada} [ref]"
+
+
+# --- Modelos exclusivamente locales (prompt 19, motor de sincronización
+# offline) — NUNCA existen en "default" (Neon): OfflineRouter
+# (inventario/db_router.py) impide que se migren ahí. Solo viven en
+# "local_disco" (el archivo SQLite local de esta máquina). Se definen
+# aquí, junto al resto de modelos del app, en vez de un archivo aparte,
+# para no romper la convención de un solo models.py del proyecto — el
+# router es lo que de verdad los mantiene fuera de Neon.
+
+class PendienteSincronizacion(models.Model):
+    """
+    Una escritura (LoteCompra/MovimientoSalida/ConteoFisico) que ya se
+    guardó localmente pero todavía no se confirmó contra Neon — el
+    "outbox" del patrón. Se crea en ColaOfflineMixin.form_valid() justo
+    antes de intentar la escritura real, y se borra apenas esa escritura
+    se confirma (o la confirma un reintento posterior del hilo de
+    sincronización) — nunca se marca "sincronizado" en la misma fila,
+    simplemente deja de existir.
+
+    payload guarda los campos ya listos para
+    Modelo.objects.get_or_create(uuid=..., defaults=payload) — uuid es la
+    clave de idempotencia: un reintento que en realidad ya se había
+    confirmado (ej. la escritura remota funcionó pero la respuesta se
+    perdió) encuentra la fila existente por uuid en vez de duplicarla.
+
+    Vive en el archivo local de esta máquina para los TRES roles (prompt
+    19b, punto 3) — antes la cola del vendedor vivía solo en RAM y se
+    perdía al cerrar la app; esa decisión se revirtió explícitamente.
+    """
+    uuid = models.UUIDField(unique=True)
+    modelo = models.CharField(max_length=30)  # "LoteCompra" | "MovimientoSalida" | "ConteoFisico"
+    payload = models.JSONField()
+    creado_en = models.DateTimeField()  # momento de creación LOCAL — nunca el de sincronización (prompt 29 aplica a esta fecha)
+    intentos = models.PositiveIntegerField(default=0)
+    ultimo_error = models.TextField(blank=True, null=True)
+
+    class Meta:
+        ordering = ["creado_en"]
+
+    def __str__(self):
+        return f"Pendiente {self.modelo} {self.uuid} ({self.intentos} intentos)"
+
+
+class CredencialOfflineCache(models.Model):
+    """
+    Credenciales del último inicio de sesión exitoso de cada usuario que
+    alguna vez entró CON CONEXIÓN en esta máquina (prompt 19b, punto 1).
+    Es lo que permite iniciar sesión durante un apagón: sin esto, abrir o
+    reiniciar la app sin internet dejaba a todos afuera y el modo offline
+    entero quedaba inservible.
+
+    password_hash guarda el MISMO hash que Django tiene en
+    auth_user.password (PBKDF2 con sal) — nunca la contraseña en texto
+    plano. check_password() lo valida igual que contra la base real, y de
+    este archivo no se puede deducir la contraseña.
+
+    aviso_password_cambiada lo marca refrescar_credenciales_cache() (hilo
+    de fondo) cuando, al volver la conexión, el hash real en Neon ya no
+    coincide con el cacheado: la contraseña cambió mientras la máquina
+    estaba sin conexión. Ver ContinuidadSesionOfflineMiddleware en
+    inventario/offline.py para qué se hace con esa marca.
+    """
+    username = models.CharField(max_length=150, primary_key=True)
+    user_id = models.PositiveIntegerField(db_index=True)
+    password_hash = models.CharField(max_length=255)
+    rol = models.CharField(max_length=20)
+    is_active = models.BooleanField(default=True)
+    is_staff = models.BooleanField(default=False)
+    is_superuser = models.BooleanField(default=False)
+    aviso_password_cambiada = models.BooleanField(default=False)
+    actualizado_en = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["username"]
+
+    def __str__(self):
+        return f"{self.username} ({self.rol})"

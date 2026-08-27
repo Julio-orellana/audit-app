@@ -12,7 +12,7 @@ puerto por completo — no queda ningún proceso de Python en segundo plano.
 """
 import os
 import socket
-import sys
+import sys2
 import threading
 import time
 
@@ -26,14 +26,46 @@ def _preparar_django():
 
     django.setup()
 
-    # Aplica migraciones pendientes en cada arranque. Es barato y no hace
-    # nada si ya están aplicadas (comando idempotente) — pero es lo que
-    # permite que el .exe funcione con un doble clic en una máquina nueva,
-    # sin que nadie tenga que abrir una terminal y correr
-    # "manage.py migrate" a mano la primera vez.
-    from django.core.management import call_command
+    # Hilo de fondo que sube la cola de pendientes (prompt 19). Va ANTES
+    # del migrate de "default" (Neon) y no depende para nada de que ese
+    # migrate funcione: la base local es SQLite, siempre disponible. Esto
+    # es justo lo que permite arrancar la app sin conexión.
+    #
+    # Desde el prompt 19b esto también lo arranca InventarioConfig.ready()
+    # (para que `manage.py runserver` sincronice igual); la llamada es
+    # idempotente, así que dejarla aquí explícita no arranca un segundo
+    # hilo — solo documenta que la app de escritorio lo necesita sí o sí.
+    from inventario.offline import iniciar_hilo_sincronizacion
 
-    call_command("migrate", run_syncdb=True, verbosity=0, interactive=False)
+    iniciar_hilo_sincronizacion()
+
+    # Aplica migraciones pendientes en cada arranque contra Neon. Es
+    # barato y no hace nada si ya están aplicadas (comando idempotente) —
+    # pero es lo que permite que el .exe funcione con un doble clic en
+    # una máquina nueva, sin que nadie tenga que abrir una terminal y
+    # correr "manage.py migrate" a mano la primera vez.
+    #
+    # Envuelto en try/except (prompt 19): antes, si la app arrancaba sin
+    # conexión, esto reventaba sin capturar el error y la app ni
+    # siquiera llegaba a abrir la ventana — confirmado con una prueba
+    # real cortando la conexión a propósito. Una migración pendiente en
+    # un arranque cualquiera es rarísima (solo pasa justo después de
+    # actualizar la app); no vale la pena bloquear TODO el arranque por
+    # eso — si de verdad hace falta, se aplica sola la próxima vez que
+    # haya conexión al abrir la app.
+    from django.core.management import call_command
+    from django.db.utils import InterfaceError, OperationalError
+
+    try:
+        call_command("migrate", run_syncdb=True, verbosity=0, interactive=False)
+    except (OperationalError, InterfaceError):
+        print(
+            "Sin conexión a la base en la nube al arrancar — se sigue de "
+            "todas formas con el catálogo y la cola guardados en este "
+            "equipo. Los movimientos se sincronizarán solos en cuanto "
+            "vuelva internet.",
+            file=sys.stderr,
+        )
 
     from django.core.wsgi import get_wsgi_application
 

@@ -16,6 +16,17 @@ db.sqlite3-journal
 staticfiles/
 media/
 
+# Cola/catálogo offline local (prompt 19) — datos locales de esta
+# máquina (pendientes por sincronizar, catálogo cacheado), nunca se sube
+# a git, igual que db.sqlite3.
+offline_local.sqlite3
+offline_local.sqlite3-journal
+
+# Sesiones en archivo (prompt 19b): SESSION_ENGINE ya no usa la base de
+# datos, para que una sesión ya iniciada no se caiga al quedarse sin
+# internet. Son archivos locales de esta máquina, nunca se versionan.
+sesiones/
+
 # Backups locales de la base de datos (respaldo automático, no versionado)
 backups/*
 !backups/.gitkeep

@@ -18,7 +18,11 @@
       <input type="hidden" name="token_formulario" value="{{ token_formulario }}">
 
       {{ form.producto|as_crispy_field }}
-      {{ form.fecha|as_crispy_field }}
+      {% if rol_usuario == "vendedor" %}
+        {{ form.fecha.as_hidden }}
+      {% else %}
+        {{ form.fecha|as_crispy_field }}
+      {% endif %}
 
       {% if rol_usuario == "vendedor" %}
         {{ form.tipo.as_hidden }}

@@ -1,13 +1,37 @@
 {% extends "base.html" %}
-{% block title %}No se pudo completar la consulta — Auditoría Aylupita{% endblock %}
+{% comment %}
+  Dos mensajes en una sola pantalla (prompt 19b, punto 4):
+
+  - requiere_conexion=True  -> se sabe que ahora mismo NO hay internet y
+    esta sección no puede funcionar sin él. El mensaje lo dice tal cual,
+    y aclara que registrar movimientos sí sigue disponible.
+  - requiere_conexion=False -> hubo un problema momentáneo de conexión a
+    media consulta, pero la conexión en general sí está: reintentar tiene
+    sentido (el mensaje de siempre, del prompt 18b).
+{% endcomment %}
+{% block title %}{% if requiere_conexion %}Esta función requiere conexión{% else %}No se pudo completar la consulta{% endif %} — Auditoría Aylupita{% endblock %}
 {% block content %}
 <div class="form-card" style="max-width:520px;margin:48px auto;text-align:center;">
+  {% if requiere_conexion %}
+  <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="var(--danger)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="margin-bottom:16px;"><path d="M2 2l20 20"/><path d="M5 12.55a11 11 0 0 1 5.17-2.39"/><path d="M10.71 5.05A16 16 0 0 1 22.58 9"/><path d="M1.42 9a15.91 15.91 0 0 1 4.7-2.88"/><path d="M8.53 16.11a6 6 0 0 1 6.95 0"/><circle cx="12" cy="20" r="0.5" fill="var(--danger)"/></svg>
+  <h1 class="form-card-title" style="text-align:center;">Esta función requiere conexión a internet</h1>
+  <p class="form-card-subtitle" style="text-align:center;">
+    En este momento no hay conexión con la base de datos en la nube, y esta sección
+    necesita consultarla para mostrarte información correcta. Vuelve a intentarlo
+    cuando regrese internet.
+  </p>
+  <p class="form-card-subtitle" style="text-align:center;">
+    Mientras tanto <strong>sí puedes seguir registrando movimientos</strong>: se guardan
+    en este equipo y se sincronizan solos en cuanto vuelva la conexión.
+  </p>
+  {% else %}
   <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="var(--danger)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="margin-bottom:16px;"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2z"/><path d="M12 8v5"/><circle cx="12" cy="16" r="0.5" fill="var(--danger)"/></svg>
   <h1 class="form-card-title" style="text-align:center;">No se pudo completar la consulta</h1>
   <p class="form-card-subtitle" style="text-align:center;">
     Hubo un problema momentáneo de conexión con la base de datos. No se perdió ningún dato —
     intenta de nuevo en unos segundos.
   </p>
+  {% endif %}
   <a href="{% url 'home' %}" class="btn btn-primary">Volver a Inicio</a>
 </div>
 {% endblock %}

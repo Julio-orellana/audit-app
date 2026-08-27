@@ -12,6 +12,7 @@ siempre el valor ya guardado en cada MovimientoSalida, que es un snapshot
 congelado al momento del registro. Así, un reporte de un mes cerrado da
 siempre los mismos números sin importar cuándo se genere.
 """
+import uuid
 from collections import defaultdict
 from datetime import date, datetime, timedelta
 from decimal import Decimal
@@ -211,10 +212,18 @@ _CLAVES_SUMABLES = (
 _CLAVES_MONETARIAS = ("invertido", "ingreso", "costo_de_lo_vendido", "ganancia_bruta", "perdida_por_merma", "ganancia_neta")
 
 
-def resumen_general(fecha_inicio, fecha_fin, productos=None):
+def resumen_general(fecha_inicio, fecha_fin, productos=None, motor=None):
     """
     Resumen financiero de varios productos en el rango [fecha_inicio,
     fecha_fin]. Si `productos` es None, usa todos los productos activos.
+
+    `motor`: un MotorStockCosto ya construido, para compartirlo con quien
+    llama en vez de construir uno nuevo (prompt 24) — home() ya arma el
+    suyo propio para las alertas/último conteo de la página, y llamar
+    aquí sin pasarlo construía un SEGUNDO MotorStockCosto completo,
+    repitiendo sus 3 consultas fijas sin necesidad. Cada consulta de más
+    contra Neon paga la misma latencia de red fija que cualquier otra
+    (~80-100ms medido), así que evitar 3 de más sí se siente.
 
     Devuelve un dict: {"productos": [...], "totales": {...}}
     - "productos": una lista de dicts, con las mismas claves que devolvía
@@ -283,7 +292,7 @@ def resumen_general(fecha_inicio, fecha_fin, productos=None):
         .annotate(total=Sum("cantidad"))
     }
 
-    motor = MotorStockCosto()
+    motor = motor or MotorStockCosto()
 
     filas = []
     totales = {clave: (Decimal("0.00") if clave in _CLAVES_MONETARIAS else 0) for clave in _CLAVES_SUMABLES}
@@ -492,6 +501,10 @@ def snapshot_registro(instance):
             valor = str(valor)
         elif isinstance(valor, (datetime, date)):
             valor = valor.isoformat()
+        elif isinstance(valor, uuid.UUID):
+            # Campo "uuid" (prompt 19) — mismo motivo que Decimal/fecha:
+            # json.dumps() no sabe serializar un UUID directamente.
+            valor = str(valor)
         datos[field.name] = valor
     if getattr(instance, "producto_id", None):
         datos["producto_nombre"] = instance.producto.nombre
@@ -500,16 +513,21 @@ def snapshot_registro(instance):
     return datos
 
 
-def productos_activos_por_categoria():
+def productos_activos_por_categoria(alias="default"):
     """
     Productos activos agrupados por categoría, en orden — misma agrupación
     que usa el selector de productos de Reportes y el catálogo reducido
     del dashboard de un vendedor (ver home_vendedor.html).
 
+    `alias`: "default" (Neon) en el uso normal; "local_disco" (prompt 19)
+    cuando se llama para el catálogo cacheado sin conexión — Reportes
+    nunca pasa "local_disco", siempre requiere conexión activa.
+
     Devuelve una lista de (nombre_categoria, [productos]).
     """
     productos = (
-        Producto.objects.filter(activo=True)
+        Producto.objects.using(alias)
+        .filter(activo=True)
         .select_related("categoria")
         .order_by("categoria__nombre", "nombre")
     )
