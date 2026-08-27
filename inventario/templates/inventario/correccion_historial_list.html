@@ -16,7 +16,7 @@
       </div>
       <span style="color:var(--ink-faint);font-size:13px;">{{ correccion.fecha }} · {{ correccion.realizado_por.username|default:"(usuario eliminado)" }}</span>
     </div>
-    <p style="margin:0 0 12px;font-size:14px;"><strong>Motivo:</strong> {{ correccion.motivo }}</p>
+    <p style="margin:0 0 12px;font-size:17px;"><strong>Motivo:</strong> {{ correccion.motivo }}</p>
 
     {% if fila.cambios %}
       <table class="table table-sm" style="margin:0;">
@@ -30,7 +30,7 @@
     {% elif correccion.accion == "eliminacion" %}
       <table class="table table-sm" style="margin:0;">
         <tbody>
-          {% for campo, valor in correccion.datos_anteriores.items %}
+          {% for campo, valor in fila.datos_anteriores.items %}
           <tr><td style="width:220px;color:var(--ink-soft);">{{ campo }}</td><td>{{ valor|default:"—" }}</td></tr>
           {% endfor %}
         </tbody>

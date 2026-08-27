@@ -63,7 +63,7 @@
     <div style="display:grid;grid-template-columns:2.4fr 1.1fr 1.1fr 1.3fr 1.8fr;padding:18px 20px;align-items:center;border-bottom:1px solid var(--border);background:{% if fila.alerta.diferencia > 0 %}var(--sobrante-bg){% else %}var(--danger-bg){% endif %};">
       <div style="font-weight:600;">
         {{ fila.producto.nombre }}
-        {% if fila.producto.producto_base %}<span style="display:block;font-weight:500;font-size:12px;color:var(--ink-faint);">variante de {{ fila.producto.producto_base.nombre }}</span>{% endif %}
+        {% if fila.producto.producto_base %}<span style="display:block;font-weight:500;font-size:12px;color:var(--ink-faint);">Producto base: {{ fila.producto.producto_base.nombre }}</span>{% endif %}
       </div>
       <div class="num">{{ fila.stock_teorico }}</div>
       <div class="num">Q{{ fila.costo_promedio }}</div>
@@ -105,7 +105,7 @@
     <div style="display:grid;grid-template-columns:2.4fr 1.1fr 1.1fr 1.3fr;padding:13px 20px;align-items:center;border-bottom:1px solid var(--border);">
       <div style="font-weight:600;">
         {{ fila.producto.nombre }}
-        {% if fila.producto.producto_base %}<span style="display:block;font-weight:500;font-size:12px;color:var(--ink-faint);">variante de {{ fila.producto.producto_base.nombre }}</span>{% endif %}
+        {% if fila.producto.producto_base %}<span style="display:block;font-weight:500;font-size:12px;color:var(--ink-faint);">Producto base: {{ fila.producto.producto_base.nombre }}</span>{% endif %}
       </div>
       <div class="num">{{ fila.stock_teorico }}</div>
       <div class="num">Q{{ fila.costo_promedio }}</div>

@@ -148,6 +148,12 @@
   </div>
   <div class="app-navbar-right">
     {% if user.is_authenticated %}
+      {% if pendientes_navbar %}
+      <span title="Se sincronizan solos en cuanto haya conexión — no cierres la app mientras haya pendientes." style="display:inline-flex;align-items:center;gap:6px;background:oklch(93% 0.03 45);color:oklch(45% 0.1 45);border-radius:999px;padding:4px 12px;font-size:12.5px;font-weight:700;">
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83"/></svg>
+        {{ pendientes_navbar }} pendiente{{ pendientes_navbar|pluralize }} de sincronizar
+      </span>
+      {% endif %}
       <span class="username">{{ user.username }}</span>
       <form method="post" action="{% url 'logout' %}" class="d-flex mb-0">
         {% csrf_token %}
@@ -183,13 +189,28 @@
   // esto es solo para que el caso más común (doble clic) ni siquiera
   // llegue a mandar un segundo request.
   document.addEventListener("submit", function (evento) {
-    var boton = evento.target.querySelector('button[type="submit"]');
+    // evento.submitter es el botón que de verdad se clickeó — con
+    // formularios de varios botones submit con distinto name/value (ej.
+    // los accesos rápidos de periodo en Reportes: Hoy/Esta semana/Este
+    // mes/Ver estadísticas), querySelector('button[type="submit"]')
+    // siempre agarraba el PRIMERO del formulario sin importar cuál se
+    // clickeó en realidad.
+    var boton = evento.submitter || evento.target.querySelector('button[type="submit"]');
     if (!boton || boton.disabled) {
       return;
     }
-    boton.disabled = true;
     var textoOriginal = boton.textContent;
-    boton.textContent = "Guardando...";
+    // Deshabilitar tiene que esperar al siguiente tick: si se deshabilita
+    // el botón de forma síncrona dentro de este evento "submit", el
+    // navegador arma el envío del formulario DESPUÉS de que termine este
+    // handler — un botón ya deshabilitado en ese momento se excluye del
+    // envío junto con su name/value (por eso "Hoy" dejaba de mandar
+    // periodo=hoy). setTimeout(..., 0) deja que el envío real ya haya
+    // arrancado antes de deshabilitar nada.
+    setTimeout(function () {
+      boton.disabled = true;
+      boton.textContent = "Guardando...";
+    }, 0);
     // Salvavidas: si por lo que sea el formulario no termina de navegar
     // (ej. el envío falla y el navegador se queda en la misma página sin
     // recargar), no se deja el botón inhabilitado para siempre.

@@ -1,6 +1,21 @@
 from django import forms
+from django.utils import timezone
 
 from .models import Categoria, ConteoFisico, LoteCompra, MovimientoSalida, Producto
+from .offline import hay_conexion
+
+
+def _alias_catalogo():
+    """
+    "default" (Neon) si hay conexión, "local_disco" (catálogo cacheado,
+    prompt 19) si no — así el desplegable de producto de los 3
+    formularios de escritura sigue funcionando sin conexión, en vez de
+    reventar al intentar validar contra Neon. Nunca aplica a los
+    formularios de CORRECCIÓN de historial (LoteCompraCorreccionForm,
+    etc. heredan estos mismos __init__, pero editar historial siempre
+    exige conexión activa de todas formas — ver CorreccionUpdateView).
+    """
+    return "default" if hay_conexion() else "local_disco"
 
 
 def _queryset_producto_activo_o_actual(instance):
@@ -12,10 +27,33 @@ def _queryset_producto_activo_o_actual(instance):
     guardado que lo referencia se sigue pudiendo ver/editar sin que el
     formulario lo rechace como "opción inválida".
     """
-    queryset = Producto.objects.filter(activo=True)
+    alias = _alias_catalogo()
+    queryset = Producto.objects.using(alias).filter(activo=True)
     if instance.pk and instance.producto_id:
-        queryset = queryset | Producto.objects.filter(pk=instance.producto_id)
+        queryset = queryset | Producto.objects.using(alias).filter(pk=instance.producto_id)
     return queryset
+
+
+def _queryset_producto_base_activo_o_actual(instance):
+    """
+    Como _queryset_producto_activo_o_actual(), pero además excluye
+    productos derivados (prompt 28b) — para LoteCompra y ConteoFisico,
+    que solo tienen sentido sobre el producto base real: un derivado no
+    tiene compras propias (Producto.clean() ya lo bloqueaba al enviar,
+    desde el prompt 15) ni conteo físico propio (ConteoFisico.clean(),
+    prompt 28b) — ahora tampoco aparece como opción para elegir.
+    """
+    alias = _alias_catalogo()
+    queryset = Producto.objects.using(alias).filter(activo=True, producto_base__isnull=True)
+    if instance.pk and instance.producto_id:
+        queryset = queryset | Producto.objects.using(alias).filter(pk=instance.producto_id)
+    return queryset
+
+
+MENSAJE_PRODUCTO_DERIVADO_NO_VALIDO = (
+    "Este producto es una variante/paquete de otro (un producto base) — "
+    "regístralo sobre el producto base, no sobre esta variante."
+)
 
 
 class CategoriaForm(forms.ModelForm):
@@ -59,7 +97,13 @@ class LoteCompraForm(forms.ModelForm):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.fields["producto"].queryset = _queryset_producto_activo_o_actual(self.instance)
+        self.fields["producto"].queryset = _queryset_producto_base_activo_o_actual(self.instance)
+        # El selector ya oculta los derivados (ver el queryset de arriba),
+        # pero si de todas formas llega uno en el POST (HTML manipulado a
+        # mano, o un registro ya editado que apuntaba a un derivado desde
+        # antes), el mensaje de rechazo de Django ("Escoja una opción
+        # válida...") no explica el motivo — este sí (prompt 28b, punto 1).
+        self.fields["producto"].error_messages["invalid_choice"] = MENSAJE_PRODUCTO_DERIVADO_NO_VALIDO
 
 
 class MovimientoSalidaForm(forms.ModelForm):
@@ -85,6 +129,16 @@ class MovimientoSalidaForm(forms.ModelForm):
             # el POST, así se haya manipulado el HTML a mano.
             self.fields["tipo"].choices = [("venta", "Venta")]
             self.fields["tipo"].initial = "venta"
+            # Un vendedor tampoco puede elegir la fecha (prompt 29):
+            # siempre es la de hoy — se oculta el campo (queda como
+            # hidden con el valor de hoy) en vez de quitarlo del todo,
+            # así el form sigue siendo válido sin campos faltantes. La
+            # aplicación real de "siempre hoy" pasa en el backend (ver
+            # MovimientoSalidaCreateView.form_valid) — esto es solo la
+            # capa visual, un HTML manipulado a mano no basta para
+            # cambiarla.
+            self.fields["fecha"].widget = forms.HiddenInput()
+            self.fields["fecha"].initial = timezone.localdate()
 
     def clean(self):
         cleaned_data = super().clean()
@@ -95,7 +149,11 @@ class MovimientoSalidaForm(forms.ModelForm):
         if not self.permitir_todos_los_tipos and tipo != "venta":
             self.add_error("tipo", "Como vendedor, solo puedes registrar ventas.")
 
-        if tipo in ("merma", "ajuste") and not motivo:
+        if tipo in ("merma", "ajuste") and not motivo and "motivo" not in self.errors:
+            # El "not in self.errors" evita un segundo mensaje redundante
+            # cuando motivo ya es obligatorio a nivel de campo (ver
+            # MovimientoSalidaCorreccionForm, que lo vuelve obligatorio
+            # siempre porque ahí dobla como motivo de la corrección).
             self.add_error(
                 "motivo",
                 "El motivo es obligatorio para mermas y ajustes por conteo físico.",
@@ -121,7 +179,11 @@ class ConteoFisicoForm(forms.ModelForm):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.fields["producto"].queryset = _queryset_producto_activo_o_actual(self.instance)
+        self.fields["producto"].queryset = _queryset_producto_base_activo_o_actual(self.instance)
+        # Ver el mismo comentario en LoteCompraForm.__init__ — mensaje
+        # claro (prompt 28b, punto 1) incluso si un derivado llega en el
+        # POST más allá de lo que ya oculta el selector.
+        self.fields["producto"].error_messages["invalid_choice"] = MENSAJE_PRODUCTO_DERIVADO_NO_VALIDO
 
 
 class HistorialFiltroForm(forms.Form):
@@ -178,11 +240,64 @@ class LoteCompraCorreccionForm(LoteCompraForm):
 
 
 class MovimientoSalidaCorreccionForm(MovimientoSalidaForm):
-    motivo_correccion = forms.CharField(
-        label="Motivo de la corrección",
-        widget=forms.Textarea(attrs={"rows": 3}),
-        help_text="Obligatorio: explica por qué se corrige este registro ya guardado.",
+    """
+    A diferencia de LoteCompraCorreccionForm/ConteoFisicoCorreccionForm,
+    NO agrega un campo "motivo_correccion" aparte: MovimientoSalida ya
+    tiene su propio campo "motivo" (heredado de MovimientoSalidaForm), y
+    al editar un movimiento ya guardado, el motivo de por qué se
+    corrige ahora y el motivo del movimiento en sí son, en la práctica,
+    la misma explicación — pedirla dos veces era una duplicación
+    confusa en el formulario. Se reutiliza el campo "motivo" existente,
+    volviéndolo obligatorio siempre (antes solo lo era para merma/ajuste)
+    y relabeleado para dejar claro que alimenta la corrección — sigue
+    siendo el mismo campo del modelo, así que la venta/merma/ajuste
+    corregida se sigue guardando con su motivo real.
+
+    precio_venta_unitario/costo_unitario_snapshot (prompt 28): NO son
+    campos del Meta de MovimientoSalidaForm (no se pueden editar al
+    registrar una venta nueva, donde siempre los calcula
+    MovimientoSalida.save()) — aquí se agregan explícitamente, ambos
+    opcionales, como el override manual que puede escribir el admin. Si
+    se dejan en blanco, MovimientoSalidaCorreccionUpdateView.form_valid()
+    decide: si el producto del movimiento cambió, los recalcula al
+    precio/costo del producto NUEVO; si el producto no cambió, los deja
+    tal como estaban (una corrección de, por ejemplo, solo la fecha o la
+    cantidad no debe alterar por accidente el costo histórico
+    congelado). Si el admin escribe un valor aquí, se respeta tal cual,
+    haya cambiado el producto o no.
+    """
+    precio_venta_unitario = forms.DecimalField(
+        max_digits=8,
+        decimal_places=2,
+        required=False,
+        label="Precio de venta unitario (Q)",
+        help_text=(
+            "Solo aplica a ventas. Si cambias el producto de arriba y dejas esto en "
+            "blanco, se recalcula automáticamente al precio de venta actual del "
+            "producto NUEVO. Si no cambias el producto, se deja igual. Escribe un "
+            "valor aquí solo si quieres forzarlo a mano."
+        ),
     )
+    costo_unitario_snapshot = forms.DecimalField(
+        max_digits=8,
+        decimal_places=2,
+        required=False,
+        label="Costo unitario (Q)",
+        help_text=(
+            "Si cambias el producto de arriba y dejas esto en blanco, se recalcula "
+            "automáticamente al costo promedio del producto NUEVO a la fecha del "
+            "movimiento. Si no cambias el producto, se deja igual. Escribe un valor "
+            "aquí solo si quieres forzarlo a mano."
+        ),
+    )
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.fields["motivo"].required = True
+        self.fields["motivo"].label = "Motivo de la corrección"
+        self.fields["motivo"].help_text = (
+            "Obligatorio: explica por qué se corrige este registro ya guardado."
+        )
 
 
 class ConteoFisicoCorreccionForm(ConteoFisicoForm):

@@ -76,14 +76,66 @@ INSTALLED_APPS = [
 ]
 
 MIDDLEWARE = [
+    # Primero en la lista a propósito (prompt 24): así envuelve TODO lo
+    # demás y mide el tiempo real de extremo a extremo de la request, no
+    # solo el de la vista — ver inventario/tiempos.py.
+    'inventario.tiempos.TiempoRequestMiddleware',
+    # Red de seguridad global de errores de conexión (prompt 19b, punto
+    # 4): atrapa RequiereConexionError y cualquier OperationalError/
+    # InterfaceError de CUALQUIER vista — incluida /admin/ y cualquier
+    # vista futura — y muestra la pantalla amigable en vez de la página
+    # técnica de Django. Va arriba para envolver a todo lo de abajo.
+    'inventario.resiliencia.ManejoGlobalErrorConexionMiddleware',
     'django.middleware.security.SecurityMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
     'django.middleware.common.CommonMiddleware',
     'django.middleware.csrf.CsrfViewMiddleware',
+    # AuthenticationMiddleware normal de Django (prompt 19b): ya no hace
+    # falta reemplazarlo como en el prompt 19. El respaldo offline vive
+    # ahora donde de verdad corresponde — en el backend de autenticación
+    # (inventario.offline.BackendConRespaldoOffline, ver
+    # AUTHENTICATION_BACKENDS más abajo), que es quien resuelve al
+    # usuario — y la sesión ya no toca la base (SESSION_ENGINE).
     'django.contrib.auth.middleware.AuthenticationMiddleware',
     'django.contrib.messages.middleware.MessageMiddleware',
+    # Después de MessageMiddleware a propósito: necesita poder dejar un
+    # mensaje para el usuario (ver ContinuidadSesionOfflineMiddleware en
+    # inventario/offline.py).
+    'inventario.offline.ContinuidadSesionOfflineMiddleware',
     'django.middleware.clickjacking.XFrameOptionsMiddleware',
 ]
+
+# Logging (prompt 24): sin esto, un logger.info() no imprime nada por
+# default (el root logger de Python solo deja pasar WARNING o más grave) —
+# se necesita este bloque explícito para que TiempoRequestMiddleware se
+# vea en la consola/log del servidor.
+LOGGING = {
+    'version': 1,
+    'disable_existing_loggers': False,
+    'handlers': {
+        'console': {
+            'class': 'logging.StreamHandler',
+        },
+    },
+    'loggers': {
+        'inventario.tiempos': {
+            'handlers': ['console'],
+            'level': 'INFO',
+            'propagate': False,
+        },
+        # Prompt 19b: sin esta entrada, el logger del motor de
+        # sincronización no tenía ningún handler y su nivel efectivo era
+        # WARNING — o sea, "Sincronización offline: N movimientos
+        # confirmados" NUNCA se imprimía y los fallos del hilo pasaban en
+        # silencio. Parte de por qué el punto 2 se veía como "no pasa
+        # nada" en vez de como un error concreto.
+        'inventario.offline': {
+            'handlers': ['console'],
+            'level': 'INFO',
+            'propagate': False,
+        },
+    },
+}
 
 ROOT_URLCONF = 'auditoria_aylupita.urls'
 
@@ -98,6 +150,7 @@ TEMPLATES = [
                 'django.contrib.auth.context_processors.auth',
                 'django.contrib.messages.context_processors.messages',
                 'inventario.context_processors.rol',
+                'inventario.context_processors.pendientes_sincronizar',
             ],
         },
     },
@@ -138,6 +191,27 @@ if _database_url:
     # siguiente request — dj_database_url.parse() no siempre expone este
     # parámetro según la versión instalada, se fija aparte por seguridad.
     DATABASES["default"]["CONN_HEALTH_CHECKS"] = True
+
+    # DISABLE_SERVER_SIDE_CURSORS (prompt 24): confirmado con evidencia real,
+    # no por sospecha — bajo carga concurrente contra el pooler de Neon
+    # (PgBouncer en modo transacción), una query que Django decide iterar
+    # con cursor server-side ("DECLARE ... CURSOR ... WITH HOLD") puede
+    # terminar con el DECLARE en una conexión de backend y el FETCH
+    # posterior en OTRA (PgBouncer reasigna la conexión de backend entre
+    # transacciones, de forma transparente e invisible para Django) —
+    # reproducido en este mismo prompt: django.db.utils.ProgrammingError:
+    # portal "_django_curs_..." does not exist, disparado por 6 requests
+    # POST simultáneos. Un cursor server-side depende de que la MISMA
+    # conexión de backend siga viva entre el DECLARE y el FETCH — algo que
+    # el modo transacción de PgBouncer no garantiza. Esto es justo lo que
+    # la documentación de Django recomienda desactivar cuando se usa un
+    # pooler en modo transacción (no tiene relación con CONN_MAX_AGE: pasa
+    # igual con conexiones nuevas en cada request, ver el diagnóstico del
+    # prompt 24). Sin este cursor, Django trae los resultados de una vez
+    # en la respuesta normal de la consulta — más simple y sin este riesgo,
+    # al costo de no poder transmitir un queryset gigante en streaming
+    # (irrelevante para el volumen de datos real de esta app).
+    DATABASES["default"]["DISABLE_SERVER_SIDE_CURSORS"] = True
 else:
     DATABASES = {
         'default': {
@@ -145,6 +219,51 @@ else:
             'NAME': BASE_DIR_ESCRIBIBLE / 'db.sqlite3',
         }
     }
+
+# "local_disco" (prompt 19, motor de sincronización offline): alias
+# EXCLUSIVAMENTE local, nunca habla con Neon — ver inventario/db_router.py
+# para qué modelos pueden vivir ahí (Producto/Categoria cacheados, más
+# PendienteSincronizacion/CredencialOfflineCache). Es un archivo, así que
+# sobrevive a un reinicio o un apagón. Existe siempre, haya o no conexión
+# a Neon configurada, porque su propósito es precisamente seguir
+# funcionando cuando "default" no responde.
+#
+# Prompt 19b, punto 3: antes había un segundo alias "local_memoria"
+# (SQLite en RAM) para que la cola del vendedor se perdiera al cerrar la
+# app. Esa decisión se revirtió explícitamente — los TRES roles usan
+# ahora este mismo archivo y su cola sobrevive a un cierre forzado.
+DATABASES["local_disco"] = {
+    "ENGINE": "django.db.backends.sqlite3",
+    "NAME": BASE_DIR_ESCRIBIBLE / "offline_local.sqlite3",
+}
+
+DATABASE_ROUTERS = ["inventario.db_router.OfflineRouter"]
+
+
+# Sesiones en ARCHIVO, no en la base de datos (prompt 19b, punto 1).
+#
+# El backend por defecto de Django (django.contrib.sessions.backends.db)
+# consulta la tabla django_session EN CADA REQUEST — confirmado al
+# revisar el punto 1 de este prompt. Con ese backend, un usuario que ya
+# había iniciado sesión con conexión perdía la sesión en cuanto se caía
+# internet a media jornada, no solo al reiniciar: cada request moría
+# antes de llegar a cualquier vista, así que la cola offline nunca
+# llegaba siquiera a aplicarse.
+#
+# El backend de archivo no toca la base nunca, y a diferencia de
+# "signed_cookies" no manda los datos de sesión dentro de la cookie ni
+# pierde la posibilidad de invalidar una sesión del lado del servidor.
+# Las sesiones viven junto a la base local, en la carpeta escribible.
+SESSION_ENGINE = "django.contrib.sessions.backends.file"
+SESSION_FILE_PATH = str(BASE_DIR_ESCRIBIBLE / "sesiones")
+Path(SESSION_FILE_PATH).mkdir(parents=True, exist_ok=True)
+
+# Backend de autenticación con respaldo offline (prompt 19b, punto 1):
+# se comporta igual que el ModelBackend de Django mientras haya conexión
+# (misma validación contra Neon) y solo cae a la caché local de
+# credenciales cuando la base no responde — es lo que permite iniciar
+# sesión durante un apagón y mantener viva una sesión ya iniciada.
+AUTHENTICATION_BACKENDS = ["inventario.offline.BackendConRespaldoOffline"]
 
 
 # Password validation
