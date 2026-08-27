@@ -27,4 +27,10 @@ urlpatterns = [
     path("correcciones/", views.CorreccionHistorialListView.as_view(), name="correcciones_historial"),
     path("reportes/", views.ReporteView.as_view(), name="reportes"),
     path("instrucciones/", views.InstruccionesView.as_view(), name="instrucciones"),
+    # Cola de sincronización (prompt 19c, punto 4).
+    path("sincronizacion/", views.ColaSincronizacionView.as_view(), name="cola_sincronizacion"),
+    path("sincronizacion/<int:pendiente_id>/reintentar/", views.cola_sincronizacion_reintentar, name="cola_sincronizacion_reintentar"),
+    path("sincronizacion/reintentar-todos/", views.cola_sincronizacion_reintentar_todos, name="cola_sincronizacion_reintentar_todos"),
+    # Estado liviano en JSON para el auto-refresco del dashboard (prompt 19c, punto 2).
+    path("estado-sincronizacion/", views.estado_sincronizacion, name="estado_sincronizacion"),
 ]

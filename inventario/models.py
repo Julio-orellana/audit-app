@@ -62,6 +62,17 @@ class Producto(models.Model):
     # que MovimientoSalidaCreateView pueda armar un costo_unitario_snapshot
     # razonable al encolar una venta sin conexión.
     costo_promedio_cache = models.DecimalField(max_digits=8, decimal_places=2, null=True, blank=True, editable=False)
+    # stock_teorico_cache (prompt 19c): mismo patrón que costo_promedio_cache
+    # — solo tiene sentido en la copia local ("local_disco"), calculado en
+    # cada refresco de caché con conexión. stock_teorico() agrega
+    # LoteCompra/MovimientoSalida, tablas que a propósito NO existen en el
+    # alias local (ver db_router.py), así que sin este campo no habría
+    # forma de validar "hay suficiente stock" al registrar una venta sin
+    # conexión (prompt 19c, punto 5). SIEMPRE es el stock del producto BASE
+    # incluso en la fila de un derivado — igual que costo_promedio_cache,
+    # nunca el resultado de dividir por factor_equivalencia, para que
+    # quien lo lea decida esa división con el factor correcto del momento.
+    stock_teorico_cache = models.IntegerField(null=True, blank=True, editable=False)
 
     class Meta:
         ordering = ["categoria__nombre", "nombre"]
@@ -389,3 +400,43 @@ class CredencialOfflineCache(models.Model):
 
     def __str__(self):
         return f"{self.username} ({self.rol})"
+
+
+class MovimientoHistorialCache(models.Model):
+    """
+    Copia local, de solo lectura, de los últimos movimientos ya
+    confirmados en Neon (prompt 19c, punto 1) — permite consultar
+    Historial sin conexión, combinada con la cola de pendientes de esta
+    misma máquina (PendienteSincronizacion) para mostrar también lo
+    registrado localmente y aún no sincronizado.
+
+    Se recalcula por completo (borra y reinserta) en cada refresco de
+    caché con conexión — ver refrescar_historial_cache() en
+    inventario/offline.py — y se limita a los LIMITE_HISTORIAL_CACHE
+    movimientos más recientes: el alcance explícito de esta caché es
+    "los últimos movimientos", no el historial completo (que sigue
+    necesitando conexión para un rango arbitrario, ver HistorialView).
+
+    payload guarda la fila ya lista para mostrar en la plantilla
+    (mismo formato que movimientos_periodo() en services.py, con el
+    producto ya resuelto a su nombre en vez de la instancia, y
+    fecha/valor_unitario/creado_en serializados) — evita tener que volver
+    a resolver relaciones al leer, y evita duplicar esta tabla con
+    columnas para cada campo que la plantilla necesita.
+
+    producto_id y fecha SÍ son columnas propias (no solo parte del
+    payload): son los únicos dos criterios por los que Historial filtra
+    (HistorialFiltroForm), y esas columnas permiten filtrar con el ORM en
+    vez de traer todo a Python.
+    """
+    tipo_registro = models.CharField(max_length=30)  # "LoteCompra" | "MovimientoSalida" | "ConteoFisico"
+    registro_id = models.PositiveIntegerField()
+    fecha = models.DateField()
+    producto_id = models.PositiveIntegerField(db_index=True)
+    payload = models.JSONField()
+
+    class Meta:
+        ordering = ["-fecha"]
+
+    def __str__(self):
+        return f"{self.tipo_registro} #{self.registro_id} ({self.fecha})"

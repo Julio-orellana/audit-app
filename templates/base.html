@@ -135,6 +135,7 @@
       <a href="{% url 'producto_list' %}">Productos</a>
       <a href="{% url 'historial' %}">Historial</a>
       <a href="{% url 'reportes' %}">Reportes</a>
+      <a href="{% url 'cola_sincronizacion' %}">Sincronización</a>
       {% if rol_usuario == "admin" %}
       <a href="{% url 'correcciones_historial' %}">Correcciones</a>
       {% endif %}
@@ -148,11 +149,22 @@
   </div>
   <div class="app-navbar-right">
     {% if user.is_authenticated %}
+      <button type="button" class="btn-nav-exit" onclick="window.location.reload()" title="Recargar los datos de esta pantalla — funciona con o sin conexión">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round" style="margin-right:6px;"><path d="M23 4v6h-6"/><path d="M1 20v-6h6"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10"/><path d="M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>
+        Refrescar
+      </button>
       {% if pendientes_navbar %}
-      <span title="Se sincronizan solos en cuanto haya conexión — no cierres la app mientras haya pendientes." style="display:inline-flex;align-items:center;gap:6px;background:oklch(93% 0.03 45);color:oklch(45% 0.1 45);border-radius:999px;padding:4px 12px;font-size:12.5px;font-weight:700;">
-        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83"/></svg>
-        {{ pendientes_navbar }} pendiente{{ pendientes_navbar|pluralize }} de sincronizar
-      </span>
+        {% if rol_usuario != "vendedor" %}
+        <a href="{% url 'cola_sincronizacion' %}" title="Ver la cola de sincronización" style="display:inline-flex;align-items:center;gap:6px;background:oklch(93% 0.03 45);color:oklch(45% 0.1 45);border-radius:999px;padding:4px 12px;font-size:12.5px;font-weight:700;">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83"/></svg>
+          {{ pendientes_navbar }} pendiente{{ pendientes_navbar|pluralize }} de sincronizar
+        </a>
+        {% else %}
+        <span title="Se sincronizan solos en cuanto haya conexión — no cierres la app mientras haya pendientes." style="display:inline-flex;align-items:center;gap:6px;background:oklch(93% 0.03 45);color:oklch(45% 0.1 45);border-radius:999px;padding:4px 12px;font-size:12.5px;font-weight:700;">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83"/></svg>
+          {{ pendientes_navbar }} pendiente{{ pendientes_navbar|pluralize }} de sincronizar
+        </span>
+        {% endif %}
       {% endif %}
       <span class="username">{{ user.username }}</span>
       <form method="post" action="{% url 'logout' %}" class="d-flex mb-0">

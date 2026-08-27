@@ -762,3 +762,349 @@ class VendedorOfflineTests(TestCase):
         )
         self.assertEqual(respuesta.status_code, 200)  # re-render con error, no redirección
         self.assertFalse(MovimientoSalida.objects.filter(tipo="merma").exists())
+
+
+# ---------------------------------------------------------------------------
+# Prompt 19c — historial offline, dashboard, refrescar, cola de
+# sincronización y validación de stock disponible al vender.
+# ---------------------------------------------------------------------------
+
+class StockDisponibleVentaTests(TestCase):
+    """
+    Prompt 19c, punto 5: no se puede vender más de lo que hay en
+    inventario. Cubre producto simple, producto derivado (vía
+    factor_equivalencia), que EDITAR una venta ya guardada no dispara la
+    validación (evitaría poder corregir nada), y que el cálculo
+    considera la cola local de pendientes — no solo el stock ya
+    confirmado en Neon.
+    """
+
+    databases = {"default", "local_disco"}
+
+    def setUp(self):
+        self.user = User.objects.create_user(username="admin_stock", password="clave-de-prueba-19c")
+        grupo, _ = Group.objects.get_or_create(name="admin")
+        self.user.groups.add(grupo)
+        self.categoria = Categoria.objects.create(nombre="Categoría stock")
+        self.producto = Producto.objects.create(
+            nombre="Corona", categoria=self.categoria, precio_venta_actual=Decimal("18.00")
+        )
+        LoteCompra.objects.create(
+            producto=self.producto, fecha=date(2026, 8, 1), cantidad=10, costo_unitario=Decimal("9.00"),
+        )
+        self.client.force_login(self.user)
+
+    def _vender(self, producto_id, cantidad, token="tok-" ):
+        return self.client.post(
+            reverse("movimientosalida_create"),
+            {
+                "producto": producto_id, "fecha": "2026-08-27", "tipo": "venta",
+                "cantidad": cantidad, "motivo": "", "token_formulario": token + str(cantidad) + str(producto_id),
+            },
+        )
+
+    def test_rechaza_vender_mas_del_stock_disponible(self):
+        respuesta = self._vender(self.producto.pk, 11)
+        self.assertEqual(respuesta.status_code, 200)  # re-render con error, no redirección
+        self.assertContains(respuesta, "No hay suficiente inventario disponible: quedan 10 unidades.")
+        self.assertFalse(MovimientoSalida.objects.filter(producto=self.producto).exists())
+
+    def test_permite_vender_exactamente_el_stock_disponible(self):
+        respuesta = self._vender(self.producto.pk, 10)
+        self.assertEqual(respuesta.status_code, 302)
+        self.assertEqual(
+            MovimientoSalida.objects.get(producto=self.producto, tipo="venta").cantidad, 10
+        )
+
+    def test_valida_stock_de_un_producto_derivado_via_factor_equivalencia(self):
+        base = Producto.objects.create(
+            nombre="Gallo base", categoria=self.categoria, precio_venta_actual=Decimal("15.00")
+        )
+        LoteCompra.objects.create(producto=base, fecha=date(2026, 8, 1), cantidad=12, costo_unitario=Decimal("9.50"))
+        cubeta = Producto.objects.create(
+            nombre="Cubeta Gallo", categoria=self.categoria, precio_venta_actual=Decimal("85.00"),
+            producto_base=base, factor_equivalencia=6,
+        )
+        # 12 unidades base / 6 por cubeta = 2 cubetas disponibles.
+        rechazo = self._vender(cubeta.pk, 3)
+        self.assertEqual(rechazo.status_code, 200)
+        self.assertContains(rechazo, "No hay suficiente inventario disponible: quedan 2 unidades.")
+
+        exito = self._vender(cubeta.pk, 2)
+        self.assertEqual(exito.status_code, 302)
+        self.assertEqual(MovimientoSalida.objects.get(producto=cubeta).cantidad, 2)
+
+    def test_editar_una_venta_ya_guardada_no_aplica_la_validacion_de_stock(self):
+        """
+        stock_teorico() ya cuenta la cantidad ORIGINAL de la venta como
+        consumida — corregirla no es "una venta nueva" y no debe exigir
+        stock de más por eso. Sin este comportamiento, ni siquiera se
+        podría corregir el motivo de una venta que agotó el inventario.
+        """
+        venta = MovimientoSalida.objects.create(
+            producto=self.producto, fecha=date(2026, 8, 20), tipo="venta", cantidad=8,
+            costo_unitario_snapshot=Decimal("9.00"), precio_venta_unitario=Decimal("18.00"),
+        )
+        # Stock real restante: 10 compradas - 8 vendidas = 2.
+        self.assertEqual(self.producto.stock_teorico(), 2)
+
+        respuesta = self.client.post(
+            reverse("movimientosalida_correccion_editar", args=[venta.pk]),
+            {
+                "producto": self.producto.pk, "fecha": "2026-08-20", "tipo": "venta",
+                "cantidad": 9, "motivo": "corrección de prueba — cantidad real era 9, no 8",
+            },
+        )
+        self.assertEqual(respuesta.status_code, 302, respuesta.content[:500])
+        venta.refresh_from_db()
+        self.assertEqual(venta.cantidad, 9)
+
+    def test_stock_disponible_para_venta_descuenta_la_cola_local_de_pendientes(self):
+        """
+        Dos ventas offline seguidas del mismo producto en la misma
+        máquina: la segunda no debe "ver" el mismo stock cacheado que la
+        primera — tiene que descontar lo que la primera ya reservó en la
+        cola local, aunque ninguna de las dos haya llegado todavía a Neon.
+        """
+        from unittest.mock import patch
+
+        from .models import PendienteSincronizacion
+        from .offline import encolar_pendiente, refrescar_catalogo_cache, stock_disponible_para_venta
+
+        # refrescar_catalogo_cache() (con conexión, como pasaría de
+        # verdad) deja el producto en "local_disco" con su stock real (10)
+        # en stock_teorico_cache — no se arma la fila a mano para probar
+        # el camino real que usa la app.
+        refrescar_catalogo_cache()
+
+        with patch("inventario.offline.hay_conexion", return_value=False):
+            self.assertEqual(stock_disponible_para_venta(
+                Producto.objects.using("local_disco").get(pk=self.producto.pk)
+            ), 10)
+
+            pendiente = MovimientoSalida(
+                producto_id=self.producto.pk, fecha=date(2026, 8, 27), tipo="venta", cantidad=7,
+                costo_unitario_snapshot=Decimal("9.00"), precio_venta_unitario=Decimal("18.00"),
+            )
+            encolar_pendiente(pendiente)
+
+            disponible = stock_disponible_para_venta(
+                Producto.objects.using("local_disco").get(pk=self.producto.pk)
+            )
+            self.assertEqual(disponible, 3, "No descontó la venta ya encolada pero aún sin sincronizar.")
+
+        PendienteSincronizacion.objects.using("local_disco").filter(uuid=pendiente.uuid).delete()
+
+
+class HistorialOfflineTests(TestCase):
+    """
+    Prompt 19c, punto 1: Historial en modo lectura combina la caché local
+    de movimientos ya sincronizados con la cola de pendientes de esta
+    máquina, marcando estos últimos como "es_pendiente".
+    """
+
+    databases = {"default", "local_disco"}
+
+    def setUp(self):
+        from .models import MovimientoHistorialCache, PendienteSincronizacion
+
+        MovimientoHistorialCache.objects.using("local_disco").all().delete()
+        PendienteSincronizacion.objects.using("local_disco").all().delete()
+
+        self.user = User.objects.create_user(username="auditor_hist_off", password="clave-de-prueba-19c")
+        grupo, _ = Group.objects.get_or_create(name="auditor")
+        self.user.groups.add(grupo)
+        self.categoria = Categoria.objects.create(nombre="Categoría historial offline")
+        self.producto = Producto.objects.create(
+            nombre="Producto historial offline", categoria=self.categoria, precio_venta_actual=Decimal("20.00")
+        )
+        # refrescar_catalogo_cache() (no una copia manual) para que
+        # Categoria/Producto queden en "local_disco" con el mismo pk que
+        # en "default" — es justo lo que hace el hilo de fondo con
+        # conexión, y evita duplicar a mano cómo se arma esa caché.
+        from .offline import refrescar_catalogo_cache
+
+        refrescar_catalogo_cache()
+
+    def test_historial_offline_combina_cache_y_pendientes(self):
+        from .models import MovimientoHistorialCache
+        from .offline import encolar_pendiente, historial_offline
+
+        MovimientoHistorialCache.objects.using("local_disco").create(
+            tipo_registro="MovimientoSalida", registro_id=999, fecha=date(2026, 8, 20), producto_id=self.producto.pk,
+            payload={
+                "fecha": {"__date__": "2026-08-20"}, "tipo": "Venta", "producto_nombre": self.producto.nombre,
+                "cantidad": 4, "valor_unitario": {"__decimal__": "20.00"}, "usuario": "auditor_hist_off",
+                "detalle": "", "creado_en": {"__datetime__": "2026-08-20T10:00:00+00:00"},
+                "tipo_registro": "MovimientoSalida", "registro_id": 999,
+            },
+        )
+        pendiente = MovimientoSalida(
+            producto_id=self.producto.pk, fecha=date(2026, 8, 27), tipo="venta", cantidad=2,
+            costo_unitario_snapshot=Decimal("10.00"), precio_venta_unitario=Decimal("20.00"),
+            registrado_por_id=self.user.pk,
+        )
+        encolar_pendiente(pendiente)
+
+        filas = historial_offline(date(2026, 1, 1), date(2026, 12, 31))
+
+        self.assertEqual(len(filas), 2)
+        pendientes = [f for f in filas if f["es_pendiente"]]
+        sincronizadas = [f for f in filas if not f["es_pendiente"]]
+        self.assertEqual(len(pendientes), 1)
+        self.assertEqual(len(sincronizadas), 1)
+        self.assertEqual(pendientes[0]["cantidad"], 2)
+        self.assertEqual(pendientes[0]["registro_id"], None)
+        self.assertEqual(sincronizadas[0]["cantidad"], 4)
+        # Más reciente primero: la pendiente (27) antes que la cacheada (20).
+        self.assertTrue(filas[0]["es_pendiente"])
+
+    def test_vista_historial_offline_no_crashea_y_marca_pendientes(self):
+        from unittest.mock import patch
+
+        from .offline import encolar_pendiente
+
+        pendiente = MovimientoSalida(
+            producto_id=self.producto.pk, fecha=date(2026, 8, 27), tipo="venta", cantidad=3,
+            costo_unitario_snapshot=Decimal("10.00"), precio_venta_unitario=Decimal("20.00"),
+            registrado_por_id=self.user.pk,
+        )
+        encolar_pendiente(pendiente)
+        self.client.force_login(self.user)
+
+        with patch("inventario.views.hay_conexion", return_value=False):
+            respuesta = self.client.get(reverse("historial"))
+
+        self.assertEqual(respuesta.status_code, 200)
+        self.assertContains(respuesta, "Pendiente")
+        self.assertContains(respuesta, "Sin conexión")
+
+    def test_editar_historial_sigue_bloqueado_sin_conexion_aunque_historial_ya_no_lo_este(self):
+        from unittest.mock import patch
+
+        venta = MovimientoSalida.objects.create(
+            producto=self.producto, fecha=date(2026, 8, 1), tipo="venta", cantidad=1,
+            costo_unitario_snapshot=Decimal("10.00"), precio_venta_unitario=Decimal("20.00"),
+        )
+        self.user.groups.clear()
+        grupo_admin, _ = Group.objects.get_or_create(name="admin")
+        self.user.groups.add(grupo_admin)
+        self.client.force_login(self.user)
+
+        # RequiereConexionMixin (el que de verdad bloquea editar/eliminar
+        # historial) vive en inventario/resiliencia.py, con su PROPIO
+        # "from .offline import hay_conexion" — un nombre aparte del de
+        # inventario.views, aunque apunten a la misma función original.
+        # Parchear solo uno de los dos no alcanza para simular "sin
+        # conexión" en esta vista.
+        with patch("inventario.views.hay_conexion", return_value=False), \
+             patch("inventario.resiliencia.hay_conexion", return_value=False):
+            respuesta = self.client.get(reverse("movimientosalida_correccion_editar", args=[venta.pk]))
+
+        self.assertEqual(respuesta.status_code, 503)
+        self.assertContains(respuesta, "Esta función requiere conexión a internet", status_code=503)
+
+
+class ColaSincronizacionTests(TestCase):
+    """Prompt 19c, punto 4: pantalla de cola de sincronización para admin/auditor."""
+
+    databases = {"default", "local_disco"}
+
+    def setUp(self):
+        from .models import PendienteSincronizacion
+
+        PendienteSincronizacion.objects.using("local_disco").all().delete()
+        self.admin = User.objects.create_user(username="admin_cola", password="clave-de-prueba-19c")
+        grupo_admin, _ = Group.objects.get_or_create(name="admin")
+        self.admin.groups.add(grupo_admin)
+        self.vendedor = User.objects.create_user(username="vendedor_cola_19c", password="clave-de-prueba-19c")
+        grupo_vendedor, _ = Group.objects.get_or_create(name="vendedor")
+        self.vendedor.groups.add(grupo_vendedor)
+
+        self.categoria = Categoria.objects.create(nombre="Categoría cola 19c")
+        self.producto = Producto.objects.create(
+            nombre="Producto cola 19c", categoria=self.categoria, precio_venta_actual=Decimal("12.00")
+        )
+        from .offline import refrescar_catalogo_cache
+
+        refrescar_catalogo_cache()
+
+    def test_vendedor_no_tiene_acceso_a_la_pantalla_completa(self):
+        self.client.force_login(self.vendedor)
+        respuesta = self.client.get(reverse("cola_sincronizacion"))
+        self.assertEqual(respuesta.status_code, 403)
+
+    def test_lista_los_pendientes_reales_de_la_cola(self):
+        from .offline import encolar_pendiente
+
+        lote = LoteCompra(
+            producto_id=self.producto.pk, fecha=date(2026, 8, 27), cantidad=50, costo_unitario=Decimal("6.00"),
+        )
+        encolar_pendiente(lote)
+        self.client.force_login(self.admin)
+
+        respuesta = self.client.get(reverse("cola_sincronizacion"))
+
+        self.assertEqual(respuesta.status_code, 200)
+        self.assertContains(respuesta, "Producto cola 19c")
+        self.assertContains(respuesta, "Entrada")
+
+        from .models import PendienteSincronizacion
+
+        PendienteSincronizacion.objects.using("local_disco").filter(uuid=lote.uuid).delete()
+
+    def test_reintentar_todos_sincroniza_lo_pendiente(self):
+        from .models import PendienteSincronizacion
+        from .offline import encolar_pendiente
+
+        lote = LoteCompra(
+            producto_id=self.producto.pk, fecha=date(2026, 8, 27), cantidad=15, costo_unitario=Decimal("6.50"),
+        )
+        encolar_pendiente(lote)
+        self.client.force_login(self.admin)
+
+        respuesta = self.client.post(reverse("cola_sincronizacion_reintentar_todos"), follow=True)
+
+        self.assertEqual(respuesta.status_code, 200)
+        self.assertFalse(PendienteSincronizacion.objects.using("local_disco").filter(uuid=lote.uuid).exists())
+        self.assertTrue(LoteCompra.objects.filter(uuid=lote.uuid).exists())
+
+    def test_reintentar_uno_reporta_un_fallo_no_recuperable_sin_perder_el_pendiente(self):
+        """
+        Fuerza un fallo real de sincronización, no de conexión: un
+        payload con un campo que ya no existe en el modelo (simula un
+        pendiente encolado antes de un cambio de esquema) — Modelo(...)
+        revienta con TypeError al crear la instancia, antes de tocar la
+        base. Confirma que el botón "reintentar ahora" no lo pierde ni lo
+        sincroniza a la fuerza, y que queda registrado el error.
+        """
+        import uuid as uuid_module
+
+        from django.utils import timezone
+
+        from .models import PendienteSincronizacion
+
+        pendiente = PendienteSincronizacion.objects.using("local_disco").create(
+            uuid=uuid_module.uuid4(),
+            modelo="LoteCompra",
+            payload={
+                "producto_id": self.producto.pk, "fecha": {"__date__": "2026-08-27"}, "cantidad": 5,
+                "costo_unitario": {"__decimal__": "1.00"}, "proveedor": None, "notas": None,
+                "registrado_por_id": None, "campo_que_ya_no_existe": "valor",
+            },
+            creado_en=timezone.now(),
+        )
+        self.client.force_login(self.admin)
+
+        respuesta = self.client.post(
+            reverse("cola_sincronizacion_reintentar", args=[pendiente.pk]), follow=True
+        )
+
+        self.assertEqual(respuesta.status_code, 200)
+        self.assertContains(respuesta, "No se pudo sincronizar")
+        pendiente.refresh_from_db(using="local_disco")
+        self.assertEqual(pendiente.intentos, 1)
+        self.assertTrue(pendiente.ultimo_error)
+        self.assertFalse(LoteCompra.objects.filter(uuid=pendiente.uuid).exists())
+
+        pendiente.delete(using="local_disco")

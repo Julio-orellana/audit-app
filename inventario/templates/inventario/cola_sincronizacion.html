@@ -1,0 +1,62 @@
+{% extends "base.html" %}
+{% block content %}
+<div style="display:flex;justify-content:space-between;align-items:flex-start;flex-wrap:wrap;gap:14px;margin-bottom:24px;">
+  <div>
+    <h1 style="margin:0 0 4px;font-size:22px;font-weight:800;">Cola de sincronización</h1>
+    <p style="margin:0;color:var(--ink-soft);font-size:14.5px;">
+      Movimientos guardados en este equipo que todavía no se confirmaron en la nube.
+      Se suben solos cada poco tiempo; usa "Reintentar" si la sincronización automática falló o no se ha disparado todavía.
+    </p>
+  </div>
+  {% if filas %}
+  <form method="post" action="{% url 'cola_sincronizacion_reintentar_todos' %}">
+    {% csrf_token %}
+    <button type="submit" class="btn btn-primary">Reintentar todos ({{ filas|length }})</button>
+  </form>
+  {% endif %}
+</div>
+
+{% if not conectado %}
+<div class="alert alert-warning" style="margin-bottom:20px;">
+  Sin conexión ahora mismo — puedes ver la cola con normalidad, pero "Reintentar" no podrá confirmar nada hasta que vuelva internet.
+</div>
+{% endif %}
+
+<div class="info-card" style="overflow:hidden;">
+  <div style="display:grid;grid-template-columns:1.1fr 1.6fr 0.9fr 1.4fr 0.9fr 2fr 1.1fr;padding:12px 20px;font-size:12px;font-weight:700;color:var(--ink-faint);text-transform:uppercase;letter-spacing:.03em;border-bottom:1px solid var(--border);">
+    <div>Tipo</div><div>Producto</div><div>Cant.</div><div>Creado (local)</div><div>Intentos</div><div>Último error</div><div></div>
+  </div>
+  {% for fila in filas %}
+    <div style="display:grid;grid-template-columns:1.1fr 1.6fr 0.9fr 1.4fr 0.9fr 2fr 1.1fr;padding:14px 20px;align-items:center;border-bottom:1px solid var(--border);">
+      <div>
+        {% if fila.tipo == "Venta" %}
+          <span class="badge-pill" style="background:var(--accent);color:#fff;">Venta</span>
+        {% elif fila.tipo == "Entrada" %}
+          <span class="badge-pill" style="background:var(--teal-bg);color:var(--teal);">Entrada</span>
+        {% elif fila.tipo == "Merma" %}
+          <span class="badge-pill" style="background:var(--plum-bg);color:var(--plum);">Merma</span>
+        {% elif "sobrante" in fila.tipo %}
+          <span class="badge-pill" style="background:var(--sobrante-bg);color:var(--sobrante-ink);">{{ fila.tipo }}</span>
+        {% elif "faltante" in fila.tipo %}
+          <span class="badge-pill" style="background:var(--danger-bg);color:var(--danger-ink);">{{ fila.tipo }}</span>
+        {% else %}
+          <span class="badge-pill" style="background:var(--slate-bg);color:var(--slate);">{{ fila.tipo }}</span>
+        {% endif %}
+      </div>
+      <div style="font-weight:600;">{{ fila.producto }}</div>
+      <div class="num">{{ fila.cantidad }}</div>
+      <div style="color:var(--ink-soft);font-size:13.5px;">{{ fila.creado_en }}</div>
+      <div class="num">{{ fila.intentos }}</div>
+      <div style="color:var(--danger-ink);font-size:12.5px;">{{ fila.ultimo_error|default:"—" }}</div>
+      <div>
+        <form method="post" action="{% url 'cola_sincronizacion_reintentar' fila.id %}">
+          {% csrf_token %}
+          <button type="submit" class="btn btn-sm" style="border:1.5px solid var(--accent);color:var(--accent-dark);">Reintentar ahora</button>
+        </form>
+      </div>
+    </div>
+  {% empty %}
+    <div style="padding:20px;color:var(--ink-faint);">No hay movimientos pendientes de sincronizar — todo está al día.</div>
+  {% endfor %}
+</div>
+{% endblock %}

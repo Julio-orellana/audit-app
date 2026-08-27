@@ -40,22 +40,30 @@ FUNCIONAN SIN CONEXIÓN — marcadas con `funciona_sin_conexion = True`
   conteofisico_create ................. conteo físico -> cola local
   instrucciones ....................... contenido estático, no toca la base
   login / logout ...................... caché local de credenciales
+  historial ............................ lectura combinada: caché de los últimos
+                                          movimientos + cola de pendientes de esta
+                                          máquina (prompt 19c, punto 1) — NUNCA
+                                          incluye editar/eliminar, eso lo bloquean
+                                          las vistas de corrección de abajo
+  cola_sincronizacion .................. lee la cola local (prompt 19c, punto 4)
+  cola_sincronizacion_reintentar(_todos) intenta sincronizar; si no hay conexión,
+                                          lo reporta con un mensaje, no revienta
+  estado_sincronizacion ................ JSON liviano para el auto-refresco del
+                                          dashboard (prompt 19c, punto 2)
 
 REQUIEREN CONEXIÓN — marcadas con `requiere_conexion_activa = True`
   categoria_list / _create / _update / _toggle .... catálogo maestro
   producto_list / _create / _update / _toggle ..... catálogo maestro
   conteofisico_detail ............................. necesita el stock teórico real
   conteofisico_generar_ajuste ..................... escribe con transacción y bloqueo
-  historial ....................................... lectura pesada contra Neon (*)
   reportes ........................................ lectura pesada contra Neon
   correcciones_historial .......................... bitácora de correcciones
   *_correccion_editar / *_correccion_eliminar ..... editar/eliminar historial: NUNCA
                                                     se encola, ni bajo ninguna
-                                                    circunstancia (prompt 17/19)
+                                                    circunstancia (prompt 17/19) —
+                                                    ni siquiera ahora que Historial
+                                                    en sí ya no requiere conexión
   /admin/ de Django ............................... cubierto por el middleware global
-
-  (*) El historial en modo lectura offline es alcance del prompt 19c;
-      hasta entonces se bloquea con el mensaje claro, no revienta.
 """
 import time
 from functools import wraps

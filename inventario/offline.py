@@ -399,7 +399,16 @@ class ContinuidadSesionOfflineMiddleware:
 def _serializar_valor(valor):
     if isinstance(valor, Decimal):
         return {"__decimal__": str(valor)}
-    if isinstance(valor, (datetime, date)):
+    # datetime ANTES que date (datetime es subclase de date) — perder esa
+    # distinción aquí perdía la hora al reconstruir un campo datetime real
+    # (ej. "creado_en" en el payload de MovimientoHistorialCache, prompt
+    # 19c) y hacía fallar _deserializar_valor(), que intentaba parsear un
+    # ISO-8601 con hora como si fuera solo fecha. _instancia_a_payload()
+    # nunca pasó un datetime por aquí antes de esto (excluye "creado_en"
+    # a propósito), así que el problema no se había manifestado.
+    if isinstance(valor, datetime):
+        return {"__datetime__": valor.isoformat()}
+    if isinstance(valor, date):
         return {"__date__": valor.isoformat()}
     return valor
 
@@ -408,6 +417,8 @@ def _deserializar_valor(valor):
     if isinstance(valor, dict):
         if "__decimal__" in valor:
             return Decimal(valor["__decimal__"])
+        if "__datetime__" in valor:
+            return datetime.fromisoformat(valor["__datetime__"])
         if "__date__" in valor:
             return date.fromisoformat(valor["__date__"])
     return valor
@@ -458,6 +469,109 @@ def completar_snapshot_offline(movimiento):
         movimiento.costo_unitario_snapshot = producto.costo_promedio_cache
     if movimiento.tipo == "venta" and not movimiento.precio_venta_unitario:
         movimiento.precio_venta_unitario = producto.precio_venta_actual
+
+
+# --- Validación de stock disponible al vender (prompt 19c, punto 5) ---------
+
+def _mapa_producto_base_factor():
+    """
+    {producto_id: (producto_base_id o None, factor_equivalencia)} de TODO
+    el catálogo cacheado en esta máquina — se usa para traducir un
+    producto_id cualquiera (el de un pendiente en la cola) a su producto
+    base y el factor con el que consume su stock, sin depender de si hay
+    conexión (el catálogo local siempre existe una vez que refrescó al
+    menos una vez).
+    """
+    from .models import Producto
+
+    return {
+        p["id"]: (p["producto_base_id"], p["factor_equivalencia"])
+        for p in Producto.objects.using(ALIAS_LOCAL).values("id", "producto_base_id", "factor_equivalencia")
+    }
+
+
+def _ajuste_stock_pendiente_en_base(base_id):
+    """
+    Cuánto ya cambió el stock del producto BASE `base_id` por lo que hay
+    AHORA MISMO en la cola de pendientes de esta máquina (encolado pero
+    todavía no confirmado en Neon). Positivo = ya se consumió esa
+    cantidad (hay que restarla del stock disponible); negativo = ya se
+    sumó (una entrada o un ajuste por sobrante pendientes).
+
+    Sin esto, dos ventas offline seguidas del mismo producto en la misma
+    máquina podrían las dos "ver" el mismo stock cacheado (el que había
+    al último refresco con conexión) y así permitir vender de más entre
+    ellas — exactamente el escenario que el prompt 19c, punto 5, pide
+    cubrir explícitamente.
+    """
+    from .models import PendienteSincronizacion
+
+    try:
+        pendientes = list(PendienteSincronizacion.objects.using(ALIAS_LOCAL).all())
+    except Exception:
+        return 0
+    if not pendientes:
+        return 0
+
+    mapa = _mapa_producto_base_factor()
+    total = 0
+    for pendiente in pendientes:
+        producto_id = pendiente.payload.get("producto_id")
+        info = mapa.get(producto_id)
+        if info is None:
+            continue
+        prod_base_id, factor = info
+        if (prod_base_id or producto_id) != base_id:
+            continue
+        if pendiente.modelo == "LoteCompra":
+            total -= pendiente.payload.get("cantidad") or 0
+        elif pendiente.modelo == "MovimientoSalida":
+            # cantidad ya viene con el signo real (ver models.py:
+            # MovimientoSalida.cantidad) — positiva resta stock (venta,
+            # merma, ajuste por faltante), negativa lo suma (ajuste por
+            # sobrante). factor traduce unidades del derivado a
+            # unidades base, igual que Producto.stock_teorico().
+            total += (pendiente.payload.get("cantidad") or 0) * factor
+        # ConteoFisico pendiente no mueve stock por sí solo (solo lo hace
+        # el ajuste que se genera a partir de él, que sería su propio
+        # MovimientoSalida pendiente aparte).
+    return total
+
+
+def stock_disponible_para_venta(producto):
+    """
+    Unidades de `producto` que se pueden vender AHORA MISMO, considerando
+    tanto el stock real (Neon si hay conexión, la caché local si no) como
+    lo que ya está reservado por la cola de pendientes de esta máquina
+    (ver _ajuste_stock_pendiente_en_base) — para que MovimientoSalidaForm
+    (forms.py) rechace una venta que dejaría el inventario en negativo,
+    tanto online como offline, y sin basarse en un stock cacheado que ya
+    quedó desactualizado por otra venta offline reciente en el mismo
+    equipo.
+
+    Para un producto derivado, el resultado ya está traducido con su
+    factor_equivalencia — misma división entera que Producto.stock_teorico().
+    """
+    from .models import Producto
+
+    base_id = producto.producto_base_id
+    factor = producto.factor_equivalencia if base_id else 1
+
+    if hay_conexion():
+        base = producto if base_id is None else Producto.objects.using("default").get(pk=base_id)
+        stock_base = base.stock_teorico()
+    else:
+        # Sin conexión no existen las tablas de movimientos en el alias
+        # local (a propósito, ver db_router.py) — no hay forma de
+        # recalcular stock_teorico() desde cero, se usa el último valor
+        # calculado con conexión (ver refrescar_catalogo_cache).
+        base_local = Producto.objects.using(ALIAS_LOCAL).get(pk=base_id or producto.pk)
+        stock_base = base_local.stock_teorico_cache or 0
+
+    stock_base_ajustado = stock_base - _ajuste_stock_pendiente_en_base(base_id or producto.pk)
+    if base_id:
+        return stock_base_ajustado // factor
+    return stock_base_ajustado
 
 
 # --- Cola de pendientes ------------------------------------------------------
@@ -567,15 +681,56 @@ def _clase_modelo(nombre):
     return _MODELOS_SINCRONIZABLES[nombre]
 
 
-def sincronizar_pendientes():
+def _intentar_sincronizar_uno(pendiente):
     """
-    Sube cada pendiente de la cola local a Neon. La llama el hilo de
-    fondo cada INTERVALO_SEGUNDOS.
+    Intenta subir UN pendiente a Neon. No decide qué hacer si falla (eso
+    depende de quién llama: sincronizar_pendientes() corta el resto del
+    lote ante un error de conexión, reintentar_uno_pendiente() —
+    prompt 19c, punto 4 — no tiene ese problema porque ya es un solo
+    elemento) — solo intenta, marca el intento fallido si corresponde, y
+    reporta qué pasó.
 
     uuid como restricción única remota (LoteCompra/MovimientoSalida/
     ConteoFisico) es lo que hace esto idempotente: get_or_create() nunca
     duplica un registro cuyo uuid ya se confirmó en un intento anterior,
     aunque la respuesta de ESE intento nunca haya llegado localmente.
+
+    Devuelve (sincronizado: bool, fue_error_de_conexion: bool).
+    """
+    try:
+        Modelo = _clase_modelo(pendiente.modelo)
+    except KeyError:
+        logger.error("Pendiente con modelo desconocido (%s), se ignora.", pendiente.modelo)
+        return False, False
+
+    kwargs = _payload_a_kwargs(pendiente.payload)
+    try:
+        _, creado = Modelo.objects.using("default").get_or_create(uuid=pendiente.uuid, defaults=kwargs)
+    except ERRORES_DE_CONEXION as error:
+        _marcar_intento_fallido(pendiente, error)
+        return False, True
+    except Exception as error:
+        # Un error que NO es de conexión (ej. una FK que ya no existe) no
+        # se arregla reintentando para siempre igual — se deja registrado
+        # (con el detalle en ultimo_error, visible en la cola de
+        # sincronización) y se sigue con los demás.
+        logger.exception("Error no recuperable sincronizando %s %s", pendiente.modelo, pendiente.uuid)
+        _marcar_intento_fallido(pendiente, error)
+        return False, False
+
+    pendiente.delete(using=ALIAS_LOCAL)
+    logger.info(
+        "Sincronizado %s %s contra Neon (%s).",
+        pendiente.modelo, pendiente.uuid, "creado" if creado else "ya existía, no se duplicó",
+    )
+    return True, False
+
+
+def sincronizar_pendientes():
+    """
+    Sube cada pendiente de la cola local a Neon. La llama el hilo de
+    fondo cada INTERVALO_SEGUNDOS, y también el botón "Reintentar todos"
+    de la cola de sincronización (prompt 19c, punto 4).
     """
     preparar_bases_locales()
     from .models import PendienteSincronizacion
@@ -588,16 +743,10 @@ def sincronizar_pendientes():
         return 0
 
     for pendiente in pendientes:
-        try:
-            Modelo = _clase_modelo(pendiente.modelo)
-        except KeyError:
-            logger.error("Pendiente con modelo desconocido (%s), se ignora.", pendiente.modelo)
-            continue
-        kwargs = _payload_a_kwargs(pendiente.payload)
-        try:
-            _, creado = Modelo.objects.using("default").get_or_create(uuid=pendiente.uuid, defaults=kwargs)
-        except ERRORES_DE_CONEXION as error:
-            _marcar_intento_fallido(pendiente, error)
+        exito, fue_error_de_conexion = _intentar_sincronizar_uno(pendiente)
+        if exito:
+            total_sincronizados += 1
+        elif fue_error_de_conexion:
             logger.warning(
                 "Se cortó la conexión sincronizando %s %s — se reintenta en el próximo ciclo.",
                 pendiente.modelo, pendiente.uuid,
@@ -606,20 +755,30 @@ def sincronizar_pendientes():
             # casi seguro también — no vale la pena seguir golpeando la
             # red, se reintenta todo junto en el próximo ciclo.
             break
-        except Exception as error:
-            # Un error que NO es de conexión (ej. una FK que ya no existe)
-            # no se arregla reintentando para siempre igual — se deja
-            # registrado y se sigue con los demás.
-            logger.exception("Error no recuperable sincronizando %s %s", pendiente.modelo, pendiente.uuid)
-            _marcar_intento_fallido(pendiente, error)
-            continue
-        pendiente.delete(using=ALIAS_LOCAL)
-        total_sincronizados += 1
-        logger.info(
-            "Sincronizado %s %s contra Neon (%s).",
-            pendiente.modelo, pendiente.uuid, "creado" if creado else "ya existía, no se duplicó",
-        )
     return total_sincronizados
+
+
+def reintentar_uno_pendiente(pendiente_id):
+    """
+    Botón "Reintentar ahora" de un elemento puntual de la cola de
+    sincronización (prompt 19c, punto 4) — para cuando la sincronización
+    automática falló o no se ha disparado todavía. A diferencia del ciclo
+    automático, un fallo aquí no corta nada más: es un solo elemento.
+
+    Devuelve (sincronizado: bool, motivo: "conexion" | "error" | None).
+    """
+    preparar_bases_locales()
+    from .models import PendienteSincronizacion
+
+    try:
+        pendiente = PendienteSincronizacion.objects.using(ALIAS_LOCAL).get(pk=pendiente_id)
+    except PendienteSincronizacion.DoesNotExist:
+        return False, None
+
+    exito, fue_error_de_conexion = _intentar_sincronizar_uno(pendiente)
+    if exito:
+        return True, None
+    return False, "conexion" if fue_error_de_conexion else "error"
 
 
 def _marcar_intento_fallido(pendiente, error):
@@ -629,6 +788,58 @@ def _marcar_intento_fallido(pendiente, error):
         pendiente.save(using=ALIAS_LOCAL, update_fields=["intentos", "ultimo_error"])
     except Exception:
         pass
+
+
+# --- Mostrar la cola de pendientes (prompt 19c, punto 4) --------------------
+
+_ETIQUETAS_TIPO_PENDIENTE = {"LoteCompra": "Entrada", "ConteoFisico": "Conteo físico"}
+
+
+def _tipo_mostrado_pendiente(pendiente):
+    if pendiente.modelo != "MovimientoSalida":
+        return _ETIQUETAS_TIPO_PENDIENTE.get(pendiente.modelo, pendiente.modelo)
+    tipo = pendiente.payload.get("tipo")
+    if tipo == "ajuste":
+        cantidad = pendiente.payload.get("cantidad") or 0
+        return "Ajuste (sobrante)" if cantidad < 0 else "Ajuste (faltante)"
+    return {"venta": "Venta", "merma": "Merma"}.get(tipo, "Ajuste")
+
+
+def listar_pendientes_para_mostrar():
+    """
+    Fila por pendiente para la pantalla "Cola de sincronización" (prompt
+    19c, punto 4): tipo, producto, cantidad, fecha de creación local,
+    intentos ya hechos y el último error (si algo falló antes) — todo
+    resuelto desde la cola local y el catálogo cacheado, nunca desde
+    Neon, así la pantalla funciona igual con o sin conexión.
+    """
+    from .models import PendienteSincronizacion, Producto
+
+    try:
+        pendientes = list(PendienteSincronizacion.objects.using(ALIAS_LOCAL).all())
+    except Exception:
+        return []
+    if not pendientes:
+        return []
+
+    productos_por_id = {p.pk: p.nombre for p in Producto.objects.using(ALIAS_LOCAL).all()}
+
+    filas = []
+    for pendiente in pendientes:
+        payload = pendiente.payload
+        cantidad = payload.get("cantidad_contada", payload.get("cantidad"))
+        filas.append(
+            {
+                "id": pendiente.pk,
+                "tipo": _tipo_mostrado_pendiente(pendiente),
+                "producto": productos_por_id.get(payload.get("producto_id"), "—"),
+                "cantidad": abs(cantidad) if cantidad is not None else "—",
+                "creado_en": pendiente.creado_en,
+                "intentos": pendiente.intentos,
+                "ultimo_error": pendiente.ultimo_error,
+            }
+        )
+    return filas
 
 
 # --- Catálogo cacheado -------------------------------------------------------
@@ -642,17 +853,26 @@ def refrescar_catalogo_cache():
 
     Se conserva el mismo pk que en Neon (necesario: la cola de pendientes
     guarda producto_id, tiene que apuntar al mismo producto real al
-    sincronizar) y se calcula costo_promedio() de cada producto BASE aquí
-    mismo, con conexión — es el único dato que la caché local no puede
-    derivar sola sin tocar la base (agrega LoteCompra, no es una columna).
+    sincronizar) y se calcula costo_promedio() y stock_teorico() de cada
+    producto BASE aquí mismo, con conexión — son los dos únicos datos que
+    la caché local no puede derivar sola sin tocar la base (agregan
+    LoteCompra/MovimientoSalida, no son columnas). stock_teorico_cache
+    (prompt 19c) es lo que permite validar "hay suficiente inventario"
+    al registrar una venta sin conexión (ver stock_disponible_para_venta
+    más abajo) — se usa MotorStockCosto (servicio ya existente, 3
+    consultas fijas) en vez de Producto.stock_teorico() producto por
+    producto, para no pagar una consulta extra por cada uno.
     """
     preparar_bases_locales()
     from .models import Categoria, Producto
+    from .services import MotorStockCosto
 
     categorias = list(Categoria.objects.using("default").all())
     productos_base = list(Producto.objects.using("default").filter(producto_base__isnull=True))
     productos_derivados = list(Producto.objects.using("default").filter(producto_base__isnull=False))
     costos_base = {p.pk: p.costo_promedio() for p in productos_base}
+    motor = MotorStockCosto()
+    stocks_base = {p.pk: motor.stock_teorico(p.pk) for p in productos_base}
 
     with transaction.atomic(using=ALIAS_LOCAL):
         # DELETE crudo, no Producto.objects...delete(): el Collector de
@@ -675,6 +895,7 @@ def refrescar_catalogo_cache():
                 precio_venta_actual=p.precio_venta_actual, activo=p.activo,
                 producto_base_id=None, factor_equivalencia=p.factor_equivalencia,
                 costo_promedio_cache=costos_base[p.pk],
+                stock_teorico_cache=stocks_base[p.pk],
             )
         for p in productos_derivados:
             costo_base = costos_base.get(p.producto_base_id) or Decimal("0.00")
@@ -683,6 +904,10 @@ def refrescar_catalogo_cache():
                 precio_venta_actual=p.precio_venta_actual, activo=p.activo,
                 producto_base_id=p.producto_base_id, factor_equivalencia=p.factor_equivalencia,
                 costo_promedio_cache=(costo_base * p.factor_equivalencia).quantize(Decimal("0.01")),
+                # stock_teorico_cache de un derivado guarda el stock del
+                # BASE (no dividido por factor) — ver el docstring del
+                # campo en models.py: quien lo lea decide esa división.
+                stock_teorico_cache=stocks_base.get(p.producto_base_id),
             )
 
 
@@ -737,6 +962,166 @@ def refrescar_credenciales_cache():
         fila.save(using=ALIAS_LOCAL)
         revisadas += 1
     return revisadas
+
+
+# --- Historial offline (prompt 19c, punto 1) ---------------------------------
+
+LIMITE_HISTORIAL_CACHE = 300
+
+
+def _fila_historial_a_payload(fila):
+    """Convierte una fila de movimientos_periodo() (services.py) en algo JSON-serializable para MovimientoHistorialCache.payload."""
+    return {
+        "fecha": _serializar_valor(fila["fecha"]),
+        "tipo": fila["tipo"],
+        "producto_nombre": str(fila["producto"]),
+        "cantidad": fila["cantidad"],
+        "valor_unitario": _serializar_valor(fila["valor_unitario"]) if fila["valor_unitario"] is not None else None,
+        "usuario": fila["usuario"],
+        "detalle": fila["detalle"],
+        "creado_en": _serializar_valor(fila["creado_en"]),
+        "tipo_registro": fila["tipo_registro"],
+        "registro_id": fila["registro_id"],
+    }
+
+
+def _payload_a_fila_historial(payload):
+    """Inverso de _fila_historial_a_payload(): reconstruye la fila lista para la plantilla historial.html."""
+    valor_unitario = payload.get("valor_unitario")
+    return {
+        "fecha": _deserializar_valor(payload["fecha"]),
+        "tipo": payload["tipo"],
+        "producto": payload["producto_nombre"],
+        "cantidad": payload["cantidad"],
+        "valor_unitario": _deserializar_valor(valor_unitario) if valor_unitario is not None else None,
+        "usuario": payload.get("usuario") or "",
+        "detalle": payload.get("detalle") or "",
+        "creado_en": _deserializar_valor(payload["creado_en"]),
+        "tipo_registro": payload["tipo_registro"],
+        "registro_id": payload["registro_id"],
+        "es_pendiente": False,
+    }
+
+
+def refrescar_historial_cache():
+    """
+    Copia local (borra y reinserta, últimos LIMITE_HISTORIAL_CACHE) de
+    los movimientos ya confirmados en Neon — lo que permite consultar
+    Historial sin conexión (prompt 19c, punto 1). Reutiliza
+    movimientos_periodo() (services.py), la misma función que ya arma el
+    Historial en línea, para no duplicar esa lógica.
+
+    Solo tiene sentido llamarla con conexión — deja que la excepción se
+    propague si no la hay, igual que refrescar_catalogo_cache().
+    """
+    preparar_bases_locales()
+    from datetime import date as date_cls
+
+    from .models import MovimientoHistorialCache
+    from .services import movimientos_periodo
+
+    filas = movimientos_periodo(date_cls(1900, 1, 1), date_cls(2999, 12, 31), descendente=True)
+    filas = filas[:LIMITE_HISTORIAL_CACHE]
+
+    with transaction.atomic(using=ALIAS_LOCAL):
+        MovimientoHistorialCache.objects.using(ALIAS_LOCAL).all().delete()
+        for fila in filas:
+            MovimientoHistorialCache.objects.using(ALIAS_LOCAL).create(
+                tipo_registro=fila["tipo_registro"],
+                registro_id=fila["registro_id"],
+                fecha=fila["fecha"],
+                producto_id=fila["producto"].pk,
+                payload=_fila_historial_a_payload(fila),
+            )
+
+
+def _fila_desde_pendiente_historial(pendiente, productos_por_id, usuarios_por_id):
+    """
+    Convierte un PendienteSincronizacion en una fila de historial —
+    mismo formato que las de la caché, marcada aparte como es_pendiente.
+    """
+    payload = pendiente.payload
+    producto_id = payload.get("producto_id")
+    producto_nombre = productos_por_id.get(producto_id)
+    if producto_nombre is None:
+        return None
+
+    if pendiente.modelo == "LoteCompra":
+        cantidad = payload.get("cantidad") or 0
+        valor_unitario = payload.get("costo_unitario")
+        detalle = payload.get("notas") or ""
+        if payload.get("proveedor"):
+            detalle = f"Proveedor: {payload['proveedor']}" + (f" · {detalle}" if detalle else "")
+    elif pendiente.modelo == "MovimientoSalida":
+        cantidad = abs(payload.get("cantidad") or 0)
+        valor_unitario = payload.get("precio_venta_unitario") if payload.get("tipo") == "venta" else payload.get("costo_unitario_snapshot")
+        detalle = payload.get("motivo") or ""
+    else:  # ConteoFisico
+        cantidad = payload.get("cantidad_contada") or 0
+        valor_unitario = None
+        detalle = payload.get("notas") or ""
+
+    return {
+        "fecha": _deserializar_valor(payload.get("fecha")),
+        "tipo": _tipo_mostrado_pendiente(pendiente),
+        "producto": producto_nombre,
+        "producto_id": producto_id,
+        "cantidad": cantidad,
+        "valor_unitario": _deserializar_valor(valor_unitario) if valor_unitario is not None else None,
+        "usuario": usuarios_por_id.get(payload.get("registrado_por_id"), ""),
+        "detalle": detalle,
+        "creado_en": pendiente.creado_en,
+        "tipo_registro": pendiente.modelo,
+        "registro_id": None,  # todavía no existe en Neon — no se puede editar/eliminar hasta que sincronice
+        "es_pendiente": True,
+    }
+
+
+def historial_offline(fecha_desde, fecha_hasta, producto_id=None):
+    """
+    Historial combinado sin conexión (prompt 19c, punto 1): los últimos
+    movimientos ya sincronizados (MovimientoHistorialCache, refrescada
+    con conexión cada INTERVALO_CATALOGO_SEGUNDOS) más lo que está en la
+    cola de pendientes de ESTA máquina y todavía no ha llegado a Neon —
+    marcado aparte con "es_pendiente" para que la plantilla lo distinga
+    visualmente. Nunca incluye edición/eliminación (eso lo sigue
+    bloqueando RequiereConexionMixin en CorreccionUpdateView/DeleteView,
+    sin cambios de este prompt).
+
+    Alcance explícito y limitado a propósito: son los últimos
+    LIMITE_HISTORIAL_CACHE movimientos, no el historial completo — un
+    filtro de fechas más viejo que lo cacheado simplemente no encuentra
+    nada ahí, igual que pasaría si de verdad no hubiera movimientos en
+    ese rango.
+    """
+    from .models import CredencialOfflineCache, MovimientoHistorialCache, PendienteSincronizacion, Producto
+
+    filas = []
+    cache_qs = MovimientoHistorialCache.objects.using(ALIAS_LOCAL).filter(fecha__gte=fecha_desde, fecha__lte=fecha_hasta)
+    if producto_id:
+        cache_qs = cache_qs.filter(producto_id=producto_id)
+    for fila_cache in cache_qs:
+        filas.append(_payload_a_fila_historial(fila_cache.payload))
+
+    try:
+        pendientes = list(PendienteSincronizacion.objects.using(ALIAS_LOCAL).all())
+    except Exception:
+        pendientes = []
+    if pendientes:
+        productos_por_id = {p.pk: p.nombre for p in Producto.objects.using(ALIAS_LOCAL).all()}
+        usuarios_por_id = {c.user_id: c.username for c in CredencialOfflineCache.objects.using(ALIAS_LOCAL).all()}
+        for pendiente in pendientes:
+            fila = _fila_desde_pendiente_historial(pendiente, productos_por_id, usuarios_por_id)
+            if fila is None:
+                continue
+            if producto_id and fila["producto_id"] != producto_id:
+                continue
+            if not (fecha_desde <= fila["fecha"] <= fecha_hasta):
+                continue
+            filas.append(fila)
+
+    filas.sort(key=lambda f: (f["fecha"], f["creado_en"]), reverse=True)
+    return filas
 
 
 # --- Hilo de sincronización en segundo plano --------------------------------
@@ -805,6 +1190,12 @@ def _ciclo_de_fondo():
 
                 if _tarea("sincronizar pendientes", _sincronizar) and sincronizados:
                     logger.info("Sincronización offline: %d movimiento(s) confirmados contra Neon.", sincronizados)
+                    # Refresca el historial cacheado de inmediato tras
+                    # sincronizar de verdad algo (prompt 19c, punto 1/2):
+                    # así Historial offline y el próximo reintento del
+                    # dashboard ya reflejan lo recién subido, sin esperar
+                    # hasta el próximo refresco de INTERVALO_CATALOGO_SEGUNDOS.
+                    _tarea("refrescar historial tras sincronizar", refrescar_historial_cache)
 
                 # "not habia_conexion" = acaba de VOLVER la conexión: se
                 # refresca de inmediato, sin esperar el intervalo. Importa
@@ -819,7 +1210,9 @@ def _ciclo_de_fondo():
                     if _tarea("revalidar credenciales", refrescar_credenciales_cache):
                         ultimo_credenciales = ahora
                 if acaba_de_reconectar or ahora - ultimo_catalogo >= INTERVALO_CATALOGO_SEGUNDOS:
-                    if _tarea("refrescar catálogo", refrescar_catalogo_cache):
+                    ok_catalogo = _tarea("refrescar catálogo", refrescar_catalogo_cache)
+                    ok_historial = _tarea("refrescar historial", refrescar_historial_cache)
+                    if ok_catalogo and ok_historial:
                         ultimo_catalogo = ahora
             habia_conexion = conectado
         except Exception:

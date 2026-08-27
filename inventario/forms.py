@@ -145,6 +145,7 @@ class MovimientoSalidaForm(forms.ModelForm):
         tipo = cleaned_data.get("tipo")
         motivo = cleaned_data.get("motivo")
         cantidad = cleaned_data.get("cantidad")
+        producto = cleaned_data.get("producto")
 
         if not self.permitir_todos_los_tipos and tipo != "venta":
             self.add_error("tipo", "Como vendedor, solo puedes registrar ventas.")
@@ -164,6 +165,31 @@ class MovimientoSalidaForm(forms.ModelForm):
                 self.add_error("cantidad", "La cantidad debe ser mayor que cero.")
             elif tipo == "ajuste" and cantidad == 0:
                 self.add_error("cantidad", "La cantidad del ajuste no puede ser cero.")
+
+        # Validación de stock disponible (prompt 19c, punto 5): solo para
+        # una venta NUEVA (self.instance.pk is None) — nunca al CORREGIR
+        # una ya guardada (MovimientoSalidaCorreccionForm hereda este
+        # clean()), porque ahí stock_disponible_para_venta() ya cuenta la
+        # cantidad ORIGINAL como consumida, y validar como si fuera una
+        # venta nueva de la cantidad corregida exigiría de más. Tampoco
+        # aplica a merma/ajuste — el reporte que motivó este punto es
+        # específicamente "se puede vender más de lo que hay".
+        if (
+            self.instance.pk is None
+            and tipo == "venta"
+            and producto is not None
+            and cantidad is not None
+            and cantidad > 0
+            and "cantidad" not in self.errors
+        ):
+            from .offline import stock_disponible_para_venta
+
+            disponible = stock_disponible_para_venta(producto)
+            if cantidad > disponible:
+                self.add_error(
+                    "cantidad",
+                    f"No hay suficiente inventario disponible: quedan {max(disponible, 0)} unidades.",
+                )
 
         return cleaned_data
 
@@ -205,6 +231,14 @@ class HistorialFiltroForm(forms.Form):
         required=False,
         widget=forms.DateInput(attrs={"type": "date", "class": "form-control"}),
     )
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Historial funciona sin conexión (prompt 19c, punto 1) — el
+        # desplegable de producto tiene que poder armarse desde el
+        # catálogo cacheado ahí también, igual que en los 3 formularios
+        # de escritura (ver _alias_catalogo()).
+        self.fields["producto"].queryset = Producto.objects.using(_alias_catalogo()).all()
 
     def clean(self):
         cleaned_data = super().clean()

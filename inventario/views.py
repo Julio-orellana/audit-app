@@ -39,6 +39,10 @@ from .offline import (
     completar_snapshot_offline,
     contar_pendientes,
     hay_conexion,
+    historial_offline,
+    listar_pendientes_para_mostrar,
+    reintentar_uno_pendiente,
+    sincronizar_pendientes,
 )
 from .permisos import RequiereRol, requiere_rol, rol_de
 from .reportes import generar_reporte_excel
@@ -190,6 +194,12 @@ def home(request):
         "ganancia_neta_hoy": totales_hoy["ganancia_neta"],
         "hoy": hoy,
         "saludo": _saludo_segun_hora(),
+        # pendientes (prompt 19c, punto 2): con esto, y sabiendo que aquí
+        # SÍ hay conexión (se llegó a este punto porque hay_conexion() ya
+        # dio True arriba), home.html puede mostrar "subiendo cambios
+        # pendientes..." y refrescarse solo cuando la cola de esta misma
+        # máquina termine de subir lo que quedó de una sesión anterior.
+        "pendientes": contar_pendientes(),
     }
     return render(request, "inventario/home.html", context)
 
@@ -476,31 +486,132 @@ def generar_ajuste(request, pk):
 # usar RequiereRol("admin") — exclusivo de administrador, ni el auditor
 # puede editar o borrar lo ya registrado (ver reglas de rol del prompt 16).
 
-class HistorialView(RequiereRol("admin", "auditor"), RequiereConexionMixin, ManejoErrorConexionMixin, generic.TemplateView):
+class HistorialView(RequiereRol("admin", "auditor"), ManejoErrorConexionMixin, generic.TemplateView):
+    """
+    Historial en modo LECTURA funciona sin conexión (prompt 19c, punto 1):
+    combina los últimos movimientos ya sincronizados (cacheados en esta
+    máquina) con lo que está en la cola de pendientes y todavía no ha
+    llegado a Neon, marcado como "Pendiente" en la plantilla. Lo que
+    sigue exigiendo conexión, sin cambios, es EDITAR o ELIMINAR un
+    registro — eso lo bloquea RequiereConexionMixin en
+    CorreccionUpdateView/CorreccionDeleteView, no esta vista.
+
+    No lleva RequiereConexionMixin: en vez de bloquear de entrada, decide
+    caso por caso en get_context_data() — con conexión usa la consulta
+    completa de siempre (movimientos_periodo(), sin límite de fecha); sin
+    ella, o si la conexión se cae A MEDIO de esa consulta (ManejoError
+    ConexionMixin ya no haría falta para esto, pero se conserva como red
+    de seguridad), cae a historial_offline().
+    """
     template_name = "inventario/historial.html"
+    funciona_sin_conexion = True
 
     def get_context_data(self, **kwargs):
         context = super().get_context_data(**kwargs)
         form = HistorialFiltroForm(self.request.GET or None)
         context["form"] = form
 
-        productos = None
+        producto = None
         fecha_desde = None
         fecha_hasta = None
         if form.is_valid():
             producto = form.cleaned_data.get("producto")
             fecha_desde = form.cleaned_data.get("fecha_desde")
             fecha_hasta = form.cleaned_data.get("fecha_hasta")
-            if producto:
-                productos = [producto]
 
         # Sin filtro de fecha, se muestra todo el historial: un rango muy
-        # amplio hace las veces de "sin límite" para movimientos_periodo().
+        # amplio hace las veces de "sin límite" para movimientos_periodo()
+        # (con conexión) o historial_offline() (sin ella).
         fecha_desde = fecha_desde or date(1900, 1, 1)
         fecha_hasta = fecha_hasta or date(2999, 12, 31)
 
-        context["filas"] = movimientos_periodo(fecha_desde, fecha_hasta, productos=productos)
+        if hay_conexion():
+            try:
+                context["filas"] = movimientos_periodo(
+                    fecha_desde, fecha_hasta, productos=[producto] if producto else None
+                )
+                context["modo_offline"] = False
+                return context
+            except ERRORES_DE_CONEXION:
+                # Se cortó la conexión justo a media consulta — cae al
+                # camino offline de abajo en vez de dejar que se propague.
+                pass
+
+        context["filas"] = historial_offline(
+            fecha_desde, fecha_hasta, producto_id=producto.pk if producto else None
+        )
+        context["modo_offline"] = True
         return context
+
+
+# --- Cola de sincronización (prompt 19c, punto 4) ---------------------------
+# Pantalla completa solo para admin/auditor — el vendedor conserva
+# únicamente el indicador simple de "N pendientes" del navbar/dashboard
+# (prompt 19), sin acceso a esta vista con el detalle de cada pendiente.
+
+class ColaSincronizacionView(RequiereRol("admin", "auditor"), generic.TemplateView):
+    """
+    Funciona sin conexión a propósito: la cola en sí (lo que hay que
+    revisar) vive en el archivo local de esta máquina, no en Neon — tiene
+    sentido poder consultarla justo cuando no hay conexión, que es cuando
+    más se necesita saber qué está pendiente.
+    """
+    template_name = "inventario/cola_sincronizacion.html"
+    funciona_sin_conexion = True
+
+    def get_context_data(self, **kwargs):
+        context = super().get_context_data(**kwargs)
+        context["filas"] = listar_pendientes_para_mostrar()
+        context["conectado"] = hay_conexion()
+        return context
+
+
+@funciona_sin_conexion
+@requiere_rol("admin", "auditor")
+@require_POST
+def cola_sincronizacion_reintentar(request, pendiente_id):
+    sincronizado, motivo = reintentar_uno_pendiente(pendiente_id)
+    if sincronizado:
+        messages.success(request, "Movimiento sincronizado correctamente.")
+    elif motivo == "conexion":
+        messages.warning(request, "Sigue sin haber conexión — no se pudo sincronizar todavía.")
+    else:
+        messages.error(request, "No se pudo sincronizar: revisa el detalle del error en la lista.")
+    return redirect("cola_sincronizacion")
+
+
+@funciona_sin_conexion
+@requiere_rol("admin", "auditor")
+@require_POST
+def cola_sincronizacion_reintentar_todos(request):
+    # contar_pendientes() ANTES de sincronizar: distingue "no había nada
+    # que hacer" (probablemente el hilo de fondo ya lo subió solo, justo
+    # antes de este clic) de "lo intentó y no pudo" — mismo total=0 en
+    # ambos casos, pero mensajes muy distintos para quien hace clic.
+    habia_pendientes = contar_pendientes() > 0
+    total = sincronizar_pendientes()
+    if total:
+        messages.success(request, f"Se sincronizaron {total} movimiento{'s' if total != 1 else ''}.")
+    elif habia_pendientes:
+        messages.warning(request, "No se pudo sincronizar ningún movimiento por ahora — revisa la conexión.")
+    else:
+        messages.info(request, "No había nada pendiente por sincronizar — ya estaba todo al día.")
+    return redirect("cola_sincronizacion")
+
+
+@funciona_sin_conexion
+@login_required
+def estado_sincronizacion(request):
+    """
+    Endpoint liviano en JSON, consultado por el pequeño script del
+    dashboard (prompt 19c, punto 2) para saber cuándo terminó de subirse
+    lo que quedó pendiente de una sesión anterior y refrescar la pantalla
+    sola en ese momento — nunca dispara una sincronización por sí mismo,
+    solo reporta el estado actual de la cola local y la conectividad.
+    """
+    from django.http import JsonResponse
+
+    return JsonResponse({"pendientes": contar_pendientes(), "conectado": hay_conexion()})
 
 
 # --- Reportes --------------------------------------------------------------
