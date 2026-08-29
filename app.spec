@@ -12,7 +12,7 @@ no hace cross-compile). Uso:
 
 Genera dist/AuditoriaAylupita/AuditoriaAylupita.exe.
 """
-from PyInstaller.utils.hooks import collect_data_files, collect_submodules
+from PyInstaller.utils.hooks import collect_data_files, collect_dynamic_libs, collect_submodules
 
 block_cipher = None
 
@@ -43,13 +43,33 @@ for paquete in (
     "crispy_forms",
     "crispy_bootstrap5",
     "webview",
+    # psycopg (prompt 18, Postgres/Neon) — NUEVO desde el build del 13b,
+    # que solo conocía SQLite. psycopg (el paquete puro-Python) importa a
+    # psycopg_binary (la implementación en C, instalada vía
+    # "psycopg[binary]" en requirements.txt) con un try/except en tiempo
+    # de ejecución, no con un "import" estático arriba del archivo — el
+    # análisis estático de PyInstaller NO sigue ese patrón solo, así que
+    # sin esto psycopg_binary queda completamente afuera del bundle y
+    # cualquier intento de conectar a Neon revienta con ImportError
+    # apenas se abre la app empaquetada. Confirmado con un build real
+    # (ver EMPAQUETADO.md, prompt 30) antes de darlo por bueno.
+    "psycopg",
+    "psycopg_binary",
+    "dj_database_url",
+    "environ",
 ):
     hiddenimports += collect_submodules(paquete)
+
+# psycopg_binary trae DOS extensiones compiladas (pq.*.so/.pyd y
+# _psycopg.*.so/.pyd) — son binarios nativos, no bytecode Python:
+# collect_submodules() (arriba) encuentra el módulo por nombre, pero el
+# .so/.pyd en sí solo se copia al bundle si además se declara aquí.
+psycopg_binaries = collect_dynamic_libs("psycopg_binary")
 
 a = Analysis(
     ["app_desktop.py"],
     pathex=[],
-    binaries=[],
+    binaries=psycopg_binaries,
     datas=datas,
     hiddenimports=hiddenimports,
     hookspath=[],

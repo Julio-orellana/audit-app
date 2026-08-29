@@ -12,7 +12,7 @@ puerto por completo — no queda ningún proceso de Python en segundo plano.
 """
 import os
 import socket
-import sys2
+import sys
 import threading
 import time
 

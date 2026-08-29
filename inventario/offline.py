@@ -41,12 +41,15 @@ RequiereConexionMixin (inventario/resiliencia.py) en vez de
 ColaOfflineMixin.
 """
 import logging
+import os
 import sys
 import threading
 import time
 from datetime import date, datetime
 from decimal import Decimal
+from pathlib import Path
 
+from django.conf import settings
 from django.contrib import messages
 from django.contrib.auth import HASH_SESSION_KEY, SESSION_KEY
 from django.contrib.auth.backends import ModelBackend
@@ -99,7 +102,36 @@ def preparar_bases_locales():
         if _bases_locales_listas:
             return
         call_command("migrate", database=ALIAS_LOCAL, run_syncdb=True, verbosity=0, interactive=False)
+        _restringir_permisos_archivo_local()
         _bases_locales_listas = True
+
+
+def _restringir_permisos_archivo_local():
+    """
+    "offline_local.sqlite3" (prompt 19/19b/19c) es UN SOLO archivo que
+    guarda, a la vez, la cola de pendientes, el caché de credenciales
+    offline (CredencialOfflineCache.password_hash — un hash, nunca la
+    contraseña en claro, pero un hash igual no es algo para dejar
+    legible por cualquiera) y el caché de historial. Por defecto,
+    SQLite lo crea con los permisos normales del sistema operativo
+    (0o644 en macOS/Linux — el dueño puede escribir, cualquier otra
+    cuenta local de esa máquina puede LEER). Se restringe a
+    solo-el-dueño (0o600) apenas queda listo, en vez de confiar en el
+    permiso por defecto.
+
+    os.chmod() en Windows no controla ACLs de verdad (solo puede
+    alternar el atributo de solo-lectura) — esto es un endurecimiento
+    real en macOS/Linux y un best-effort silencioso en Windows, nunca
+    la única capa de protección: la contraseña en sí sigue sin
+    guardarse jamás en texto plano, pase lo que pase con el permiso del
+    archivo (ver CredencialOfflineCache en models.py).
+    """
+    try:
+        ruta = Path(settings.DATABASES[ALIAS_LOCAL]["NAME"])
+        if ruta.exists():
+            os.chmod(ruta, 0o600)
+    except Exception:
+        logger.exception("No se pudo restringir el permiso del archivo local de datos offline.")
 
 
 # --- Conectividad ------------------------------------------------------------

@@ -37,6 +37,56 @@ igual, moviendo `.env` a un lado temporalmente:
 mv .env .env.bak && python manage.py test; mv .env.bak .env
 ```
 
+## Scripts de prueba, siembra de datos o limpieza — regla no negociable (prompt 32)
+
+**Requisito obligatorio, sin excepción, para cualquier script (del repo o
+improvisado en una sesión de desarrollo) que vaya a sembrar datos de
+prueba o borrar registros masivamente:** verificar el entorno ANTES de
+escribir nada, usando `seguridad_entorno_pruebas.py` (raíz del proyecto).
+Nunca asumas "seguramente `.env` está bien" ni confíes en verificar a
+mano — este módulo existe exactamente porque eso falló una vez.
+
+Por qué existe esto: el prompt 30 mandó un script (`sembrar30.py`,
+pensado para una base de pruebas aislada) que en realidad leyó el `.env`
+de producción activo en ese momento — nadie se lo indicó explícitamente
+— y borró con `.delete()` todos los `LoteCompra`/`MovimientoSalida`/
+`ConteoFisico` reales de Neon. El prompt 32 corrigió la causa raíz
+(ver `seguridad_entorno_pruebas.py` para el detalle completo) y **esta
+regla queda vigente para siempre, no solo para el prompt 30**: cualquier
+instrucción futura de "genera datos de prueba", "limpia la base",
+"siembra un escenario para verificar X", etc., implica primero pasar por
+este mecanismo.
+
+Patrón obligatorio para un script independiente (arranca Django él mismo):
+
+```python
+import sys
+sys.path.insert(0, "/ruta/al/proyecto")
+from seguridad_entorno_pruebas import cargar_env_de_pruebas, confirmar_operacion_riesgosa
+
+cargar_env_de_pruebas()          # ANTES de "import django"/"django.setup()" — nunca el .env de producción
+import os, django
+os.environ.setdefault("DJANGO_SETTINGS_MODULE", "auditoria_aylupita.settings")
+django.setup()
+
+from inventario.models import LoteCompra
+confirmar_operacion_riesgosa("borrar TODO LoteCompra")   # imprime host+base, exige escribir CONFIRMAR
+LoteCompra.objects.all().delete()
+```
+
+`cargar_env_de_pruebas()` carga `.env.test` (nunca `.env`) y falla fuerte
+si ese archivo no existe o si su `DATABASE_URL` no tiene ninguna señal
+reconocible de ser de pruebas (ni "test" en el nombre de la base, ni
+localhost/127.0.0.1 en el host). Crea tu `.env.test` real a partir de
+`.env.test.example` la primera vez que lo necesites — nunca se sube a
+git, igual que `.env`.
+
+Para un management command del repo, el mismo patrón pero solo con
+`confirmar_operacion_riesgosa()` (el comando ya arrancó con el `.env` que
+sea desde antes — ver `limpiar_datos_prueba.py`/`cargar_datos_prueba.py`
+para el ejemplo real ya aplicado, incluida la bandera `--sin-confirmar`
+para automatización controlada).
+
 ## Restaurar desde un respaldo completo (prompt 23)
 
 Cada login de un admin/auditor (nunca vendedor) genera, como máximo una
