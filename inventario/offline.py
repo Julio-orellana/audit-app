@@ -229,6 +229,17 @@ def _reciclar_conexion_remota():
         conexion.health_check_done = True
 
 
+def resumen_conexion_actual(alias="default"):
+    """
+    {host, dbname} de la conexión activa — para poder decir en el log a
+    QUÉ base se estaba hablando cuando algo falló, en vez de un "no se
+    pudo" sin contexto. Nunca incluye la contraseña.
+    """
+    cfg = settings.DATABASES.get(alias, {})
+    host = cfg.get("HOST") or "(sqlite, sin red)"
+    return {"host": host, "dbname": str(cfg.get("NAME"))}
+
+
 def hay_conexion():
     """
     ¿Se puede hablar con Neon AHORA MISMO? Verifica de verdad la conexión
@@ -470,11 +481,20 @@ class BackendConRespaldoOffline(ModelBackend):
             )
             raise
         if user is None:
-            logger.warning(
-                "Login CON conexión rechazado para '%s': el usuario no existe en la nube o la "
-                "contraseña no coincide.",
-                username,
-            )
+            # ModelBackend devuelve None tanto si el usuario no existe
+            # como si la contraseña no coincide, y son dos problemas
+            # completamente distintos: "no existe" casi siempre significa
+            # que la app está apuntando a OTRA base de datos (el .env
+            # equivocado), mientras que "existe pero no coincide" es una
+            # contraseña mal escrita o cambiada. Se distinguen aquí
+            # porque, sin eso, perseguir el problema equivocado cuesta
+            # días — ya pasó con el prompt 33.
+            #
+            # Sí, esto revela en el LOG si un usuario existe. Es un
+            # archivo local del equipo del operador, no una respuesta que
+            # se le devuelva a nadie por la red: el mensaje que ve quien
+            # intenta entrar sigue siendo el genérico de siempre.
+            self._registrar_por_que_fallo_el_login(username)
             return None
         try:
             from .permisos import rol_de
@@ -486,6 +506,49 @@ class BackendConRespaldoOffline(ModelBackend):
             # inicio de sesión que YA se validó correctamente.
             logger.exception("Inicio de sesión correcto pero no se pudo cachear la credencial.")
         return user
+
+    @staticmethod
+    def _registrar_por_que_fallo_el_login(username):
+        """
+        Deja en el log el motivo REAL de un login online rechazado, junto
+        con a qué base se está hablando — que es el dato que de verdad
+        resuelve el caso cuando "las credenciales son correctas" pero la
+        app dice que no.
+        """
+        from django.contrib.auth.models import User
+
+        try:
+            info = resumen_conexion_actual()
+            existe = User.objects.filter(username=username).exists()
+            total = User.objects.count()
+        except Exception:
+            logger.exception("Login rechazado para '%s' y además falló el diagnóstico.", username)
+            return
+
+        if existe:
+            logger.warning(
+                "Login RECHAZADO para '%s': el usuario SÍ existe en %s (host %s), así que la "
+                "contraseña no coincide. No es un problema de configuración ni de conexión.",
+                username, info["dbname"], info["host"],
+            )
+        else:
+            # Se listan los usuarios que SÍ existen: casi siempre el
+            # problema no es "la base está vacía" sino que el nombre de
+            # usuario está escrito distinto — y Django compara el nombre
+            # respetando mayúsculas, así que 'ventas' y 'Ventas' son dos
+            # usuarios distintos. Ver eso de un vistazo ahorra horas.
+            try:
+                existentes = sorted(User.objects.values_list("username", flat=True)[:20])
+            except Exception:
+                existentes = []
+            logger.error(
+                "Login RECHAZADO para '%s': ese usuario NO EXISTE en la base a la que está "
+                "conectada la app — %s (host %s), que tiene %d usuario(s): %s. "
+                "Ojo con las mayúsculas: el nombre de usuario distingue entre 'ventas' y "
+                "'Ventas'. Si la lista de arriba se ve vacía o ajena, revisa que el .env "
+                "junto al ejecutable apunte a la base correcta.",
+                username, info["dbname"], info["host"], total, existentes or "(ninguno)",
+            )
 
     def get_user(self, user_id):
         try:

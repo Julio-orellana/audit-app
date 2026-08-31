@@ -66,11 +66,17 @@ abajo no tienen sentido hasta que esto esté bien.
 > VM nunca ocurrió, porque hasta ahora la app se conectaba a un SQLite
 > vacío — la caché está vacía y no hay contra qué validar sin red.
 
+> **Los nombres de usuario distinguen mayúsculas.** En la base de
+> producción los usuarios son exactamente `Ruth`, `Michelle`, `Ventas` y
+> `admin` — verificado. `ventas` en minúscula o `Mich2026` **no
+> existen** y el login fallará con "usuario o contraseña incorrectos"
+> aunque la contraseña sea la correcta.
+
 **Con internet todavía conectado**, y con el `.env` ya en su lugar:
 
 - [ ] Inicia sesión con `Ruth`, y cierra sesión.
-- [ ] Inicia sesión con `Mich2026`, y cierra sesión.
-- [ ] Inicia sesión con `ventas`, y cierra sesión.
+- [ ] Inicia sesión con `Michelle`, y cierra sesión.
+- [ ] Inicia sesión con `Ventas`, y cierra sesión.
 - [ ] En `diagnostico.log` aparece, por cada uno:
       `Credencial de '<usuario>' cacheada para poder entrar sin conexión.`
 
@@ -88,8 +94,8 @@ Desactiva el adaptador de red de la VM **antes** de abrir la app.
 - [ ] El `.exe` abre (la ventana aparece; no se queda colgada ni tarda
       medio minuto).
 - [ ] `Ruth` inicia sesión.
-- [ ] `Mich2026` inicia sesión.
-- [ ] `ventas` inicia sesión.
+- [ ] `Michelle` inicia sesión.
+- [ ] `Ventas` inicia sesión.
 
 Si dice "usuario o contraseña incorrectos", **no asumas que la
 contraseña está mal**: busca en `diagnostico.log` la línea que empieza
@@ -109,9 +115,9 @@ inactivo". Son tres problemas distintos con soluciones distintas.
 
 Con la red aún cortada:
 
-- [ ] `ventas`: registra una venta. La fecha queda fija en hoy, sin poder
+- [ ] `Ventas`: registra una venta. La fecha queda fija en hoy, sin poder
       elegirla.
-- [ ] `Mich2026`: registra una entrada (o merma, o conteo físico).
+- [ ] `Michelle`: registra una entrada (o merma, o conteo físico).
 - [ ] `Ruth`: registra otro movimiento.
 - [ ] Aparece el indicador **"N pendientes de sincronizar"** en la barra
       superior, y el número sube con cada movimiento.
@@ -155,7 +161,7 @@ técnico, no congelarse):
 - [ ] Correcciones
 - [ ] Editar o eliminar un registro desde Historial
 
-Y con `ventas`:
+Y con `Ventas`:
 - [ ] No puede entrar a entradas, mermas, ajustes, conteo físico ni
       reportes (bloqueo por rol, no un crash).
 
