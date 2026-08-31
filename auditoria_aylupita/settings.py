@@ -254,6 +254,35 @@ def _interpretar_url_de_nube(url):
     return cfg, None
 
 
+SEGUNDOS_TIMEOUT_CONEXION_POR_DEFECTO = 3
+
+
+def _leer_connect_timeout():
+    """
+    connect_timeout, tomado del .env si está y con respaldo si no.
+
+    Nunca revienta por un valor mal escrito. Ese cuidado no es
+    paranoia: este archivo se lee AL IMPORTAR settings.py, así que
+    cualquier excepción aquí deja la app sin arrancar en absoluto —ni
+    ventana, ni log, ni mensaje— que es justo el fallo que se corrigió
+    para DATABASE_URL en este mismo prompt. Un `DB_CONNECT_TIMEOUT=`
+    vacío, o con letras, o en cero, cae al valor por defecto en vez de
+    tumbar el programa.
+    """
+    crudo = env("DB_CONNECT_TIMEOUT", default=None)
+    if crudo is None or not str(crudo).strip():
+        return SEGUNDOS_TIMEOUT_CONEXION_POR_DEFECTO
+    try:
+        valor = int(str(crudo).strip())
+    except (TypeError, ValueError):
+        return SEGUNDOS_TIMEOUT_CONEXION_POR_DEFECTO
+    # libpq trata 0 como "sin límite", que es exactamente lo que este
+    # ajuste existe para evitar: una espera sin techo cuelga la ventana.
+    if valor < 1:
+        return SEGUNDOS_TIMEOUT_CONEXION_POR_DEFECTO
+    return min(valor, 60)
+
+
 _url_para_conectar = _direct_database_url if (_es_comando_migrate and _direct_database_url) else _database_url
 _config_nube, _motivo_bd_no_configurada = _interpretar_url_de_nube(_url_para_conectar)
 
@@ -318,8 +347,18 @@ if _config_nube is not None:
     # - tcp_user_timeout: refuerza lo anterior, pero SOLO existe en
     #   Linux; en Windows y macOS libpq lo acepta y lo ignora sin error
     #   (comprobado). Se deja por si algún día esto corre en Linux.
+    # DB_CONNECT_TIMEOUT se puede fijar en el .env, junto al .exe, SIN
+    # recompilar (prompt 33c). Hace falta porque el valor bueno depende
+    # de la red donde corra la app, y eso no se sabe desde aquí: el
+    # saludo completo con Neon (TCP + TLS + autenticación SCRAM con
+    # channel binding) son 6-8 viajes de ida y vuelta, así que una red
+    # con 400ms de latencia necesita bastante más que una con 20ms. En
+    # la VM de Windows este valor en 3 dejaba fuera conexiones
+    # perfectamente sanas, y sin poder ajustarlo desde el .env la única
+    # salida era recompilar el .exe. La sonda de conectividad
+    # (inventario/diagnostico.py) dice en el log qué número poner.
     DATABASES["default"].setdefault("OPTIONS", {}).update({
-        "connect_timeout": 3,
+        "connect_timeout": _leer_connect_timeout(),
         "keepalives": 1,
         "keepalives_idle": 10,
         "keepalives_interval": 5,

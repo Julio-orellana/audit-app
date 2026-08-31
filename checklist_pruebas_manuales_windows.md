@@ -54,6 +54,29 @@ Abre el `.exe` una vez **con internet**, ciérralo, y abre el archivo
 Si algo de esto falla, **detente aquí** y mándame el log: los puntos de
 abajo no tienen sentido hasta que esto esté bien.
 
+#### Si dice `FALLÓ: migrate ... connection timeout expired` aunque haya internet
+
+Desde el prompt 33c, cuando la conexión del arranque falla la app corre
+sola una **sonda de conectividad** y escribe en el log un `VEREDICTO`.
+Búscalo, porque distingue dos causas que se ven idénticas y se arreglan
+al revés:
+
+- *"la nube SÍ responde, pero el saludo completo tarda X s"* → la red de
+  ese equipo es lenta y el timeout se quedó corto. **No hay que
+  recompilar**: agrega `DB_CONNECT_TIMEOUT=<el número que sugiere el
+  log>` al `.env` que está junto al `.exe` y vuelve a abrir la app.
+- *"el TCP pasa pero el saludo cifrado no termina NI CON 25 SEGUNDOS"* →
+  algo intercepta el TLS de salida (antivirus con inspección SSL, proxy
+  o firewall de la red, filtrado del hipervisor). Subir el número no
+  sirve; hay que probar en otra red o desactivar esa inspección.
+- *"no hay ni TCP a ninguna dirección"* → sin internet o puerto 5432
+  bloqueado. Si apagaste la red a propósito, es lo esperado.
+
+> Ojo con `DB_CONNECT_TIMEOUT`: el límite es **por dirección IP** y el
+> host de Neon resuelve a varias, así que un corte real cuesta
+> (valor × direcciones) antes de pasar a modo offline. Con 3 direcciones
+> y 15s son 45 segundos de ventana congelada. Entre 3 y 15 es lo sano.
+
 ### Punto 0-bis — sembrar el caché de credenciales (obligatorio)
 
 > **Sin este paso el punto 1 falla siempre**, y falla diciendo

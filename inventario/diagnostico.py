@@ -203,6 +203,151 @@ def volcar_diagnostico_arranque():
     logger.info("=" * 70)
 
 
+def diagnosticar_conectividad_nube():
+    """
+    Sonda PROFUNDA, que corre solo cuando la conexión normal ya falló.
+
+    Existe por un caso real de la VM de Windows (prompt 33c) que el log
+    no permitía resolver: `Test-NetConnection ... -Port 5432` daba True
+    —o sea que el saludo TCP pasaba— y aun así la app fallaba con
+    "connection timeout expired" contra las tres IPs, de forma
+    reproducible durante más de 10 minutos, mientras el mismo endpoint
+    respondía en 0.83s desde otra máquina.
+
+    Con eso quedaban dos explicaciones muy distintas y ninguna forma de
+    separarlas desde el log:
+
+      a) la red de esa máquina es LENTA y connect_timeout se queda
+         corto — el saludo completo (TCP + TLS + autenticación SCRAM con
+         channel binding) son 6-8 viajes de ida y vuelta, así que con
+         400ms de latencia se pasa de 3s sin que nada esté roto;
+      b) algo BLOQUEA el tráfico cifrado (antivirus, DPI, proxy) — el
+         TCP pasa y el handshake nunca termina, tarde lo que tarde.
+
+    Esta función las separa midiendo los tres escalones por separado y
+    dándole al último un timeout generoso: si con 25s SÍ conecta, es (a)
+    y basta con subir el timeout; si con 25s tampoco, es (b) y no hay
+    número que lo arregle.
+
+    Nunca escribe en la base (solo SELECT 1) y nunca registra la
+    contraseña.
+    """
+    import socket
+
+    from django.conf import settings
+
+    cfg = settings.DATABASES["default"]
+    host, puerto = cfg.get("HOST"), int(cfg.get("PORT") or 5432)
+    if not host or "postgresql" not in (cfg.get("ENGINE") or ""):
+        return
+
+    logger.info("-" * 70)
+    logger.info("SONDA DE CONECTIVIDAD (la conexión normal falló — prompt 33c)")
+
+    # --- Escalón 1: DNS ---
+    inicio = time.monotonic()
+    try:
+        infos = socket.getaddrinfo(host, puerto, type=socket.SOCK_STREAM)
+        direcciones = sorted({i[4][0] for i in infos})
+        logger.info(
+            "  1. DNS: %d dirección(es) en %.2fs -> %s",
+            len(direcciones), time.monotonic() - inicio, direcciones,
+        )
+        logger.info(
+            "     OJO: connect_timeout de libpq es POR DIRECCIÓN, no total. "
+            "Con %d direcciones y connect_timeout=%s, un corte real cuesta "
+            "hasta %ss antes de rendirse.",
+            len(direcciones), (cfg.get("OPTIONS") or {}).get("connect_timeout", "?"),
+            len(direcciones) * int((cfg.get("OPTIONS") or {}).get("connect_timeout", 0) or 0),
+        )
+    except Exception as error:
+        logger.error("  1. DNS: FALLÓ en %.2fs — %s: %s", time.monotonic() - inicio, type(error).__name__, error)
+        logger.info("     Sin DNS no hay nada más que probar: el equipo no resuelve el nombre.")
+        logger.info("-" * 70)
+        return
+
+    # --- Escalón 2: TCP puro, por dirección ---
+    algun_tcp = False
+    for direccion in direcciones:
+        familia = socket.AF_INET6 if ":" in direccion else socket.AF_INET
+        sock = socket.socket(familia, socket.SOCK_STREAM)
+        sock.settimeout(5)
+        inicio = time.monotonic()
+        try:
+            sock.connect((direccion, puerto))
+            algun_tcp = True
+            resultado = "OK"
+        except Exception as error:
+            resultado = f"{type(error).__name__}: {error}"
+        finally:
+            sock.close()
+        logger.info("  2. TCP %s -> %s (%.2fs)", direccion, resultado, time.monotonic() - inicio)
+
+    # Sin TCP a ninguna dirección no tiene sentido el escalón 3: se
+    # pasaría 25s esperando para confirmar lo que ya se sabe. Este es
+    # además el caso MÁS COMÚN (probar la app con la red apagada a
+    # propósito), así que ahorrarse esa espera importa.
+    if not algun_tcp:
+        logger.error(
+            "  *** VEREDICTO: no hay ni TCP a ninguna dirección. El equipo no está llegando "
+            "a la nube: adaptador de red apagado, sin internet, o el puerto 5432 bloqueado "
+            "de salida. (Si apagaste la red a propósito para probar el modo offline, esto es "
+            "justo lo esperado.) ***"
+        )
+        logger.info("-" * 70)
+        return
+
+    # --- Escalón 3: saludo Postgres COMPLETO, con timeout generoso ---
+    opciones = dict(cfg.get("OPTIONS") or {})
+    opciones.pop("connect_timeout", None)
+    opciones.pop("tcp_user_timeout", None)  # no existe fuera de Linux
+    inicio = time.monotonic()
+    try:
+        import psycopg
+
+        conexion = psycopg.connect(
+            host=host, port=puerto, dbname=cfg.get("NAME"),
+            user=cfg.get("USER"), password=cfg.get("PASSWORD"),
+            connect_timeout=25, **opciones
+        )
+        with conexion.cursor() as cursor:
+            cursor.execute("SELECT 1")
+            cursor.fetchone()
+        conexion.close()
+        duracion = time.monotonic() - inicio
+        logger.info("  3. Postgres completo (TLS + autenticación): OK en %.2fs", duracion)
+        configurado = (cfg.get("OPTIONS") or {}).get("connect_timeout")
+        if configurado and duracion > float(configurado):
+            logger.error(
+                "  *** VEREDICTO: la nube SÍ responde, pero el saludo completo tarda %.2fs y "
+                "connect_timeout está en %ss. No hay nada roto ni bloqueado: el timeout se "
+                "quedó corto para esta red. Solución: subir DB_CONNECT_TIMEOUT en el .env "
+                "(junto al .exe) a un valor holgado —por ejemplo %d— y reabrir la app. No "
+                "hace falta recompilar. ***",
+                duracion, configurado, max(10, int(duracion * 2) + 1),
+            )
+        else:
+            logger.warning(
+                "  *** VEREDICTO: ahora sí conectó (%.2fs), o sea que el fallo fue pasajero. "
+                "Si vuelve a ocurrir de forma sostenida, es la red, no la configuración. ***",
+                duracion,
+            )
+    except Exception as error:
+        duracion = time.monotonic() - inicio
+        logger.error(
+            "  3. Postgres completo: FALLÓ en %.2fs — %s: %s",
+            duracion, type(error).__name__, str(error).replace("\n", " ")[:300],
+        )
+        logger.error(
+            "  *** VEREDICTO: el TCP pasa pero el saludo cifrado no termina NI CON 25 "
+            "SEGUNDOS. Subir el timeout no lo va a arreglar. Esto es algo que intercepta o "
+            "descarta el tráfico TLS de salida: antivirus con inspección SSL, un proxy o "
+            "firewall de la red, o el filtrado del hipervisor de la VM. Prueba la app en "
+            "otra red, o desactiva temporalmente la inspección SSL del antivirus. ***"
+        )
+    logger.info("-" * 70)
+
+
 def medir(descripcion):
     """
     Context manager que loguea cuánto tardó un bloque. Se usa para las
