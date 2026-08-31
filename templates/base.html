@@ -178,6 +178,23 @@
 </nav>
 
 <div class="app-page">
+  {% comment %}
+    Aviso de CONFIGURACIÓN, distinto del aviso de "sin conexión" (prompt
+    33). Un corte de red se arregla solo al volver internet; esto no —
+    falta el archivo .env junto al programa y hace falta que alguien lo
+    coloque. Sin diferenciarlo, se confunde con un corte normal y se
+    pierde tiempo esperando a que se resuelva por su cuenta. La app sigue
+    funcionando con la cola y el caché local, igual que ante un corte.
+  {% endcomment %}
+  {% if bd_nube_no_configurada %}
+    <div class="alert" style="background:var(--danger-bg);border:1px solid var(--danger);color:var(--danger-ink);margin-bottom:16px;">
+      <strong>No se pudo leer la configuración de la base de datos.</strong>
+      Puedes seguir trabajando con normalidad: lo que registres se guarda en este equipo.
+      Pero <strong>esto no se arregla reconectándote a internet</strong> — es un problema de
+      instalación del programa. Avisa a soporte técnico para que lo revise, o de lo contrario
+      nada de lo que registres llegará al sistema central.
+    </div>
+  {% endif %}
   {% if messages %}
     {% for message in messages %}
       <div class="alert alert-{{ message.tags|default:'info' }}">{{ message }}</div>

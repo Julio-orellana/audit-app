@@ -69,6 +69,44 @@ ERRORES_DE_CONEXION = (OperationalError, InterfaceError)
 # tres roles desde el prompt 19b.
 ALIAS_LOCAL = "local_disco"
 
+# Un sondeo de conectividad que tarde más que esto es, por sí solo, la
+# explicación de que la app quede "insensible" (prompt 33): se registra
+# como error para que quede en el log del equipo donde pasó.
+UMBRAL_SONDEO_LENTO_SEGUNDOS = 3.0
+
+# Cuánto se reutiliza el resultado de un sondeo de conectividad antes de
+# volver a preguntar de verdad (prompt 33). hay_conexion() se llama en
+# CASI TODA request (dashboard, formularios vía _alias_catalogo(),
+# RequiereConexionMixin) y encima el dashboard consulta
+# /estado-sincronizacion/ cada 4 segundos. Sin caché, un corte de red
+# hace que cada una de esas llamadas pague el connect_timeout completo y,
+# con waitress en 4 hilos, la app entera deja de responder.
+#
+# Se cachea SOLO el resultado negativo y por poco tiempo: un "sí hay
+# conexión" nunca se cachea (si la red se cae justo después, la
+# operación real falla y el manejo de errores de siempre la atrapa), y
+# 15s es lo bastante corto para que volver la conexión se note enseguida.
+SEGUNDOS_CACHE_SIN_CONEXION = 15.0
+
+_sin_conexion_hasta = 0.0
+_lock_cache_conexion = threading.Lock()
+
+
+def reiniciar_cache_conexion():
+    """
+    Olvida el resultado cacheado del último sondeo, forzando que el
+    próximo hay_conexion() pregunte de verdad.
+
+    Hace falta porque la caché es estado global del proceso: en las
+    pruebas, un test que a propósito deja la conexión caída dejaría
+    "sin conexión" pegado hasta 15s y haría fallar al siguiente test por
+    un motivo que no tiene nada que ver con lo que ese test verifica.
+    """
+    global _sin_conexion_hasta
+    with _lock_cache_conexion:
+        _sin_conexion_hasta = 0.0
+
+
 # Marca en la sesión de que ESTE inicio de sesión se validó contra la
 # caché local, no contra Neon — la usa ContinuidadSesionOfflineMiddleware
 # para saber a quién avisarle si la revalidación posterior falla.
@@ -196,11 +234,40 @@ def hay_conexion():
     ¿Se puede hablar con Neon AHORA MISMO? Verifica de verdad la conexión
     (ver _reciclar_conexion_remota) y, si está muerta, la cierra para que
     el siguiente intento reconecte en vez de arrastrar el error.
+
+    OJO (prompt 33): esta función es rápida SOLO si el intento de
+    conexión falla rápido. Un puerto cerrado en localhost rechaza al
+    instante (0.00s — así se probó todo el modo offline en Mac), pero un
+    corte de red REAL descarta los paquetes en silencio y entonces esto
+    espera el timeout del sistema operativo: 75s medidos en Mac contra
+    una IP que traga paquetes. Por eso se instrumenta la duración — es
+    la evidencia que hace falta para confirmar el diagnóstico en
+    Windows, donde toda la app queda sin responder.
     """
+    global _sin_conexion_hasta
+
+    # Sin configuración de nube legible (falta el .env junto al .exe):
+    # nunca hay conexión y no tiene sentido sondear la red ni una sola
+    # vez. Se responde al instante para que el motor offline se active
+    # igual que ante un corte normal — ver BD_NUBE_NO_CONFIGURADA en
+    # settings.py y el aviso diferenciado en la interfaz.
+    if getattr(settings, "BD_NUBE_NO_CONFIGURADA", False):
+        return False
+
+    # Resultado negativo reciente: se reutiliza sin volver a sondear, para
+    # no pagar el connect_timeout en cada request (ver
+    # SEGUNDOS_CACHE_SIN_CONEXION).
+    ahora = time.monotonic()
+    if ahora < _sin_conexion_hasta:
+        return False
+
     conexion = connections["default"]
+    inicio = time.monotonic()
+    exito = False
     try:
         _reciclar_conexion_remota()
         conexion.ensure_connection()
+        exito = True
         return True
     except Exception:
         if not conexion.in_atomic_block:
@@ -209,6 +276,23 @@ def hay_conexion():
             except Exception:
                 pass
         return False
+    finally:
+        duracion = time.monotonic() - inicio
+        with _lock_cache_conexion:
+            if exito:
+                # Un "sí hay conexión" nunca se cachea: si la red se cae
+                # justo después, la operación real falla y el manejo de
+                # errores de siempre la atrapa.
+                _sin_conexion_hasta = 0.0
+            else:
+                _sin_conexion_hasta = time.monotonic() + SEGUNDOS_CACHE_SIN_CONEXION
+        if duracion >= UMBRAL_SONDEO_LENTO_SEGUNDOS:
+            logger.error(
+                "hay_conexion() tardó %.2fs (umbral %.1fs). Con waitress en 4 hilos, "
+                "unos pocos sondeos así de lentos dejan la app entera sin responder — "
+                "ver el diagnóstico del prompt 33.",
+                duracion, UMBRAL_SONDEO_LENTO_SEGUNDOS,
+            )
 
 
 # --- Credenciales cacheadas y autenticación offline (prompt 19b, punto 1) ----
@@ -1198,6 +1282,7 @@ def _tarea(nombre, funcion):
 
 
 def _ciclo_de_fondo():
+    logger.info("Hilo de sincronización: primera vuelta, preparando la base local.")
     preparar_bases_locales()
     ultimo_catalogo = 0.0
     ultimo_credenciales = 0.0
@@ -1271,6 +1356,10 @@ def iniciar_hilo_sincronizacion():
         hilo = threading.Thread(target=_ciclo_de_fondo, name="sincronizacion-offline", daemon=True)
         hilo.start()
         _hilo_iniciado = True
+        # Log explícito con timestamp (prompt 33, hipótesis 3): hace falta
+        # poder confirmar en el equipo Windows si este hilo llega a
+        # arrancar o no, cosa que hasta ahora era imposible de saber.
+        logger.info("Hilo de sincronización offline ARRANCADO (intervalo %ss).", INTERVALO_SEGUNDOS)
 
 
 # Comandos de manage.py que NO deben arrancar el hilo: o no sirven a

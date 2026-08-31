@@ -426,6 +426,16 @@ class ConectividadTests(SimpleTestCase):
 
     databases = {"default"}
 
+    def setUp(self):
+        # La caché de "sin conexión" (prompt 33) es estado GLOBAL del
+        # proceso: estos tests tumban la conexión a propósito, así que sin
+        # reiniciarla, el siguiente test arrancaría con "sin conexión"
+        # pegado hasta 15s y fallaría por un motivo ajeno a lo que prueba.
+        from .offline import reiniciar_cache_conexion
+
+        reiniciar_cache_conexion()
+        self.addCleanup(reiniciar_cache_conexion)
+
     def test_una_conexion_muerta_se_descarta_y_la_siguiente_consulta_funciona(self):
         from django.db import connections
 
@@ -447,13 +457,20 @@ class ConectividadTests(SimpleTestCase):
 
     def test_sin_conexion_real_devuelve_false_y_no_un_falso_positivo(self):
         """
-        Corte de red de verdad (no simulado con mocks): se apunta la
-        conexión a un puerto local cerrado, que es lo mismo que ve la app
-        cuando Neon deja de ser alcanzable.
+        Base inalcanzable (sin mocks): se apunta la conexión a un puerto
+        local cerrado.
+
+        OJO con el alcance de esta prueba (prompt 33): un puerto cerrado
+        RECHAZA al instante, que NO es lo mismo que un corte de red real,
+        donde los paquetes se pierden en silencio y hay que esperar el
+        timeout. Medido: 0.00s contra 75s. Esta prueba solo verifica que
+        no haya un falso positivo; que además falle RÁPIDO ante un corte
+        real depende de connect_timeout (settings.py) y de la caché de
+        resultado negativo, no de esto.
         """
         from django.db import connections
 
-        from .offline import hay_conexion
+        from .offline import hay_conexion, reiniciar_cache_conexion
 
         conexion = connections["default"]
         hay_conexion()
@@ -468,7 +485,13 @@ class ConectividadTests(SimpleTestCase):
             conexion.close()
             conexion.settings_dict.clear()
             conexion.settings_dict.update(original)
-        # Y en cuanto vuelve la configuración buena, se reconecta sola.
+        # El assertFalse de arriba dejó cacheado "sin conexión" por
+        # SEGUNDOS_CACHE_SIN_CONEXION (prompt 33) — es el comportamiento
+        # deseado en producción (evita pagar el timeout en cada request),
+        # y significa que al volver la conexión la app tarda hasta 15s en
+        # notarlo. Aquí se reinicia para verificar la reconexión en sí,
+        # que es lo que esta prueba mide.
+        reiniciar_cache_conexion()
         self.assertTrue(hay_conexion())
 
     def test_dentro_de_una_transaccion_no_se_toca_la_conexion(self):
@@ -1108,3 +1131,102 @@ class ColaSincronizacionTests(TestCase):
         self.assertFalse(LoteCompra.objects.filter(uuid=pendiente.uuid).exists())
 
         pendiente.delete(using="local_disco")
+
+
+class ConfiguracionNubeAusenteTests(SimpleTestCase):
+    """
+    Prompt 33 — el bug que dejó el motor offline completamente inerte en
+    el .exe de Windows.
+
+    Confirmado con el log de la VM: al faltar el .env junto al
+    ejecutable, settings.py caía en silencio a un SQLite local. Con
+    SQLite como base "default", hay_conexion() devuelve True SIEMPRE (un
+    archivo local siempre "conecta", medido en 1ms), así que el motor
+    offline nunca se enteraba de que no había nube y jamás se activaba:
+    el login se validaba contra una base vacía y cada movimiento se
+    encolaba y se DESENCOLABA de inmediato, porque la escritura al SQLite
+    local sí tenía éxito. Todo terminaba en un db.sqlite3 huérfano que no
+    sincronizaba con nada.
+    """
+
+    databases = {"default"}
+
+    def setUp(self):
+        from .offline import reiniciar_cache_conexion
+
+        reiniciar_cache_conexion()
+        self.addCleanup(reiniciar_cache_conexion)
+
+    def test_sin_configuracion_de_nube_hay_conexion_es_false_al_instante(self):
+        """
+        Lo que hace que el motor offline SÍ se active: sin configuración
+        legible nunca hay conexión, y se responde sin sondear la red ni
+        una sola vez (si sondeara, pagaría el timeout en cada request).
+        """
+        import time
+
+        from django.test import override_settings
+
+        from .offline import hay_conexion
+
+        with override_settings(BD_NUBE_NO_CONFIGURADA=True):
+            inicio = time.monotonic()
+            resultado = hay_conexion()
+            duracion = time.monotonic() - inicio
+
+        self.assertFalse(resultado, "Con la nube sin configurar, hay_conexion() debe decir False.")
+        self.assertLess(duracion, 0.5, "No debe sondear la red: tiene que responder al instante.")
+
+    def test_el_alias_default_nunca_es_sqlite_en_un_build_empaquetado(self):
+        """
+        La regla que evita el bug de raíz: un .exe JAMÁS debe caer a
+        SQLite para el alias "default". Da igual que sea más "amable" —
+        es justo lo que hacía que hay_conexion() mintiera y que todo se
+        guardara en una base paralela que nunca sincroniza. En un build
+        empaquetado sin configuración, "default" queda apuntando a un
+        Postgres inalcanzable a propósito, para que toda consulta falle
+        como un corte de conexión normal y el motor offline funcione.
+        """
+        import re
+
+        from pathlib import Path
+
+        fuente = (Path(__file__).resolve().parent.parent / "auditoria_aylupita" / "settings.py").read_text(encoding="utf-8")
+        rama_empaquetado = re.search(
+            r"elif esta_empaquetado\(\):(.*?)\nelse:", fuente, re.S
+        )
+        self.assertIsNotNone(
+            rama_empaquetado,
+            "settings.py ya no tiene la rama 'elif esta_empaquetado()' que impide el fallback a SQLite.",
+        )
+        # Solo el CÓDIGO, sin comentarios: la explicación de por qué no se
+        # usa SQLite menciona "sqlite3" varias veces a propósito.
+        cuerpo = "\n".join(
+            linea for linea in rama_empaquetado.group(1).splitlines()
+            if not linea.strip().startswith("#")
+        )
+        self.assertNotIn(
+            "sqlite3", cuerpo,
+            "Un build empaquetado sin configuración volvió a caer a SQLite — ese es exactamente "
+            "el bug del prompt 33: hay_conexion() diría True siempre y el motor offline quedaría inerte.",
+        )
+        self.assertIn("BD_NUBE_NO_CONFIGURADA = True", cuerpo)
+
+    def test_la_conexion_a_la_nube_lleva_timeouts_explicitos(self):
+        """
+        Sin connect_timeout, un corte de red real (paquetes perdidos, no
+        un puerto que rechaza) hace esperar el timeout del sistema
+        operativo — 75s medidos — en CADA sondeo, y con waitress en 4
+        hilos eso deja la app entera sin responder. Los keepalives cubren
+        el otro caso: una conexión ya establecida que muere.
+        """
+        from django.conf import settings
+
+        cfg = settings.DATABASES["default"]
+        if cfg["ENGINE"] != "django.db.backends.postgresql":
+            self.skipTest("Solo aplica corriendo contra Postgres/Neon (hay .env configurado).")
+
+        opciones = cfg.get("OPTIONS") or {}
+        self.assertIn("connect_timeout", opciones, "Falta connect_timeout: ver el prompt 33.")
+        self.assertLessEqual(opciones["connect_timeout"], 15)
+        self.assertEqual(opciones.get("keepalives"), 1, "Faltan keepalives para detectar una conexión muerta.")
