@@ -42,6 +42,30 @@ Abre el `.exe` una vez **con internet**, ciérralo, y abre el archivo
 Si algo de esto falla, **detente aquí** y mándame el log: los 6 puntos de
 abajo no tienen sentido hasta que esto esté bien.
 
+### Punto 0-bis — sembrar el caché de credenciales (obligatorio)
+
+> **Sin este paso el punto 1 falla siempre**, y falla diciendo
+> "usuario o contraseña incorrectos", que despista mucho: parece que las
+> credenciales están mal cuando en realidad **no hay ninguna credencial
+> guardada todavía en ese equipo**.
+>
+> El motor offline nunca guarda contraseñas por su cuenta: solo cachea
+> (como hash) la credencial de un usuario que ya se validó **con
+> internet** en esa máquina. Si ese login online nunca ocurrió — y en la
+> VM nunca ocurrió, porque hasta ahora la app se conectaba a un SQLite
+> vacío — la caché está vacía y no hay contra qué validar sin red.
+
+**Con internet todavía conectado**, y con el `.env` ya en su lugar:
+
+- [ ] Inicia sesión con `Ruth`, y cierra sesión.
+- [ ] Inicia sesión con `Mich2026`, y cierra sesión.
+- [ ] Inicia sesión con `ventas`, y cierra sesión.
+- [ ] En `diagnostico.log` aparece, por cada uno:
+      `Credencial de '<usuario>' cacheada para poder entrar sin conexión.`
+
+Si alguno de esos tres logins **falla estando con internet**, el problema
+no es del modo offline — mándame el log y paramos ahí.
+
 ---
 
 ## Los 6 puntos
@@ -56,9 +80,12 @@ Desactiva el adaptador de red de la VM **antes** de abrir la app.
 - [ ] `Mich2026` inicia sesión.
 - [ ] `ventas` inicia sesión.
 
-> Requisito: cada usuario debe haber iniciado sesión **con internet al
-> menos una vez en esa máquina** antes, para que su credencial esté
-> cacheada. Si nunca entró ahí, no poder entrar sin red es correcto.
+Si dice "usuario o contraseña incorrectos", **no asumas que la
+contraseña está mal**: busca en `diagnostico.log` la línea que empieza
+con `Login offline RECHAZADO` — ahí dice el motivo real, que puede ser
+"no tiene credencial cacheada en este equipo" (falta el Punto 0-bis),
+"la contraseña no coincide con el hash cacheado", o "está marcado como
+inactivo". Son tres problemas distintos con soluciones distintas.
 
 ### 2. Cortar la red con la app ya abierta, en la pantalla de login
 
@@ -140,3 +167,8 @@ Y con `ventas`:
   Windows Defender). Nada se guardaría.
 - `NO se pudo leer la configuración de la base de datos` → falta el
   `.env`, volver a la Preparación.
+- `Login offline RECHAZADO: ... no tiene credencial cacheada` → falta el
+  Punto 0-bis: ese usuario nunca inició sesión con internet en ese equipo.
+- `Login offline RECHAZADO: la contraseña ... no coincide` → la
+  contraseña cambió en la nube después del último login online ahí;
+  hay que entrar una vez con internet para refrescar el hash.

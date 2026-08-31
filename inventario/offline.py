@@ -370,6 +370,7 @@ def autenticar_offline(username, password):
     internet: no hay contra qué validarlo.
     """
     if not username or not password:
+        logger.warning("Inicio de sesión offline sin usuario o sin contraseña — no hay nada que validar.")
         return None
     preparar_bases_locales()
     from .models import CredencialOfflineCache
@@ -379,9 +380,34 @@ def autenticar_offline(username, password):
     except Exception:
         logger.exception("No se pudo leer la caché local de credenciales.")
         return None
-    if fila is None or not fila.is_active:
+
+    # Cada motivo de rechazo se registra por separado (prompt 33): al
+    # usuario se le muestra siempre el mismo "usuario o contraseña
+    # incorrectos" —a propósito, para no revelar qué usuarios existen—
+    # pero en el log SÍ hace falta distinguirlos, porque exigen acciones
+    # completamente distintas: "nunca inició sesión con internet aquí" se
+    # resuelve conectando una vez, "la contraseña no coincide" no.
+    if fila is None:
+        cacheados = list(
+            CredencialOfflineCache.objects.using(ALIAS_LOCAL).values_list("username", flat=True)
+        )
+        logger.warning(
+            "Login offline RECHAZADO: '%s' no tiene credencial cacheada en este equipo. "
+            "Solo se puede entrar sin internet con un usuario que ya haya iniciado sesión "
+            "CON internet en esta máquina al menos una vez. Cacheados ahora mismo: %s",
+            username, cacheados or "NINGUNO",
+        )
+        return None
+    if not fila.is_active:
+        logger.warning("Login offline RECHAZADO: el usuario '%s' está marcado como inactivo.", username)
         return None
     if not check_password(password, fila.password_hash):
+        logger.warning(
+            "Login offline RECHAZADO: la contraseña de '%s' no coincide con el hash cacheado "
+            "(actualizado por última vez el %s). Si la contraseña cambió en la nube después de "
+            "esa fecha, hay que iniciar sesión una vez CON internet para refrescarla.",
+            username, fila.actualizado_en,
+        )
         return None
     logger.warning("Inicio de sesión SIN CONEXIÓN validado contra la caché local: %s", username)
     return _usuario_desde_cache(fila)
@@ -422,17 +448,43 @@ class BackendConRespaldoOffline(ModelBackend):
     def authenticate(self, request, username=None, password=None, **kwargs):
         try:
             user = super().authenticate(request, username=username, password=password, **kwargs)
-        except ERRORES_DE_CONEXION:
+        except ERRORES_DE_CONEXION as error:
+            # Camino offline. Se registra explícitamente (prompt 33)
+            # porque hasta ahora era imposible saber, desde el log, si un
+            # login fallido siquiera había llegado hasta aquí o si había
+            # muerto antes por otra razón.
+            logger.warning(
+                "Sin conexión al validar a '%s' contra la nube (%s) — se intenta con la "
+                "caché local de credenciales.",
+                username, type(error).__name__,
+            )
             return autenticar_offline(username or kwargs.get("username"), password)
-        if user is not None:
-            try:
-                from .permisos import rol_de
+        except Exception:
+            # Cualquier otro error de base de datos (no de conexión) NO
+            # debe hacerse pasar por "credenciales incorrectas": eso fue
+            # justo lo que ocultó el bug del prompt 33 durante días.
+            logger.exception(
+                "Error NO esperado validando a '%s' contra la nube — no es un problema de "
+                "conexión, así que no se intenta la caché local.",
+                username,
+            )
+            raise
+        if user is None:
+            logger.warning(
+                "Login CON conexión rechazado para '%s': el usuario no existe en la nube o la "
+                "contraseña no coincide.",
+                username,
+            )
+            return None
+        try:
+            from .permisos import rol_de
 
-                guardar_credencial_offline(user, rol_de(user))
-            except Exception:
-                # Que falle el refresco de la caché nunca debe impedir un
-                # inicio de sesión que YA se validó correctamente.
-                logger.exception("Inicio de sesión correcto pero no se pudo cachear la credencial.")
+            guardar_credencial_offline(user, rol_de(user))
+            logger.info("Credencial de '%s' cacheada para poder entrar sin conexión.", username)
+        except Exception:
+            # Que falle el refresco de la caché nunca debe impedir un
+            # inicio de sesión que YA se validó correctamente.
+            logger.exception("Inicio de sesión correcto pero no se pudo cachear la credencial.")
         return user
 
     def get_user(self, user_id):
