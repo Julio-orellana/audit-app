@@ -1,78 +1,142 @@
-# Checklist de pruebas manuales — .exe empaquetado en Windows
+# Checklist de pruebas manuales en Windows — motor offline (prompt 33)
 
-Esta lista es para que tú la corras directamente en la VM de Windows, no para Claude Code. Ve marcando cada punto; si algo falla, anota exactamente qué pasó (mensaje, pantalla, comportamiento) para poder armar un prompt correctivo puntual después.
-
-## 1. Instalación y arranque básico
-
-- [ ] Copia la carpeta completa del build a una ubicación normal de Windows (ej. `Escritorio` o `Documentos`), no la corras desde una carpeta temporal o de descarga comprimida sin extraer.
-- [ ] Doble clic en el `.exe` — abre sin mostrar consola/terminal.
-- [ ] El ícono se ve correctamente (no el genérico de Windows).
-- [ ] La ventana carga el login sin errores visibles.
-
-## 2. Login — los tres roles, con conexión
-
-- [ ] `Ruth` inicia sesión con conexión normal.
-- [ ] `Michelle`/`Mich2026` inicia sesión con conexión normal.
-- [ ] `Ventas`/`ventas` inicia sesión con conexión normal.
-
-## 3. Login offline (el punto que más falló antes)
-
-- [ ] Corta la conexión a internet de la VM (desactiva el adaptador de red o desconecta el Wi-Fi/Ethernet).
-- [ ] Cierra la app por completo si estaba abierta.
-- [ ] Ábrela de nuevo sin conexión.
-- [ ] `Ruth` puede iniciar sesión offline usando el caché local.
-- [ ] `Michelle` puede iniciar sesión offline usando el caché local.
-- [ ] `Ventas` puede iniciar sesión offline usando el caché local.
-
-## 4. Operación offline por rol
-
-Con la red aún cortada:
-
-- [ ] `Ventas`: puede registrar una venta; la fecha queda forzada a hoy sin poder elegirla.
-- [ ] `Ventas`: no puede acceder a entradas, mermas, ajustes, conteo físico ni reportes (debe bloquear con mensaje claro, no crashear).
-- [ ] `Ruth`/`Michelle`: pueden registrar entrada, merma, ajuste y conteo físico offline.
-- [ ] `Ruth`/`Michelle`: al intentar editar/eliminar un registro de Historial offline, se bloquea con el mensaje de "requiere conexión", no crashea.
-- [ ] Historial (lectura) se puede consultar offline y muestra los movimientos combinados (locales + ya sincronizados), marcando de alguna forma cuáles son locales/pendientes.
-- [ ] Navega por cada sección del navbar una por una, offline, con cada rol — ninguna debe crashear con un error técnico. Las que no deban funcionar offline (reportes, gestión de productos/usuarios) deben mostrar el mensaje claro.
-- [ ] El indicador de "N movimientos pendientes de sincronizar" aparece visible.
-- [ ] El botón de refrescar funciona estando offline (recarga la vista actual sin errores).
-
-## 5. Persistencia ante cierre forzado (los tres roles)
-
-Con la red aún cortada:
-
-- [ ] Con `Ventas`, registra un movimiento pendiente, fuerza el cierre del proceso desde el Administrador de tareas (no lo cierres normal), reábrelo — el pendiente sigue ahí.
-- [ ] Repite lo mismo con `Ruth` y con `Michelle`.
-
-## 6. Sincronización real al reconectar
-
-- [ ] Con los pendientes generados en el punto anterior, reconecta la red.
-- [ ] Sin tocar nada manualmente, espera un momento y confirma que la sincronización ocurre sola.
-- [ ] Verifica en Neon (o pídeme ayuda para consultarlo) que esos movimientos aparecen, sin duplicados.
-- [ ] El stock/inventario refleja correctamente esos movimientos después de sincronizar.
-- [ ] Al reabrir la app con conexión después de haber tenido pendientes, aparece el indicador de "subiendo cambios pendientes" y el dashboard se refresca solo al terminar.
-
-## 7. Cola de sincronización (pantalla nueva)
-
-- [ ] Accesible para `Ruth`/`Michelle`, lista los pendientes con tipo, producto, cantidad y fecha.
-- [ ] El botón de "reintentar ahora" funciona si fuerzas un fallo (por ejemplo cortando la red justo antes de reintentar).
-
-## 8. Validación de stock
-
-- [ ] Intenta vender más unidades de las que hay disponibles de un producto normal — debe rechazarse con el mensaje de inventario insuficiente.
-- [ ] Repite con un producto derivado (ej. un "Cubetazo") — debe considerar el equivalente correcto según su `factor_equivalencia`.
-- [ ] Prueba esto tanto online como offline.
-
-## 9. Cierre limpio del proceso
-
-- [ ] Cierra la app normalmente (no forzado) y confirma en el Administrador de tareas que el proceso de Python/waitress termina por completo, sin quedar corriendo en segundo plano.
-- [ ] Abre el `.exe` una segunda vez inmediatamente después — no debe haber conflicto de puerto ni error de "ya en uso".
-
-## 10. Prueba de portabilidad (mover la carpeta)
-
-- [ ] Con la app ya usada (con caché de credenciales y algún pendiente generado), copia la carpeta completa del build a una tercera ubicación distinta en la misma VM.
-- [ ] Ábrela desde ahí y confirma que reconoce el caché/pendientes existentes, no que se comporta como una instalación nueva desde cero.
+Esta lista es para correrla a mano en la VM de Windows. Ve marcando cada
+punto; si algo falla, anota **qué pasó exactamente** (mensaje, pantalla,
+comportamiento) y adjunta el `diagnostico.log`.
 
 ---
 
-Si todos estos puntos pasan bien, la app está lista para el prompt 31 (limpieza final) cuando se reinicie tu cuota semanal. Si algo falla, anótalo con el detalle exacto (rol, paso, mensaje de error o comportamiento) para armar un prompt correctivo dirigido a ese punto específico.
+## Preparación (esto es lo que estaba fallando — no lo saltes)
+
+```
+git pull
+build_exe.bat
+```
+
+Luego, **el paso crítico**: copia tu `.env` real (el que tiene
+`DATABASE_URL` apuntando a Neon) **dentro de `dist\AuditoriaAylupita\`,
+junto al `.exe`**.
+
+> Ese archivo faltando fue la causa raíz de que todo el motor offline
+> estuviera muerto en Windows: sin él, la app se conectaba a un SQLite
+> local vacío en vez de a Neon, y como un archivo local "siempre
+> conecta", el modo offline nunca se activaba. Ojo: la instrucción vieja
+> (prompt 13b) decía copiar `db.sqlite3`; **eso ya no aplica**, ahora es
+> el `.env`.
+
+- [ ] `.env` copiado junto al `.exe`.
+- [ ] Borra el `db.sqlite3` que haya quedado junto al `.exe` de pruebas
+      anteriores (es la base huérfana del bug; ya no se usa).
+
+### Punto 0 — confirmar que la configuración se leyó bien
+
+Abre el `.exe` una vez **con internet**, ciérralo, y abre el archivo
+`diagnostico.log` que queda junto al `.exe`.
+
+- [ ] Dice `BD engine=django.db.backends.postgresql` y
+      `host=ep-aged-frog-...neon.tech` — **NO** `sqlite3`.
+- [ ] Dice `BD OPTIONS={... 'connect_timeout': 10, 'keepalives': 1 ...}`.
+- [ ] **NO** aparece la línea `NO se pudo leer la configuración de la base de datos`.
+- [ ] `PRUEBA DE ESCRITURA en carpeta_escribible(): OK`.
+
+Si algo de esto falla, **detente aquí** y mándame el log: los 6 puntos de
+abajo no tienen sentido hasta que esto esté bien.
+
+---
+
+## Los 6 puntos
+
+### 1. Abrir el `.exe` SIN conexión y entrar con los tres roles
+
+Desactiva el adaptador de red de la VM **antes** de abrir la app.
+
+- [ ] El `.exe` abre (la ventana aparece; no se queda colgada ni tarda
+      medio minuto).
+- [ ] `Ruth` inicia sesión.
+- [ ] `Mich2026` inicia sesión.
+- [ ] `ventas` inicia sesión.
+
+> Requisito: cada usuario debe haber iniciado sesión **con internet al
+> menos una vez en esa máquina** antes, para que su credencial esté
+> cacheada. Si nunca entró ahí, no poder entrar sin red es correcto.
+
+### 2. Cortar la red con la app ya abierta, en la pantalla de login
+
+- [ ] Abre la app **con** internet, quédate en la pantalla de login.
+- [ ] Desactiva el adaptador de red.
+- [ ] Inicia sesión — debe funcionar igual, sin congelarse.
+- [ ] La ventana sigue respondiendo (los botones y enlaces reaccionan).
+
+### 3. Registrar un movimiento offline con cada rol
+
+Con la red aún cortada:
+
+- [ ] `ventas`: registra una venta. La fecha queda fija en hoy, sin poder
+      elegirla.
+- [ ] `Mich2026`: registra una entrada (o merma, o conteo físico).
+- [ ] `Ruth`: registra otro movimiento.
+- [ ] Aparece el indicador **"N pendientes de sincronizar"** en la barra
+      superior, y el número sube con cada movimiento.
+- [ ] En la sección **Sincronización** se ven los movimientos listados con
+      tipo, producto, cantidad y fecha de creación.
+
+### 4. Cierre forzado con un pendiente, y reabrir sin conexión
+
+Con la red aún cortada y pendientes sin sincronizar:
+
+- [ ] Cierra el proceso **a la fuerza** desde el Administrador de tareas
+      (finalizar tarea), no con la X de la ventana.
+- [ ] Vuelve a abrir el `.exe`, **sin reconectar la red**.
+- [ ] Los pendientes **siguen ahí** (mismo número en el indicador y en la
+      pantalla de Sincronización).
+
+### 5. Reconectar y confirmar que sincroniza sola
+
+- [ ] Reactiva el adaptador de red. **No toques nada más en la app.**
+- [ ] En menos de ~1 minuto, el indicador de pendientes baja a 0 solo.
+- [ ] En `diagnostico.log` aparece `Sincronizado ... contra Neon`.
+- [ ] Los movimientos aparecen en Historial y afectan el stock.
+
+### 6. Navegar offline por todo el navbar, con cada rol
+
+Con la red cortada, entra a **cada** sección de la barra superior, una
+por una, con cada rol. Ninguna debe dejar la app insensible.
+
+Deben **funcionar**:
+- [ ] Inicio (catálogo cacheado)
+- [ ] Historial (lectura; los pendientes salen marcados)
+- [ ] Sincronización
+- [ ] Instrucciones
+- [ ] Registrar venta / entrada / merma / conteo
+
+Deben mostrar **el mensaje claro** de "requiere conexión" (no un error
+técnico, no congelarse):
+- [ ] Reportes
+- [ ] Categorías
+- [ ] Productos
+- [ ] Correcciones
+- [ ] Editar o eliminar un registro desde Historial
+
+Y con `ventas`:
+- [ ] No puede entrar a entradas, mermas, ajustes, conteo físico ni
+      reportes (bloqueo por rol, no un crash).
+
+---
+
+## Qué mandarme
+
+1. El archivo **`diagnostico.log`** completo (junto al `.exe`) — es lo más
+   importante. Ahora sí registra cada request y cada sondeo de conexión.
+2. Qué puntos fallaron y qué viste exactamente.
+3. Si algo se congeló: cuántos segundos aproximadamente, y en qué
+   pantalla.
+
+### Cómo se ve un problema en el log
+
+- `hay_conexion() tardó XX.XXs` → sigue habiendo un bloqueo por red
+  (justo lo que el `connect_timeout` debía evitar).
+- `PRUEBA DE ESCRITURA ... FALLÓ` → la app no puede escribir junto al
+  `.exe` (permisos de Windows, o Control de acceso a carpetas de
+  Windows Defender). Nada se guardaría.
+- `NO se pudo leer la configuración de la base de datos` → falta el
+  `.env`, volver a la Preparación.
