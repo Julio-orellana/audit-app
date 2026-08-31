@@ -13,6 +13,17 @@ git pull
 build_exe.bat
 ```
 
+> **Cada cambio de código exige recompilar.** El `.exe` corre desde su
+> propia copia empaquetada, no desde el código fuente: un `git pull` solo
+> no cambia nada de lo que ves en la app.
+>
+> `build_exe.bat` ahora **respalda y restaura solo** el `.env`, la cola
+> local (`offline_local.sqlite3`), las sesiones y los respaldos — porque
+> PyInstaller borra la carpeta de salida entera antes de reconstruirla.
+> Si compilas de otra forma (`pyinstaller app.spec` a mano), esos
+> archivos **se pierden** y hay que volver a copiar el `.env` y a repetir
+> el Punto 0-bis.
+
 Luego, **el paso crítico**: copia tu `.env` real (el que tiene
 `DATABASE_URL` apuntando a Neon) **dentro de `dist\AuditoriaAylupita\`,
 junto al `.exe`**.
