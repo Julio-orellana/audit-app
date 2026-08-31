@@ -3,6 +3,14 @@
 <h1 style="margin:0 0 4px;font-size:22px;font-weight:800;">Historial de movimientos</h1>
 <p style="margin:0 0 24px;color:var(--ink-soft);font-size:14.5px;">Todo lo que ha entrado y salido de inventario, en un solo lugar.</p>
 
+{% if modo_offline %}
+<div class="alert alert-warning" style="margin-bottom:20px;">
+  Sin conexión — mostrando los últimos movimientos guardados en este equipo, combinados con lo que
+  se registró aquí mismo y todavía no se ha sincronizado (marcado como "Pendiente" abajo). Puede no
+  incluir el historial completo. Editar o eliminar un registro sigue necesitando conexión.
+</div>
+{% endif %}
+
 <form method="get" class="info-card" style="display:flex;align-items:flex-end;gap:14px;padding:18px 20px;margin-bottom:18px;flex-wrap:wrap;">
   <div>
     <div style="font-size:12px;font-weight:700;color:var(--ink-faint);margin-bottom:6px;text-transform:uppercase;letter-spacing:.03em;">{{ form.producto.label }}</div>
@@ -49,6 +57,9 @@
         {% else %}
           <span class="badge-pill" style="background:var(--slate-bg);color:var(--slate);">{{ fila.tipo }}</span>
         {% endif %}
+        {% if fila.es_pendiente %}
+          <span class="badge-pill" style="background:var(--sobrante-bg);color:var(--sobrante-ink);margin-left:4px;" title="Registrado en este equipo — todavía no se ha confirmado en la nube">Pendiente</span>
+        {% endif %}
       </div>
       <div style="font-weight:600;">{{ fila.producto }}</div>
       <div class="num">{{ fila.cantidad }}</div>
@@ -56,7 +67,7 @@
       <div style="color:var(--ink-soft);font-size:13.5px;">{{ fila.usuario|default:"—" }}</div>
       <div style="color:var(--ink-soft);font-size:13.5px;">
         {{ fila.detalle|default:"—" }}
-        {% if rol_usuario == "admin" %}
+        {% if rol_usuario == "admin" and not fila.es_pendiente %}
           {% if fila.tipo_registro == "LoteCompra" %}
             <a href="{% url 'lotecompra_correccion_editar' fila.registro_id %}" style="margin-left:8px;">Editar</a>
             · <a href="{% url 'lotecompra_correccion_eliminar' fila.registro_id %}" style="color:var(--danger-ink);">Eliminar</a>

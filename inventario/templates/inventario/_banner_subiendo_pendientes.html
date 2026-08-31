@@ -1,0 +1,39 @@
+{% comment %}
+  Prompt 19c, punto 2: al reabrir la app CON conexión pero con pendientes
+  de una sesión anterior, la sincronización automática los sube sola en
+  segundo plano (ver el hilo de fondo en inventario/offline.py) — pero
+  el dashboard, servido en el momento del request, no se enteraba hasta
+  la próxima vez que alguien lo recargara a mano. Este banner hace
+  explícito ese "subiendo..." y refresca el dashboard solo apenas la
+  cola de pendientes de esta máquina llega a 0.
+
+  "not modo_offline": si no hay conexión, lo que corresponde es el aviso
+  de modo offline que cada plantilla ya muestra por su cuenta — no tiene
+  sentido poner a esperar/consultar un endpoint que también necesita
+  conexión.
+{% endcomment %}
+{% if pendientes and not modo_offline %}
+<div class="alert alert-info" style="margin-bottom:20px;display:flex;align-items:center;gap:10px;">
+  <span class="spinner-border spinner-border-sm" role="status" aria-hidden="true"></span>
+  Subiendo {{ pendientes }} cambio{{ pendientes|pluralize }} pendiente{{ pendientes|pluralize }} de la sesión anterior — esta página se actualizará sola en cuanto termine.
+</div>
+<script>
+(function () {
+  function revisarPendientes() {
+    fetch("{% url 'estado_sincronizacion' %}", {cache: "no-store"})
+      .then(function (respuesta) { return respuesta.json(); })
+      .then(function (datos) {
+        if (!datos.pendientes) {
+          window.location.reload();
+          return;
+        }
+        setTimeout(revisarPendientes, 4000);
+      })
+      .catch(function () {
+        setTimeout(revisarPendientes, 8000);
+      });
+  }
+  setTimeout(revisarPendientes, 4000);
+})();
+</script>
+{% endif %}

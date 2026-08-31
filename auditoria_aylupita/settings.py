@@ -21,7 +21,7 @@ import environ
 # porque, empaquetado con PyInstaller, el mecanismo normal de import de
 # Django (vía manage.py) no interviene.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from runtime_paths import carpeta_codigo, carpeta_escribible  # noqa: E402
+from runtime_paths import carpeta_codigo, carpeta_escribible, esta_empaquetado  # noqa: E402
 
 # BASE_DIR: carpeta de solo lectura con el código, templates y estáticos.
 # Sin empaquetar es la raíz del proyecto de siempre; empaquetada con
@@ -151,6 +151,7 @@ TEMPLATES = [
                 'django.contrib.messages.context_processors.messages',
                 'inventario.context_processors.rol',
                 'inventario.context_processors.pendientes_sincronizar',
+                'inventario.context_processors.configuracion_bd',
             ],
         },
     },
@@ -212,13 +213,88 @@ if _database_url:
     # al costo de no poder transmitir un queryset gigante en streaming
     # (irrelevante para el volumen de datos real de esta app).
     DATABASES["default"]["DISABLE_SERVER_SIDE_CURSORS"] = True
+
+    # Timeouts explícitos (prompt 33) — SIN esto, cada intento de conexión
+    # espera el timeout por defecto del sistema operativo. Medido: un
+    # puerto cerrado en localhost rechaza en 0.00s (así se probó todo el
+    # modo offline hasta el prompt 30, y por eso "funcionaba"), pero un
+    # corte de red REAL descarta los paquetes en silencio y entonces la
+    # espera es de 75 SEGUNDOS por intento. Con waitress en 4 hilos y el
+    # dashboard consultando /estado-sincronizacion/ cada 4s, eso deja la
+    # app entera sin responder en menos de 20 segundos.
+    #
+    # - connect_timeout: corta el intento de conexión NUEVA. 10s es
+    #   holgado para que Neon despierte su cómputo serverless suspendido
+    #   sin cortar una conexión legítima, y aun así ~7x más rápido que
+    #   los 75s del sistema operativo.
+    # - keepalives*: detectan una conexión YA ESTABLECIDA que murió (el
+    #   caso "la app estaba abierta y se cayó la red"). Sin esto, un
+    #   SELECT sobre un socket muerto espera el timeout de retransmisión
+    #   de TCP, que son MINUTOS. Con esta configuración se detecta en
+    #   ~30 + 3x10 = 60s como máximo, y normalmente mucho antes.
+    #   Se usa keepalives (portable: Windows/macOS/Linux) y no
+    #   tcp_user_timeout, que solo existe en Linux.
+    DATABASES["default"].setdefault("OPTIONS", {}).update({
+        "connect_timeout": 10,
+        "keepalives": 1,
+        "keepalives_idle": 30,
+        "keepalives_interval": 10,
+        "keepalives_count": 3,
+    })
+
+    # La configuración de la nube sí se pudo leer.
+    BD_NUBE_NO_CONFIGURADA = False
+elif esta_empaquetado():
+    # Build empaquetado (.exe) SIN configuración de nube legible — falta
+    # el .env junto al ejecutable, o su DATABASE_URL es inválida.
+    #
+    # ESTE ES EL BUG RAÍZ DEL PROMPT 33, confirmado con el log de la VM de
+    # Windows: antes se caía en silencio al SQLite local de abajo, y eso
+    # rompía TODO el motor offline de una forma muy difícil de ver. Con
+    # SQLite como base "default", hay_conexion() devuelve True SIEMPRE (un
+    # archivo local siempre "conecta", medido en 1ms), así que el motor
+    # offline nunca se entera de que no hay nube y jamás se activa: el
+    # login se valida contra una base vacía, y cada movimiento se encola y
+    # se DESENCOLA de inmediato porque la escritura al SQLite local sí
+    # tiene éxito (ver ColaOfflineMixin.form_valid). Resultado: todo se
+    # guardaba en un db.sqlite3 huérfano que nunca sincronizaba con nada.
+    #
+    # Se deja a propósito una configuración de Postgres con un host
+    # centinela inalcanzable, NO SQLite: así cualquier consulta falla como
+    # un corte de conexión normal y el motor offline (cola local, caché de
+    # credenciales, catálogo cacheado) funciona exactamente igual que ante
+    # una caída de internet — que es justo la filosofía del resto del
+    # motor: perder la base es un estado normal y esperado, no un motivo
+    # para negarle la entrada a nadie.
+    #
+    # BD_NUBE_NO_CONFIGURADA distingue este caso de un corte de red común:
+    # esto NO se arregla reconectándose a internet, hace falta que alguien
+    # coloque el .env. La interfaz muestra un mensaje distinto por eso
+    # (ver context_processors.py y templates/base.html).
+    DATABASES = {
+        "default": {
+            "ENGINE": "django.db.backends.postgresql",
+            "NAME": "no_configurada",
+            "HOST": "base-de-datos-no-configurada.invalid",
+            "USER": "",
+            "PASSWORD": "",
+            "PORT": "",
+            "OPTIONS": {"connect_timeout": 2},
+        }
+    }
+    BD_NUBE_NO_CONFIGURADA = True
 else:
+    # Desarrollo sin .env (nunca un .exe): SQLite local de siempre, para
+    # poder trabajar sin tener Postgres configurado. Aquí sí es un
+    # fallback legítimo — no hay ningún usuario final de por medio que
+    # pueda quedarse trabajando contra una base huérfana sin darse cuenta.
     DATABASES = {
         'default': {
             'ENGINE': 'django.db.backends.sqlite3',
             'NAME': BASE_DIR_ESCRIBIBLE / 'db.sqlite3',
         }
     }
+    BD_NUBE_NO_CONFIGURADA = False
 
 # "local_disco" (prompt 19, motor de sincronización offline): alias
 # EXCLUSIVAMENTE local, nunca habla con Neon — ver inventario/db_router.py

@@ -3,6 +3,8 @@
 <h1 style="margin:0 0 4px;font-size:26px;font-weight:800;">{{ saludo }}, {{ user.get_full_name|default:user.username|capfirst }}</h1>
 <p style="margin:0 0 28px;color:var(--ink-soft);font-size:15px;">{{ hoy|date }} &nbsp;·&nbsp; aquí tienes el resumen de hoy.</p>
 
+{% include "inventario/_banner_subiendo_pendientes.html" %}
+
 <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:16px;margin-bottom:28px;">
 
   <div class="info-card" style="padding:22px 24px;display:flex;flex-direction:column;gap:10px;">

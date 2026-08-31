@@ -6,6 +6,7 @@ from django.contrib.auth.models import User
 from django.core.management.base import BaseCommand
 
 from inventario.models import ConteoFisico, LoteCompra, MovimientoSalida, Producto
+from seguridad_entorno_pruebas import EntornoNoSeguroError, confirmar_operacion_riesgosa
 
 # Mes de ejemplo: julio 2026, completamente en el pasado respecto a "hoy"
 # (24/08/2026), útil para probar que un reporte de un mes cerrado no cambia.
@@ -31,10 +32,32 @@ class Command(BaseCommand):
         "Genera un mes de datos de ejemplo (julio 2026) sobre el catálogo ya "
         "cargado, para verificar visualmente costo promedio, alertas de "
         "conteo físico y reportes Excel. No borra nada; seguro de re-ejecutar "
-        "(cada producto se omite si ya tiene compras en julio 2026)."
+        "(cada producto se omite si ya tiene compras en julio 2026). Pide "
+        "confirmación explícita salvo que se pase --sin-confirmar."
     )
 
+    def add_arguments(self, parser):
+        parser.add_argument(
+            "--sin-confirmar", action="store_true", dest="sin_confirmar",
+            help="Omite la confirmación interactiva (uso en automatización ya controlada).",
+        )
+
     def handle(self, *args, **options):
+        # Confirmación obligatoria (prompt 32): esto genera movimientos
+        # FALSOS (julio 2026, con datos aleatorios) — sembrarlos por
+        # accidente en producción real, mezclados con movimientos
+        # reales, sería casi tan difícil de deshacer como el borrado que
+        # causó el incidente del prompt 30 (no queda una marca clara de
+        # cuáles filas son de prueba y cuáles no). Ver seguridad_entorno_pruebas.py.
+        try:
+            confirmar_operacion_riesgosa(
+                "sembrar un mes completo de movimientos DE PRUEBA (julio 2026, datos falsos)",
+                forzar=options["sin_confirmar"],
+            )
+        except EntornoNoSeguroError as error:
+            self.stderr.write(self.style.ERROR(str(error)))
+            return
+
         random.seed(20260701)  # reproducible: mismos datos cada vez que se corre desde cero
 
         usuario = User.objects.filter(is_superuser=True).order_by("id").first()

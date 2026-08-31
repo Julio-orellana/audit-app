@@ -36,7 +36,13 @@ ALIAS_LOCALES = {"local_disco"}
 # replicando tal cual en cualquier base nueva. Si se sacara de esta lista,
 # el DROP TABLE de la 0011 correría contra Neon buscando una tabla que —
 # correctamente — nunca se creó ahí, y el migrate fallaría.
-MODELOS_SOLO_LOCALES = {"pendientesincronizacion", "credencialofflinecache", "sesionofflinecache"}
+MODELOS_SOLO_LOCALES = {
+    "pendientesincronizacion", "credencialofflinecache", "sesionofflinecache",
+    # "movimientohistorialcache" (prompt 19c): copia local de solo lectura
+    # de los últimos movimientos, para consultar Historial sin conexión —
+    # ver MovimientoHistorialCache en models.py.
+    "movimientohistorialcache",
+}
 MODELOS_PERMITIDOS_EN_LOCALES = {"producto", "categoria"} | MODELOS_SOLO_LOCALES
 
 

@@ -44,6 +44,11 @@ dist/
 .env
 .env.*
 !.env.example
+# .env.test (prompt 32): base de datos AISLADA de pruebas, cargada
+# explícitamente por seguridad_entorno_pruebas.cargar_env_de_pruebas() —
+# nunca se sube el archivo real (mismo trato que .env), pero sí su
+# plantilla, igual que con .env.example.
+!.env.test.example
 *.local
 
 # Editores / SO
@@ -59,3 +64,5 @@ Thumbs.db
 EMPAQUETADO.md
 DESARROLLO.md
 DIAGNOSTICO_GENERAL.md
+
+.claude/
