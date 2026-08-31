@@ -193,6 +193,11 @@
       Pero <strong>esto no se arregla reconectándote a internet</strong> — es un problema de
       instalación del programa. Avisa a soporte técnico para que lo revise, o de lo contrario
       nada de lo que registres llegará al sistema central.
+      {% if bd_motivo_no_configurada %}
+        <div style="margin-top:8px;font-size:.85em;opacity:.85;">
+          Detalle para soporte: {{ bd_motivo_no_configurada }}
+        </div>
+      {% endif %}
     </div>
   {% endif %}
   {% if messages %}

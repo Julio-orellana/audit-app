@@ -91,7 +91,8 @@ def _preparar_django():
             "inválida). La app arranca en modo local: todo lo que se registre "
             "queda en la cola de este equipo y NO llegará al sistema central "
             "hasta que se corrija la configuración. Esto NO se arregla "
-            "reconectando a internet."
+            "reconectando a internet. Motivo detectado: %s",
+            getattr(settings, "BD_MOTIVO_NO_CONFIGURADA", None) or "(sin detalle)",
         )
         from django.core.wsgi import get_wsgi_application
 

@@ -427,6 +427,22 @@ class ConectividadTests(SimpleTestCase):
     databases = {"default"}
 
     def setUp(self):
+        # Estas pruebas solo tienen sentido contra Postgres: simulan un
+        # corte tumbando el socket o apuntando HOST/PORT a un puerto
+        # cerrado, y SQLite ignora ambas cosas (es un archivo local, no
+        # tiene socket ni host). Corriendo la suite contra SQLite —
+        # documentado en DESARROLLO.md como forma válida de trabajar sin
+        # nube— fallaban con "hay_conexion() reportó conexión donde no la
+        # hay", que parece una regresión del motor offline y no lo es.
+        # Se salta explícitamente para que ese falso positivo no vuelva a
+        # costar tiempo.
+        from django.db import connections
+
+        if connections["default"].settings_dict["ENGINE"] != "django.db.backends.postgresql":
+            self.skipTest(
+                "Solo aplica contra Postgres/Neon: SQLite no tiene socket ni host que tumbar."
+            )
+
         # La caché de "sin conexión" (prompt 33) es estado GLOBAL del
         # proceso: estos tests tumban la conexión a propósito, así que sin
         # reiniciarla, el siguiente test arrancaría con "sin conexión"
@@ -538,6 +554,59 @@ class AutenticacionOfflineTests(TestCase):
         from .offline import guardar_credencial_offline
 
         guardar_credencial_offline(self.usuarios[rol], rol)
+
+    def test_get_user_no_toca_la_nube_cuando_ya_consta_que_esta_caida(self):
+        """
+        Prompt 33c, punto 3 ("la ventana nunca queda insensible").
+
+        get_user() resuelve request.user en CADA request de un usuario
+        con sesión iniciada, así que es el camino más transitado de la
+        app. Antes intentaba siempre la nube: sin conexión eso costaba
+        el connect_timeout ENTERO (3.04s medidos) en todas y cada una de
+        las páginas, incluidas las que ni siquiera consultan la nube —
+        un 403 por rol, /instrucciones/, el sondeo del tablero cada 4s.
+        Ese era el "no responde" que se reportó en Windows.
+
+        Se verifica con assertNumQueries(0) sobre "default", que es el
+        blindaje directo: cero consultas a la nube cuando ya consta que
+        está caída.
+        """
+        from .offline import (
+            BackendConRespaldoOffline,
+            marcar_sin_conexion,
+            reiniciar_cache_conexion,
+        )
+
+        self._cachear("auditor")
+        self.addCleanup(reiniciar_cache_conexion)
+        marcar_sin_conexion()
+
+        backend = BackendConRespaldoOffline()
+        with self.assertNumQueries(0, using="default"):
+            usuario = backend.get_user(self.usuarios["auditor"].pk)
+
+        self.assertIsNotNone(usuario, "Debe resolverse desde la caché local, no quedar anónimo.")
+        self.assertEqual(usuario.username, "auditor_test")
+
+    def test_get_user_no_agrega_un_viaje_a_la_nube_cuando_si_hay_conexion(self):
+        """
+        La otra mitad del mismo arreglo, y la razón de que se consulte
+        sin_conexion_reciente() (que solo LEE la caché) en vez de
+        hay_conexion() (que sondea). Medido contra Neon: un sondeo con la
+        conexión sana cuesta ~87ms, o sea un viaje de ida y vuelta por
+        red; ponerlo en get_user() se lo sumaría a TODAS las requests del
+        uso normal CON internet, para beneficiar solo al caso sin
+        conexión. Esta prueba fija que el camino online siga costando
+        exactamente una consulta — la de siempre, la que busca al
+        usuario — y ni una más.
+        """
+        from .offline import BackendConRespaldoOffline, reiniciar_cache_conexion
+
+        reiniciar_cache_conexion()  # nada cacheado: es el caso "con conexión"
+        backend = BackendConRespaldoOffline()
+        with self.assertNumQueries(1, using="default"):
+            usuario = backend.get_user(self.usuarios["admin"].pk)
+        self.assertEqual(usuario.username, "admin_test")
 
     def test_nunca_se_guarda_la_contrasena_en_texto_plano(self):
         from .models import CredencialOfflineCache
@@ -1192,8 +1261,13 @@ class ConfiguracionNubeAusenteTests(SimpleTestCase):
         from pathlib import Path
 
         fuente = (Path(__file__).resolve().parent.parent / "auditoria_aylupita" / "settings.py").read_text(encoding="utf-8")
+        # La condición de la rama puede crecer (desde el prompt 33c
+        # también entra aquí una DATABASE_URL presente pero inservible),
+        # así que se busca "elif esta_empaquetado()" seguido de lo que
+        # sea hasta los dos puntos — no la línea literal, que ya se rompió
+        # una vez por ampliarla.
         rama_empaquetado = re.search(
-            r"elif esta_empaquetado\(\):(.*?)\nelse:", fuente, re.S
+            r"elif esta_empaquetado\(\)[^:\n]*:(.*?)\nelse:", fuente, re.S
         )
         self.assertIsNotNone(
             rama_empaquetado,
@@ -1211,6 +1285,109 @@ class ConfiguracionNubeAusenteTests(SimpleTestCase):
             "el bug del prompt 33: hay_conexion() diría True siempre y el motor offline quedaría inerte.",
         )
         self.assertIn("BD_NUBE_NO_CONFIGURADA = True", cuerpo)
+
+    def test_una_database_url_invalida_no_revienta_el_arranque_ni_cae_a_sqlite(self):
+        """
+        Prompt 33c, punto 2. Dos fallos distintos que compartían una
+        misma causa —"hay DATABASE_URL" no es lo mismo que "DATABASE_URL
+        sirve"— y que hay que verificar importando settings DE VERDAD,
+        en un proceso aparte, porque el daño ocurría al importarlo:
+
+        - 'basura' hacía que dj_database_url lanzara UnknownSchemeError
+          al importar settings.py, o sea que la app no arrancaba en
+          absoluto: ni ventana, ni log, ni mensaje. Imposible de
+          diagnosticar desde la VM.
+        - 'postgresql://' a secas sí importaba, pero dejaba HOST y NAME
+          vacíos sin marcar nada como "sin configurar", así que la
+          interfaz mostraba el aviso de corte de red normal en lugar del
+          de problema de configuración.
+
+        En ninguno de los dos casos "default" puede terminar en SQLite:
+        eso es lo que hacía que hay_conexion() dijera True siempre y el
+        motor offline quedara inerte.
+        """
+        import json
+        import os
+        import subprocess
+        import sys
+        from pathlib import Path
+
+        raiz = Path(__file__).resolve().parent.parent
+        guion = (
+            "import django, json, os; "
+            "os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'auditoria_aylupita.settings'); "
+            "django.setup(); "
+            "from django.conf import settings as s; "
+            "cfg = s.DATABASES['default']; "
+            "print(json.dumps({'engine': cfg['ENGINE'], 'host': cfg.get('HOST'), "
+            "'no_configurada': s.BD_NUBE_NO_CONFIGURADA, "
+            "'motivo': s.BD_MOTIVO_NO_CONFIGURADA}))"
+        )
+
+        casos = {
+            "basura": "no se pudo interpretar",
+            "postgresql://": "host",
+            "   ": "no está definida",
+            "sqlite:////tmp/x.db": "PostgreSQL",
+        }
+        for url, fragmento_esperado in casos.items():
+            with self.subTest(database_url=url):
+                entorno = dict(os.environ, DATABASE_URL=url, DIRECT_DATABASE_URL="")
+                proceso = subprocess.run(
+                    [sys.executable, "-c", guion],
+                    cwd=str(raiz), env=entorno, capture_output=True, text=True, timeout=120,
+                )
+                self.assertEqual(
+                    proceso.returncode, 0,
+                    f"Importar settings con DATABASE_URL={url!r} falló — la app no arrancaría "
+                    f"ni para mostrar el aviso:\n{proceso.stderr[-2000:]}",
+                )
+                datos = json.loads(proceso.stdout.strip().splitlines()[-1])
+                self.assertNotIn(
+                    "sqlite", datos["engine"],
+                    f"Con DATABASE_URL={url!r} el alias 'default' cayó a SQLite. Eso es el bug "
+                    "del prompt 33: una base local siempre 'conecta', así que el motor offline "
+                    "nunca se entera de que no hay nube.",
+                )
+                self.assertTrue(
+                    datos["no_configurada"],
+                    f"Con DATABASE_URL={url!r} la app no quedó marcada como 'sin configuración', "
+                    "así que mostraría el aviso de corte de red normal en vez del de "
+                    "configuración — y nadie llamaría a soporte.",
+                )
+                self.assertIn(
+                    fragmento_esperado, datos["motivo"] or "",
+                    "El motivo tiene que decir QUÉ está mal: es lo que se muestra en la "
+                    "interfaz como 'Detalle para soporte' y lo que evita pedir el log.",
+                )
+
+    def test_el_motivo_llega_a_la_interfaz_y_no_solo_al_log(self):
+        """
+        Prompt 33c, punto 2: el aviso debe verse en la INTERFAZ, no solo
+        en diagnostico.log — a Ruth y Michelle nadie les va a pedir que
+        abran un archivo de texto. Y tiene que ser DISTINTO del aviso de
+        "sin conexión", porque uno se arregla solo y el otro no.
+        """
+        from django.test import override_settings
+
+        from .context_processors import configuracion_bd
+
+        with override_settings(
+            BD_NUBE_NO_CONFIGURADA=True,
+            BD_MOTIVO_NO_CONFIGURADA="DATABASE_URL no está definida",
+        ):
+            contexto = configuracion_bd(None)
+
+        self.assertTrue(contexto["bd_nube_no_configurada"])
+        self.assertEqual(contexto["bd_motivo_no_configurada"], "DATABASE_URL no está definida")
+
+        from pathlib import Path
+
+        base = Path(__file__).resolve().parent.parent / "templates" / "base.html"
+        plantilla = base.read_text(encoding="utf-8")
+        self.assertIn("bd_nube_no_configurada", plantilla)
+        self.assertIn("bd_motivo_no_configurada", plantilla)
+        self.assertIn("no se arregla reconectándote a internet", plantilla)
 
     def test_la_conexion_a_la_nube_lleva_timeouts_explicitos(self):
         """

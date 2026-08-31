@@ -72,7 +72,17 @@ ALIAS_LOCAL = "local_disco"
 # Un sondeo de conectividad que tarde más que esto es, por sí solo, la
 # explicación de que la app quede "insensible" (prompt 33): se registra
 # como error para que quede en el log del equipo donde pasó.
-UMBRAL_SONDEO_LENTO_SEGUNDOS = 3.0
+#
+# 5.0 y no 3.0 a propósito (prompt 33c): con connect_timeout=3 en
+# DATABASES["default"]["OPTIONS"], un corte de red REAL falla en ~3.03s
+# — medido contra una IP que descarta paquetes (192.0.2.1). Con el
+# umbral en 3.0, ese caso NORMAL y ya resuelto disparaba un ERROR en
+# cada sondeo, o sea ruido justo en el log que sirve para diagnosticar.
+# Por encima de 5s sí queda un síntoma real: significa que el
+# connect_timeout no se está respetando (OPTIONS que no llegó al
+# driver, un DNS colgado antes de la conexión, o el disco/GIL trabado),
+# que es exactamente lo que hay que ver en el log.
+UMBRAL_SONDEO_LENTO_SEGUNDOS = 5.0
 
 # Cuánto se reutiliza el resultado de un sondeo de conectividad antes de
 # volver a preguntar de verdad (prompt 33). hay_conexion() se llama en
@@ -105,6 +115,40 @@ def reiniciar_cache_conexion():
     global _sin_conexion_hasta
     with _lock_cache_conexion:
         _sin_conexion_hasta = 0.0
+
+
+def sin_conexion_reciente():
+    """
+    ¿Sabemos YA, sin preguntarle a la red, que ahora mismo no hay
+    conexión? Solo lee la caché; nunca sondea, así que cuesta cero.
+
+    Es distinto de `not hay_conexion()`: eso puede disparar un intento
+    real y pagar el connect_timeout entero. Esta función responde False
+    cuando no hay nada cacheado — o sea "no me consta que esté caída",
+    no "está sana".
+
+    Existe para los caminos que se recorren en CADA request y que no
+    pueden permitirse ni un sondeo: ver
+    BackendConRespaldoOffline.get_user() (prompt 33c).
+    """
+    return time.monotonic() < _sin_conexion_hasta
+
+
+def marcar_sin_conexion():
+    """
+    Registra que un intento REAL contra la nube acaba de fallar por
+    conexión, para que el resto del proceso no vuelva a pagar el
+    timeout durante los próximos SEGUNDOS_CACHE_SIN_CONEXION.
+
+    Lo llama quien descubre la caída por su cuenta, sin pasar por
+    hay_conexion() — hoy get_user(), que es el primer código que toca la
+    base en una request. Sin esto, el primer request sin conexión pagaba
+    el timeout dos veces: una en get_user() y otra en el hay_conexion()
+    que la vista hace después para decidir si muestra el aviso offline.
+    """
+    global _sin_conexion_hasta
+    with _lock_cache_conexion:
+        _sin_conexion_hasta = time.monotonic() + SEGUNDOS_CACHE_SIN_CONEXION
 
 
 # Marca en la sesión de que ESTE inicio de sesión se validó contra la
@@ -551,9 +595,45 @@ class BackendConRespaldoOffline(ModelBackend):
             )
 
     def get_user(self, user_id):
+        """
+        Resuelve request.user en CADA request de un usuario con sesión
+        iniciada — o sea, es el camino más transitado de toda la app.
+
+        Medido (prompt 33c): sin la comprobación de abajo, cada página
+        sin conexión pagaba aquí 3.04s enteros — el connect_timeout
+        completo, en todas y cada una de las requests, incluidas las que
+        ni siquiera tocan la nube (403 por rol, /instrucciones/, el
+        sondeo del tablero cada 4s). El barrido de las 19 rutas con los
+        3 roles daba 3.04s constantes con 0 consultas a la base: el
+        tiempo no era la vista, era este get_user(). Eso es justo la
+        sensación de "ventana insensible" que se reportó en Windows.
+
+        Se consulta sin_conexion_reciente() —que solo LEE la caché— y no
+        hay_conexion(), que sondea. La diferencia importa mucho y se
+        midió: contra Neon, un hay_conexion() con la conexión sana
+        cuesta ~87ms (es un viaje de ida y vuelta por red), y ponerlo
+        aquí se los sumaría a TODAS las requests del uso normal, con
+        internet, para beneficiar solo al caso sin conexión. Cambiar
+        3040ms offline por 87ms online en cada página no es un buen
+        trato; leer la caché cuesta cero en ambos casos.
+
+        El precio de leer la caché en vez de sondear es que la PRIMERA
+        request tras caerse la red no sabe todavía que está caída y paga
+        el timeout aquí. Por eso el except la marca: así el
+        hay_conexion() que la vista hace justo después sale del caché en
+        vez de pagar el timeout una segunda vez en la misma request.
+        """
+        if sin_conexion_reciente():
+            usuario = usuario_offline_por_id(user_id)
+            if usuario is not None:
+                return usuario
+            # Sin fila cacheada no queda más que intentar la base: si
+            # tampoco responde, el except de abajo devuelve None y
+            # Django trata la sesión como anónima, que es lo correcto.
         try:
             return super().get_user(user_id)
         except ERRORES_DE_CONEXION:
+            marcar_sin_conexion()
             return usuario_offline_por_id(user_id)
 
 

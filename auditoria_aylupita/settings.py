@@ -216,11 +216,49 @@ _es_comando_migrate = len(sys.argv) > 1 and sys.argv[1] == "migrate"
 _database_url = env("DATABASE_URL", default=None)
 _direct_database_url = env("DIRECT_DATABASE_URL", default=None)
 
-if _database_url:
-    _url_para_conectar = _direct_database_url if (_es_comando_migrate and _direct_database_url) else _database_url
-    DATABASES = {
-        "default": dj_database_url.parse(_url_para_conectar, conn_max_age=60, ssl_require=True)
-    }
+
+def _interpretar_url_de_nube(url):
+    """
+    Convierte DATABASE_URL en una configuración de Django utilizable, o
+    explica por qué no se puede. Devuelve (config, motivo_del_fallo);
+    motivo es None cuando la configuración sirve.
+
+    Existe porque "hay DATABASE_URL" y "DATABASE_URL sirve" NO son lo
+    mismo, y confundirlos rompía la app de dos formas distintas
+    (prompt 33c):
+
+    - Una URL basura ('no-es-una-url', o solo espacios) hace que
+      dj_database_url.parse() lance UnknownSchemeError. Como esto corre
+      al importar settings.py, la excepción reventaba el arranque
+      ENTERO: ni ventana, ni log, ni mensaje — nada.
+    - 'postgresql://' a secas sí parsea, pero produce HOST='' y NAME='':
+      la app arranca, nunca puede conectarse, y ni siquiera quedaba
+      marcada como "sin configurar", así que mostraba el aviso de corte
+      de red normal en vez del de problema de configuración.
+
+    Una URL presente pero inservible NUNCA se trata como "el usuario
+    quería SQLite": eso es siempre un error que hay que avisar, también
+    en desarrollo.
+    """
+    if not url or not str(url).strip():
+        return None, "DATABASE_URL no está definida"
+    try:
+        cfg = dj_database_url.parse(url, conn_max_age=60, ssl_require=True)
+    except Exception as error:
+        return None, f"DATABASE_URL no se pudo interpretar ({type(error).__name__})"
+    motor = cfg.get("ENGINE") or ""
+    if "postgresql" not in motor:
+        return None, f"DATABASE_URL no apunta a PostgreSQL (motor detectado: {motor or 'ninguno'})"
+    if not cfg.get("HOST") or not cfg.get("NAME"):
+        return None, "DATABASE_URL no incluye host y/o nombre de base de datos"
+    return cfg, None
+
+
+_url_para_conectar = _direct_database_url if (_es_comando_migrate and _direct_database_url) else _database_url
+_config_nube, _motivo_bd_no_configurada = _interpretar_url_de_nube(_url_para_conectar)
+
+if _config_nube is not None:
+    DATABASES = {"default": _config_nube}
     # Detecta una conexión persistente muerta (ej. el cómputo serverless de
     # Neon se suspendió por inactividad) y la reabre en vez de fallar la
     # siguiente request — dj_database_url.parse() no siempre expone este
@@ -257,30 +295,53 @@ if _database_url:
     # dashboard consultando /estado-sincronizacion/ cada 4s, eso deja la
     # app entera sin responder en menos de 20 segundos.
     #
-    # - connect_timeout: corta el intento de conexión NUEVA. 10s es
-    #   holgado para que Neon despierte su cómputo serverless suspendido
-    #   sin cortar una conexión legítima, y aun así ~7x más rápido que
-    #   los 75s del sistema operativo.
+    # - connect_timeout=3: corta el intento de conexión NUEVA. 25x más
+    #   rápido que los 75s del sistema operativo, y lo bastante corto
+    #   para que la ventana nunca se sienta congelada.
+    #
+    #   Contrapartida asumida a propósito: si el cómputo serverless de
+    #   Neon está suspendido, despertarlo puede tardar más de 3s y esa
+    #   conexión legítima se va a dar por fallida. NO se pierde nada —
+    #   la app entra en modo offline, encola el movimiento, y el hilo de
+    #   fondo reintenta a los 20s, cuando el cómputo ya despertó. O sea
+    #   que el peor caso es un aviso de "sin conexión" pasajero, no un
+    #   dato perdido. Se prefiere eso a que la app se congele: un
+    #   congelamiento no se recupera solo, un reintento sí.
+    #
     # - keepalives*: detectan una conexión YA ESTABLECIDA que murió (el
     #   caso "la app estaba abierta y se cayó la red"). Sin esto, un
     #   SELECT sobre un socket muerto espera el timeout de retransmisión
     #   de TCP, que son MINUTOS. Con esta configuración se detecta en
-    #   ~30 + 3x10 = 60s como máximo, y normalmente mucho antes.
-    #   Se usa keepalives (portable: Windows/macOS/Linux) y no
-    #   tcp_user_timeout, que solo existe en Linux.
+    #   ~10 + 3x5 = 25s como máximo, y normalmente mucho antes.
+    #   keepalives es portable (Windows/macOS/Linux).
+    #
+    # - tcp_user_timeout: refuerza lo anterior, pero SOLO existe en
+    #   Linux; en Windows y macOS libpq lo acepta y lo ignora sin error
+    #   (comprobado). Se deja por si algún día esto corre en Linux.
     DATABASES["default"].setdefault("OPTIONS", {}).update({
-        "connect_timeout": 10,
+        "connect_timeout": 3,
         "keepalives": 1,
-        "keepalives_idle": 30,
-        "keepalives_interval": 10,
+        "keepalives_idle": 10,
+        "keepalives_interval": 5,
         "keepalives_count": 3,
+        "tcp_user_timeout": 10000,  # ms; ignorado fuera de Linux
     })
 
     # La configuración de la nube sí se pudo leer.
     BD_NUBE_NO_CONFIGURADA = False
-elif esta_empaquetado():
-    # Build empaquetado (.exe) SIN configuración de nube legible — falta
-    # el .env junto al ejecutable, o su DATABASE_URL es inválida.
+    BD_MOTIVO_NO_CONFIGURADA = None
+elif esta_empaquetado() or _database_url:
+    # No hay configuración de nube utilizable, y caer a SQLite sería
+    # peligroso. Dos casos entran aquí:
+    #
+    #   a) build empaquetado (.exe) sin .env legible junto al ejecutable;
+    #   b) CUALQUIER entorno —también desarrollo— donde DATABASE_URL
+    #      existe pero no sirve (basura, sin host, motor equivocado).
+    #
+    # El caso (b) se incluye a propósito: quien escribió una DATABASE_URL
+    # quería la nube, no SQLite. Tratar su error de tipeo como "ah,
+    # entonces usemos SQLite" es exactamente el fallo silencioso que
+    # costó este prompt.
     #
     # ESTE ES EL BUG RAÍZ DEL PROMPT 33, confirmado con el log de la VM de
     # Windows: antes se caía en silencio al SQLite local de abajo, y eso
@@ -317,6 +378,7 @@ elif esta_empaquetado():
         }
     }
     BD_NUBE_NO_CONFIGURADA = True
+    BD_MOTIVO_NO_CONFIGURADA = _motivo_bd_no_configurada
 else:
     # Desarrollo sin .env (nunca un .exe): SQLite local de siempre, para
     # poder trabajar sin tener Postgres configurado. Aquí sí es un
@@ -329,6 +391,7 @@ else:
         }
     }
     BD_NUBE_NO_CONFIGURADA = False
+    BD_MOTIVO_NO_CONFIGURADA = None
 
 # "local_disco" (prompt 19, motor de sincronización offline): alias
 # EXCLUSIVAMENTE local, nunca habla con Neon — ver inventario/db_router.py

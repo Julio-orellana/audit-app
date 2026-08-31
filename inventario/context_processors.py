@@ -47,4 +47,13 @@ def configuracion_bd(request):
     """
     from django.conf import settings
 
-    return {"bd_nube_no_configurada": getattr(settings, "BD_NUBE_NO_CONFIGURADA", False)}
+    return {
+        "bd_nube_no_configurada": getattr(settings, "BD_NUBE_NO_CONFIGURADA", False),
+        # El motivo concreto ("DATABASE_URL no está definida", "...no
+        # incluye host", etc.) se muestra en letra chica dentro del
+        # aviso. No es para el usuario final —a Ruth no le dice nada—
+        # sino para quien lo atienda por teléfono: sin esto, soporte
+        # tiene que pedirle el diagnostico.log antes de poder siquiera
+        # empezar a ayudar (prompt 33c).
+        "bd_motivo_no_configurada": getattr(settings, "BD_MOTIVO_NO_CONFIGURADA", None),
+    }

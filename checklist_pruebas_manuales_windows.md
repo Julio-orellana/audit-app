@@ -1,4 +1,4 @@
-# Checklist de pruebas manuales en Windows — motor offline (prompt 33)
+# Checklist de pruebas manuales en Windows — motor offline (prompts 33 / 33b / 33c)
 
 Esta lista es para correrla a mano en la VM de Windows. Ve marcando cada
 punto; si algo falla, anota **qué pasó exactamente** (mensaje, pantalla,
@@ -46,11 +46,12 @@ Abre el `.exe` una vez **con internet**, ciérralo, y abre el archivo
 
 - [ ] Dice `BD engine=django.db.backends.postgresql` y
       `host=ep-aged-frog-...neon.tech` — **NO** `sqlite3`.
-- [ ] Dice `BD OPTIONS={... 'connect_timeout': 10, 'keepalives': 1 ...}`.
+- [ ] Dice `BD OPTIONS={... 'connect_timeout': 3, 'keepalives': 1, 'keepalives_idle': 10 ...}`.
+- [ ] Dice `configuración de nube: legible y utilizable`.
 - [ ] **NO** aparece la línea `NO se pudo leer la configuración de la base de datos`.
 - [ ] `PRUEBA DE ESCRITURA en carpeta_escribible(): OK`.
 
-Si algo de esto falla, **detente aquí** y mándame el log: los 6 puntos de
+Si algo de esto falla, **detente aquí** y mándame el log: los puntos de
 abajo no tienen sentido hasta que esto esté bien.
 
 ### Punto 0-bis — sembrar el caché de credenciales (obligatorio)
@@ -83,9 +84,44 @@ abajo no tienen sentido hasta que esto esté bien.
 Si alguno de esos tres logins **falla estando con internet**, el problema
 no es del modo offline — mándame el log y paramos ahí.
 
+### Punto 0-ter — el aviso de CONFIGURACIÓN es distinto al de "sin conexión"
+
+> Esta prueba es a propósito destructiva-de-mentira: se rompe el `.env`
+> para ver qué hace la app, y luego se deja como estaba. **Haz una copia
+> del `.env` antes de tocarlo.**
+
+Son dos fallos que en pantalla se parecen y se atienden de forma
+opuesta: "no hay internet" se arregla solo cuando vuelve la red; "no se
+pudo leer la configuración" **no se arregla nunca solo** — hace falta
+que alguien coloque el archivo. Si la app los muestra igual, se pierden
+horas esperando a que se resuelva algo que no se va a resolver.
+
+**Con internet conectado** (para que no se confunda con un corte real):
+
+- [ ] Copia el `.env` a un lugar seguro (`.env.respaldo`).
+- [ ] Renombra el `.env` a `.env.apagado` y abre el `.exe`.
+- [ ] **La app ABRE igual** — no se queda en blanco, no se cierra sola,
+      no niega la entrada. (Es a propósito: perder la base es un estado
+      esperado del motor offline.)
+- [ ] Arriba se ve el aviso **rojo** que dice *"No se pudo leer la
+      configuración de la base de datos"* y *"esto no se arregla
+      reconectándote a internet"* — **no** el aviso amarillo/azul normal
+      de "sin conexión".
+- [ ] El aviso trae abajo, en letra chica, `Detalle para soporte:
+      DATABASE_URL no está definida`.
+- [ ] En `diagnostico.log` aparece `SIN CONFIGURACIÓN DE NUBE UTILIZABLE
+      — motivo: DATABASE_URL no está definida`.
+- [ ] Cierra la app. Ahora edita el `.env` y deja `DATABASE_URL=basura`
+      (sin comillas). Abre el `.exe` otra vez.
+- [ ] **La app vuelve a abrir** (antes esto reventaba el arranque entero:
+      ni ventana, ni log, ni mensaje) y el aviso ahora dice `Detalle para
+      soporte: DATABASE_URL no se pudo interpretar (UnknownSchemeError)`.
+- [ ] Restaura tu `.env` bueno y vuelve a abrir: el aviso rojo
+      desaparece.
+
 ---
 
-## Los 6 puntos
+## Los puntos de prueba
 
 ### 1. Abrir el `.exe` SIN conexión y entrar con los tres roles
 
@@ -159,11 +195,60 @@ técnico, no congelarse):
 - [ ] Categorías
 - [ ] Productos
 - [ ] Correcciones
-- [ ] Editar o eliminar un registro desde Historial
 
 Y con `Ventas`:
 - [ ] No puede entrar a entradas, mermas, ajustes, conteo físico ni
       reportes (bloqueo por rol, no un crash).
+
+### 6-bis. Historial NO se puede editar ni eliminar sin conexión
+
+> Absorbe el prompt 33b. Se prueba aparte porque es el caso donde un
+> fallo **corrompe datos** en vez de solo molestar: una edición aceptada
+> sin conexión se escribiría contra una base que no está ahí, o peor,
+> quedaría a medias.
+
+Con la red cortada, en **Historial**, con **cada uno de los tres roles**:
+
+- [ ] El aviso amarillo de arriba dice que *"Editar o eliminar un
+      registro sigue necesitando conexión"*.
+- [ ] Haz clic en **Editar** de cualquier fila → sale la pantalla
+      *"Esta función requiere conexión a internet"*. **No** se abre el
+      formulario, **no** sale un error técnico de Django.
+- [ ] Haz clic en **Eliminar** de cualquier fila → lo mismo.
+- [ ] Repite con una fila marcada como **Pendiente** (registrada offline
+      hace un momento) — también debe bloquear.
+- [ ] Lo mismo desde **Correcciones**.
+
+> Si aquí algo **sí** deja editar: anótalo con el número de fila y
+> mándame el log. No lo des por bueno solo porque el resto funcionó.
+
+### 7. La ventana nunca queda insensible
+
+> Este punto no se prueba "de paso": se prueba a propósito, porque el
+> síntoma que reportaste (*la app deja de responder*) es distinto de
+> *la app da error*, y solo se ve haciendo clic de verdad.
+
+Con la red cortada, y **cronómetro en mano**:
+
+- [ ] Haz clic en 5 secciones distintas del navbar, **una tras otra sin
+      esperar** a que termine la anterior. La ventana debe seguir
+      redibujándose; Windows **no** debe mostrar *"(No responde)"* en la
+      barra de título.
+- [ ] Deja el Inicio abierto 2 minutos sin tocar nada (el tablero
+      consulta el estado de sincronización cada 4 segundos). Al volver,
+      el primer clic responde de inmediato.
+- [ ] Anota la espera más larga que hayas visto, en segundos: **____ s**.
+      Referencia medida en Mac con la base inalcanzable de verdad (una IP
+      que descarta paquetes, no un puerto que rechaza): de 57 páginas
+      cargadas con los 3 roles, **56 tardaron 0.02 s o menos** y **una
+      sola tardó 3.04 s** — la primera después de caerse la red, que es
+      la que descubre el corte. Si en Windows ves esperas de 3 s
+      repetidas, o cualquiera por encima de ~6 s, anótalo: no es lo
+      esperado.
+- [ ] Busca en `diagnostico.log` la línea `hay_conexion() tardó`. Si
+      aparece, anota el número: significa que un sondeo pasó de 5 s, o
+      sea que el `connect_timeout` no se está respetando.
+- [ ] Busca las líneas `TIEMPO  XXXXms`: apunta la más alta.
 
 ---
 
@@ -177,13 +262,18 @@ Y con `Ventas`:
 
 ### Cómo se ve un problema en el log
 
-- `hay_conexion() tardó XX.XXs` → sigue habiendo un bloqueo por red
-  (justo lo que el `connect_timeout` debía evitar).
+- `hay_conexion() tardó XX.XXs` → un sondeo pasó de 5 segundos, o sea
+  que el `connect_timeout=3` no se está respetando (OPTIONS que no llegó
+  al driver, o un DNS colgado antes de la conexión). Con un corte de red
+  normal esta línea **no debe aparecer**: medido contra una IP que
+  descarta paquetes, cada intento falla en 3.03 s.
 - `PRUEBA DE ESCRITURA ... FALLÓ` → la app no puede escribir junto al
   `.exe` (permisos de Windows, o Control de acceso a carpetas de
   Windows Defender). Nada se guardaría.
-- `NO se pudo leer la configuración de la base de datos` → falta el
-  `.env`, volver a la Preparación.
+- `SIN CONFIGURACIÓN DE NUBE UTILIZABLE — motivo: ...` → falta el
+  `.env` o su `DATABASE_URL` no sirve. El motivo dice cuál de los dos.
+  Volver a la Preparación. Esto **no** se arregla esperando a que vuelva
+  internet.
 - `Login offline RECHAZADO: ... no tiene credencial cacheada` → falta el
   Punto 0-bis: ese usuario nunca inició sesión con internet en ese equipo.
 - `Login offline RECHAZADO: la contraseña ... no coincide` → la

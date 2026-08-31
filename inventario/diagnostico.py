@@ -179,6 +179,27 @@ def volcar_diagnostico_arranque():
             "que rechaza) eso son decenas de segundos por intento — y waitress solo tiene "
             "4 hilos. ***"
         )
+
+    # --- ¿Configuración de nube ilegible? (prompt 33c) ---
+    # Se registra aquí, junto a la configuración real de la base, porque
+    # es la diferencia entre dos síntomas que en pantalla se parecen
+    # mucho pero se atienden de forma opuesta: "no hay internet" (se
+    # arregla solo) vs. "no se pudo leer la configuración" (no se
+    # arregla solo, hace falta soporte). El motivo concreto va en la
+    # misma línea para no tener que deducirlo del resto del log.
+    if getattr(settings, "BD_NUBE_NO_CONFIGURADA", False):
+        logger.error(
+            "  *** SIN CONFIGURACIÓN DE NUBE UTILIZABLE — motivo: %s. La app abre igual "
+            "y opera sobre la cola y el caché local, pero NADA de lo que se registre "
+            "llegará al sistema central hasta que se corrija. NO se arregla reconectando "
+            "a internet: hace falta colocar/corregir el .env junto al ejecutable. La "
+            "interfaz muestra un aviso propio para este caso, distinto del de 'sin "
+            "conexión'. ***",
+            getattr(settings, "BD_MOTIVO_NO_CONFIGURADA", None) or "(sin detalle)",
+        )
+    else:
+        logger.info("  configuración de nube: legible y utilizable")
+
     logger.info("=" * 70)
 
 
