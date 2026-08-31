@@ -42,7 +42,18 @@ BASE_DIR_ESCRIBIBLE = carpeta_escribible()
 # nada y simplemente se usan las variables de entorno del sistema, si las
 # hay — de ahí cae al fallback de SQLite más abajo.
 env = environ.Env()
-environ.Env.read_env(str(BASE_DIR_ESCRIBIBLE / ".env"))
+_RUTA_ENV = BASE_DIR_ESCRIBIBLE / ".env"
+# encoding="utf-8-sig" (prompt 33): el Bloc de notas de Windows —y varios
+# editores más— guardan en UTF-8 CON BOM. django-environ lee por defecto
+# como "utf8", así que el BOM queda pegado al inicio de la PRIMERA línea:
+# "﻿DATABASE_URL=..." ya no hace match con su expresión regular, la
+# descarta como "Invalid line" y esa variable simplemente no existe.
+# Comprobado: con un .env de dos líneas guardado con BOM, DATABASE_URL
+# queda en None y DEBUG (segunda línea) se lee bien — o sea que la app
+# arranca "sin configuración de nube" aunque el archivo esté ahí y se vea
+# perfecto al abrirlo. "utf-8-sig" quita el BOM si existe y no cambia
+# nada si no existe.
+environ.Env.read_env(str(_RUTA_ENV), encoding="utf-8-sig")
 
 
 # Quick-start development settings - unsuitable for production
@@ -112,25 +123,48 @@ MIDDLEWARE = [
 LOGGING = {
     'version': 1,
     'disable_existing_loggers': False,
+    'formatters': {
+        'detallado': {
+            'format': '%(asctime)s [%(levelname)s] %(threadName)s %(name)s: %(message)s',
+        },
+    },
     'handlers': {
         'console': {
             'class': 'logging.StreamHandler',
+            'formatter': 'detallado',
+        },
+        # Log a ARCHIVO, junto al ejecutable (prompt 33). Es la única
+        # forma de tener rastro en el .exe de Windows: con console=False
+        # el proceso no tiene consola, sys.stdout y sys.stderr son None,
+        # y todo lo que va a la consola se descarta en silencio.
+        #
+        # Tiene que estar declarado AQUÍ, dentro de LOGGING, y no
+        # agregarse a mano en tiempo de ejecución: get_wsgi_application()
+        # vuelve a llamar a django.setup(), que re-aplica esta
+        # configuración con dictConfig y borra cualquier handler añadido
+        # por fuera. Ese fue justo el bug que hacía que el archivo solo
+        # tuviera las líneas del arranque y ninguna request — y que me
+        # llevó a concluir, mal, que la app no estaba sirviendo páginas.
+        #
+        # delay=True: no se toca el disco hasta que haya algo que
+        # escribir, así que un directorio sin permiso de escritura no
+        # impide arrancar.
+        'archivo': {
+            'class': 'logging.FileHandler',
+            'filename': str(BASE_DIR_ESCRIBIBLE / 'diagnostico.log'),
+            'encoding': 'utf-8',
+            'delay': True,
+            'formatter': 'detallado',
         },
     },
     'loggers': {
-        'inventario.tiempos': {
-            'handlers': ['console'],
-            'level': 'INFO',
-            'propagate': False,
-        },
-        # Prompt 19b: sin esta entrada, el logger del motor de
-        # sincronización no tenía ningún handler y su nivel efectivo era
-        # WARNING — o sea, "Sincronización offline: N movimientos
-        # confirmados" NUNCA se imprimía y los fallos del hilo pasaban en
-        # silencio. Parte de por qué el punto 2 se veía como "no pasa
-        # nada" en vez de como un error concreto.
-        'inventario.offline': {
-            'handlers': ['console'],
+        # Un solo logger padre: "inventario.tiempos",
+        # "inventario.offline" y "inventario.diagnostico" propagan aquí
+        # por herencia. Antes cada uno se declaraba por separado con
+        # propagate=False, que es justo lo que impedía sumarles un
+        # handler común.
+        'inventario': {
+            'handlers': ['console', 'archivo'],
             'level': 'INFO',
             'propagate': False,
         },

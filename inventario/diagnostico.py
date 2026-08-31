@@ -74,34 +74,21 @@ def _probar_escritura(carpeta):
 
 def configurar_log_a_archivo(nivel=logging.INFO):
     """
-    Agrega un FileHandler junto al ejecutable a los loggers de la app.
-    Idempotente. Se llama lo ANTES posible en el arranque (ver
-    app_desktop.py), antes de cualquier cosa que pueda colgarse, para
-    que aunque la app se congele después el archivo ya tenga las
-    primeras líneas.
-    """
-    try:
-        destino = ruta_log()
-        raiz = logging.getLogger("inventario")
-        for handler in raiz.handlers:
-            if isinstance(handler, logging.FileHandler) and getattr(handler, "_diagnostico", False):
-                return destino  # ya configurado
+    El handler de archivo lo declara settings.LOGGING (handler
+    "archivo"), NO esta función.
 
-        manejador = logging.FileHandler(destino, mode="a", encoding="utf-8")
-        manejador._diagnostico = True
-        manejador.setFormatter(
-            logging.Formatter("%(asctime)s [%(levelname)s] %(threadName)s %(name)s: %(message)s")
-        )
-        raiz.addHandler(manejador)
-        raiz.setLevel(nivel)
-        # propagate=False en los loggers hijos de settings.py haría que
-        # nunca llegaran aquí; se fuerza a que sí propaguen al padre.
-        for nombre in ("inventario.offline", "inventario.tiempos", "inventario.diagnostico"):
-            logging.getLogger(nombre).propagate = True
-        return destino
-    except Exception:
-        # Nunca impedir el arranque por no poder abrir el log.
-        return None
+    Antes se agregaba aquí, en tiempo de ejecución, y era un bug:
+    get_wsgi_application() vuelve a llamar a django.setup(), que
+    re-aplica LOGGING con dictConfig y descarta cualquier handler
+    añadido por fuera. Resultado: el archivo solo tenía las líneas del
+    arranque y ninguna request ni evento del motor offline — y eso me
+    llevó a concluir, equivocadamente, que la app no estaba sirviendo
+    páginas.
+
+    Se conserva la función porque app_desktop.py la llama y porque
+    devolver la ruta del log es útil, pero ya no toca la configuración.
+    """
+    return ruta_log()
 
 
 def volcar_diagnostico_arranque():
@@ -150,6 +137,33 @@ def volcar_diagnostico_arranque():
         logger.info("  sesiones -> %s  [existe=%s]", settings.SESSION_FILE_PATH, Path(settings.SESSION_FILE_PATH).exists())
     except Exception as error:
         logger.error("  no se pudo resolver SESSION_FILE_PATH: %s", error)
+
+    # --- El archivo .env: existe, y ¿se pudo leer de verdad? ---
+    # Son dos cosas distintas y confundirlas cuesta caro: un .env puede
+    # estar ahí, verse perfecto al abrirlo, y aun así no aportar nada
+    # (ej. guardado con BOM por el Bloc de notas de Windows, que hacía
+    # que django-environ descartara la primera línea entera).
+    ruta_env = Path(carpeta_esc) / ".env"
+    if not ruta_env.exists():
+        logger.error("  .env: NO EXISTE en %s — la app no tiene configuración de nube.", ruta_env)
+    else:
+        try:
+            crudo = ruta_env.read_bytes()
+            tiene_bom = crudo.startswith(b"\xef\xbb\xbf")
+            claves = []
+            for linea in crudo.decode("utf-8-sig", errors="replace").splitlines():
+                linea = linea.strip()
+                if linea and not linea.startswith("#") and "=" in linea:
+                    claves.append(linea.split("=", 1)[0].strip())
+            logger.info("  .env: existe (%d bytes), claves definidas: %s", len(crudo), claves or "(ninguna)")
+            if tiene_bom:
+                logger.warning(
+                    "  .env guardado CON BOM (típico del Bloc de notas de Windows). Se lee "
+                    "igual porque settings.py usa utf-8-sig, pero si alguna vez ves que la "
+                    "PRIMERA variable del archivo 'no existe', esta es la causa."
+                )
+        except Exception as error:
+            logger.error("  .env: existe pero no se pudo leer — %s: %s", type(error).__name__, error)
 
     # --- Configuración REAL de la base (no la del settings.py de dev) ---
     cfg = dict(settings.DATABASES["default"])
