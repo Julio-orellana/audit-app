@@ -297,53 +297,88 @@ def diagnosticar_conectividad_nube():
         logger.info("-" * 70)
         return
 
-    # --- Escalón 3: saludo Postgres COMPLETO, con timeout generoso ---
-    opciones = dict(cfg.get("OPTIONS") or {})
-    opciones.pop("connect_timeout", None)
-    opciones.pop("tcp_user_timeout", None)  # no existe fuera de Linux
-    inicio = time.monotonic()
-    try:
-        import psycopg
+    # --- Escalón 3: escalera de intentos, quitando cosas de a una ---
+    # Se prueban variantes de MENOS a MÁS restrictivo para que el propio
+    # log diga cuál es el ingrediente que molesta, en vez de dejar el
+    # diagnóstico en "algo de la red" (prompt 33c).
+    #
+    # Se fija hostaddr a UNA sola dirección (manteniendo host, que Neon
+    # necesita para enrutar por SNI) para que cada intento cueste un
+    # timeout y no el timeout x cantidad de direcciones.
+    #
+    # El último intento, sin cifrado, es el que más informa: Neon EXIGE
+    # TLS, así que va a rechazarlo — pero un rechazo DEL SERVIDOR prueba
+    # que el camino de red funciona y que lo que se está bloqueando es
+    # concretamente el tráfico cifrado. Si en cambio también se cuelga o
+    # da "Permission denied", el bloqueo es de todo el puerto 5432.
+    import psycopg
 
-        conexion = psycopg.connect(
-            host=host, port=puerto, dbname=cfg.get("NAME"),
-            user=cfg.get("USER"), password=cfg.get("PASSWORD"),
-            connect_timeout=25, **opciones
-        )
-        with conexion.cursor() as cursor:
-            cursor.execute("SELECT 1")
-            cursor.fetchone()
-        conexion.close()
-        duracion = time.monotonic() - inicio
-        logger.info("  3. Postgres completo (TLS + autenticación): OK en %.2fs", duracion)
-        configurado = (cfg.get("OPTIONS") or {}).get("connect_timeout")
-        if configurado and duracion > float(configurado):
+    base = dict(cfg.get("OPTIONS") or {})
+    direccion = next((d for d in direcciones if ":" not in d), direcciones[0])
+
+    def _sin(*claves):
+        return {k: v for k, v in base.items() if k not in claves}
+
+    intentos = [
+        ("opciones completas (las que usa la app)", base),
+        ("sin tcp_user_timeout", _sin("tcp_user_timeout")),
+        ("sin keepalives ni tcp_user_timeout", _sin(
+            "tcp_user_timeout", "keepalives", "keepalives_idle",
+            "keepalives_interval", "keepalives_count")),
+        ("mínimo: solo sslmode=require", {"sslmode": "require"}),
+        ("SIN cifrado (sslmode=disable)", {"sslmode": "disable"}),
+    ]
+
+    alguno_funciono = False
+    bloqueo_de_windows = False
+    for etiqueta, opciones in intentos:
+        opciones = dict(opciones)
+        opciones.pop("connect_timeout", None)
+        inicio = time.monotonic()
+        try:
+            conexion = psycopg.connect(
+                host=host, hostaddr=direccion, port=puerto, dbname=cfg.get("NAME"),
+                user=cfg.get("USER"), password=cfg.get("PASSWORD"),
+                connect_timeout=8, **opciones
+            )
+            with conexion.cursor() as cursor:
+                cursor.execute("SELECT 1")
+                cursor.fetchone()
+            conexion.close()
+            alguno_funciono = True
             logger.error(
-                "  *** VEREDICTO: la nube SÍ responde, pero el saludo completo tarda %.2fs y "
-                "connect_timeout está en %ss. No hay nada roto ni bloqueado: el timeout se "
-                "quedó corto para esta red. Solución: subir DB_CONNECT_TIMEOUT en el .env "
-                "(junto al .exe) a un valor holgado —por ejemplo %d— y reabrir la app. No "
-                "hace falta recompilar. ***",
-                duracion, configurado, max(10, int(duracion * 2) + 1),
+                "  3. %-42s -> CONECTÓ en %.2fs  <-- ESTE FUNCIONA",
+                etiqueta, time.monotonic() - inicio,
             )
-        else:
-            logger.warning(
-                "  *** VEREDICTO: ahora sí conectó (%.2fs), o sea que el fallo fue pasajero. "
-                "Si vuelve a ocurrir de forma sostenida, es la red, no la configuración. ***",
-                duracion,
-            )
-    except Exception as error:
-        duracion = time.monotonic() - inicio
+        except Exception as error:
+            texto = " ".join(str(error).split())
+            if "10013" in texto or "0x0000271D" in texto or "Permission denied" in texto:
+                bloqueo_de_windows = True
+            logger.info("  3. %-42s -> falló en %.2fs — %s", etiqueta, time.monotonic() - inicio, texto[:200])
+
+    # --- Veredicto ---
+    if alguno_funciono:
         logger.error(
-            "  3. Postgres completo: FALLÓ en %.2fs — %s: %s",
-            duracion, type(error).__name__, str(error).replace("\n", " ")[:300],
+            "  *** VEREDICTO: al menos una variante SÍ conecta. La línea marcada con "
+            "'ESTE FUNCIONA' dice qué combinación sirve en este equipo — mándame el log y "
+            "ajusto la configuración de la app para usarla. ***"
         )
+    elif bloqueo_de_windows:
         logger.error(
-            "  *** VEREDICTO: el TCP pasa pero el saludo cifrado no termina NI CON 25 "
-            "SEGUNDOS. Subir el timeout no lo va a arreglar. Esto es algo que intercepta o "
-            "descarta el tráfico TLS de salida: antivirus con inspección SSL, un proxy o "
-            "firewall de la red, o el filtrado del hipervisor de la VM. Prueba la app en "
-            "otra red, o desactiva temporalmente la inspección SSL del antivirus. ***"
+            "  *** VEREDICTO: Windows está NEGANDO la conexión (error 10013 / WSAEACCES). "
+            "Eso no es la red ni la nube ni el timeout: es software de ESTE equipo "
+            "bloqueando el socket de salida. Sospechosos, en orden: (1) antivirus o "
+            "seguridad con inspección de tráfico —el TCP simple pasa y la conexión cifrada "
+            "se corta, que es justo el patrón de este log—; (2) una regla de salida del "
+            "Firewall de Windows sobre el puerto 5432; (3) rangos de puertos reservados por "
+            "Hyper-V/WSL/Docker (comprobar con: netsh int ipv4 show excludedportrange tcp). "
+            "Ninguna se arregla desde la app. ***"
+        )
+    else:
+        logger.error(
+            "  *** VEREDICTO: ninguna variante conecta y no es un bloqueo explícito de "
+            "Windows. El TCP pasa pero el saludo no termina: algo descarta el tráfico en "
+            "silencio (proxy, DPI, filtrado del hipervisor). Prueba la app en otra red. ***"
         )
     logger.info("-" * 70)
 
