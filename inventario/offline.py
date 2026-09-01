@@ -42,6 +42,7 @@ ColaOfflineMixin.
 """
 import logging
 import os
+import re
 import sys
 import threading
 import time
@@ -91,21 +92,62 @@ ALIAS_LOCAL = "local_disco"
 _MARGEN_UMBRAL_SONDEO = 1.5     # 50% de holgura sobre lo esperable
 _PISO_UMBRAL_SONDEO = 5.0       # nunca alarmar por debajo de esto
 _TECHO_UMBRAL_SONDEO = 60.0     # ni callar por encima de esto
-_umbral_sondeo_lento = None
+# Cuántas direcciones IP prueba libpq antes de rendirse. Se asume el caso
+# típico de Neon y se corrige con evidencia real — ver
+# recordar_direcciones_intentadas().
+_direcciones_del_host = 3
 
 
 def umbral_sondeo_lento():
     """
     Cuántos segundos puede tardar un sondeo ANTES de que sea un síntoma.
 
-    Se resuelve una sola vez por proceso y se guarda: hay_conexion() se
-    llama en casi toda request, así que esto no puede costar una consulta
-    de DNS cada vez. La cantidad de direcciones de un host no cambia en
-    la vida de un proceso lo bastante como para justificar el gasto.
+    NO consulta DNS. La primera versión de esta función sí lo hacía, para
+    contar a cuántas direcciones resuelve el host, y era un error de
+    bulto: `socket.getaddrinfo()` sin red se queda esperando —segundos en
+    Windows— y esto se llama desde el `finally` de hay_conexion(), o sea
+    potencialmente en el hilo de una request. Habría metido justo el tipo
+    de espera que este prompt entero existe para eliminar, y encima
+    precisamente cuando no hay conexión, que es cuando más duele.
+
+    En vez de preguntar, se asume el caso típico de Neon (varias
+    direcciones) y se AFINA con evidencia real: cuando un intento falla,
+    libpq enumera en el mensaje de error todas las direcciones que probó,
+    así que `recordar_direcciones_intentadas()` saca el número de ahí sin
+    costar nada.
     """
-    global _umbral_sondeo_lento
-    if _umbral_sondeo_lento is not None:
-        return _umbral_sondeo_lento
+    timeout = 0.0
+    try:
+        timeout = float((settings.DATABASES["default"].get("OPTIONS") or {}).get("connect_timeout") or 0)
+    except Exception:
+        pass
+    if timeout <= 0:
+        return _PISO_UMBRAL_SONDEO
+    esperable = timeout * _direcciones_del_host * _MARGEN_UMBRAL_SONDEO
+    return max(_PISO_UMBRAL_SONDEO, min(esperable, _TECHO_UMBRAL_SONDEO))
+
+
+def recordar_direcciones_intentadas(error):
+    """
+    Aprende del mensaje de error cuántas direcciones probó libpq.
+
+    Cuando falla, psycopg devuelve algo así:
+
+        Multiple connection attempts failed. All failures were:
+        - host: 'ep-...neon.tech', port: None, hostaddr: '18.226.144.228': ...
+        - host: 'ep-...neon.tech', port: None, hostaddr: '3.23.109.155': ...
+        - host: 'ep-...neon.tech', port: None, hostaddr: '16.58.187.204': ...
+
+    Contar esas líneas da el multiplicador real de ese equipo —3 en la VM
+    de Windows, 6 en un equipo con IPv6— gratis y sin tocar la red.
+    """
+    global _direcciones_del_host
+    try:
+        cuantas = len(re.findall(r"hostaddr:", str(error)))
+    except Exception:
+        return
+    if cuantas > _direcciones_del_host:
+        _direcciones_del_host = min(cuantas, 12)
 
     esperable = _PISO_UMBRAL_SONDEO
     try:
@@ -370,7 +412,8 @@ def hay_conexion():
         conexion.ensure_connection()
         exito = True
         return True
-    except Exception:
+    except Exception as error:
+        recordar_direcciones_intentadas(error)
         if not conexion.in_atomic_block:
             try:
                 conexion.close()
