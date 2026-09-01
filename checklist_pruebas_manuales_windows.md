@@ -320,6 +320,72 @@ Con la red cortada, y **cronómetro en mano**:
 
 ---
 
+### Punto 8 — el login usa Neon cuando HAY internet (prompt 33d)
+
+> Este punto es el contrario de todo lo demás del checklist: aquí se
+> verifica que la app **NO** use el modo offline cuando no toca. Hasta el
+> 33d, con internet perfecto el login se resolvía igual contra la caché
+> local — la app decidía "no hay conexión" por un sondeo sano pero lento.
+
+**Con internet conectado y estable:**
+
+- [ ] Abre el `.exe` y busca en `diagnostico.log` la línea nueva:
+
+      ```
+      HANDSHAKE CON LA NUBE: X.XXs (connect_timeout=8s)
+      ```
+
+      **Anota ese número: ____ s.** Es cuánto tarda de verdad esta laptop
+      en conectarse a Neon, y es el dato que dice si el timeout está bien
+      calibrado para este equipo. En Mac son 0.6–3.2s.
+
+- [ ] Si debajo aparece un `***` diciendo que el handshake está cerca del
+      `connect_timeout`, **sube `DB_CONNECT_TIMEOUT`** en el `.env` que
+      está junto al `.exe` al número que sugiere el propio mensaje, y
+      reabre la app. No hace falta recompilar.
+
+- [ ] Inicia sesión con `Ruth`, cierra sesión; luego `Michelle`, cierra
+      sesión; luego `Ventas`. **Con cada uno**, confirma en el log que
+      aparece:
+
+      ```
+      Credencial de '<usuario>' cacheada para poder entrar sin conexión.
+      ```
+
+      Esa línea **solo se escribe cuando la validación fue contra Neon**.
+      Si en su lugar ves `Inicio de sesión SIN CONEXIÓN validado contra
+      la caché local`, el bug sigue vivo — mándame el log.
+
+- [ ] Repite el ciclo login/logout **al menos 5 veces seguidas**. Tiene
+      que dar el resultado online las 5 veces: el bug del 33d podía ser
+      intermitente y "a veces sí" no es aprobado.
+
+- [ ] Confirma que **no** aparece `SONDEO DE CONECTIVIDAD FALLIDO` en
+      todo el rato que estuviste con internet. Si aparece con la red
+      funcionando, el `connect_timeout` se está quedando corto para esa
+      red: súbelo con `DB_CONNECT_TIMEOUT`.
+
+**Ahora corta la red de verdad** (adaptador desactivado):
+
+- [ ] El login sigue funcionando con los tres usuarios, ahora sí por
+      caché local (`Inicio de sesión SIN CONEXIÓN validado...`).
+- [ ] En el log, `SONDEO DE CONECTIVIDAD FALLIDO en X.XXs` aparece
+      **una sola vez cada tanto**, no una por cada intento. Anota el
+      número: **____ s** (esperado: hasta ~24s con 3 direcciones IP; muy
+      lejos de los 75s del bug original del prompt 33).
+- [ ] Ninguna pantalla tarda más de ~1 segundo. El costo de descubrir el
+      corte lo paga el hilo de sincronización de fondo, no tus clics —
+      verificado en Mac: 42 peticiones con la red caída, peor latencia
+      0.17s.
+
+**Vuelve a conectar la red:**
+
+- [ ] Sin tocar nada, en menos de un minuto el siguiente login vuelve a
+      validarse contra Neon (`Credencial de ... cacheada`), no contra la
+      caché.
+
+---
+
 ## Qué mandarme
 
 1. El archivo **`diagnostico.log`** completo (junto al `.exe`) — es lo más
@@ -330,6 +396,17 @@ Con la red cortada, y **cronómetro en mano**:
 
 ### Cómo se ve un problema en el log
 
+- `SONDEO DE CONECTIVIDAD FALLIDO en X.XXs` **con internet funcionando**
+  → el `connect_timeout` se está quedando corto para esa red, y por eso
+  los logins se están resolviendo contra la caché local. Sube
+  `DB_CONNECT_TIMEOUT` en el `.env` junto al `.exe` (prompt 33d). Con la
+  red caída, en cambio, esta línea es lo esperado.
+- `Sondeo de conectividad OK pero lento: X.XXs` → aviso temprano: la
+  conexión funciona pero este equipo se está acercando al límite.
+  Conviene subir `DB_CONNECT_TIMEOUT` antes de que empiece a fallar.
+- `HANDSHAKE CON LA NUBE: X.XXs` → cuánto tarda de verdad este equipo en
+  conectarse a Neon. Si el mensaje viene seguido de un `***`, hay que
+  subir `DB_CONNECT_TIMEOUT` al valor que él mismo sugiere.
 - `hay_conexion() tardó XX.XXs, por encima de los YY.Ys que explica la
   configuración` → el umbral ya no es un número fijo: se calcula como
   `connect_timeout × direcciones IP del host`, con margen, así que se

@@ -254,7 +254,29 @@ def _interpretar_url_de_nube(url):
     return cfg, None
 
 
-SEGUNDOS_TIMEOUT_CONEXION_POR_DEFECTO = 3
+# EL VALOR A SUBIR SI ALGUNA LAPTOP RESULTA MÁS LENTA. Está aquí, en una
+# sola constante, y además se puede cambiar SIN RECOMPILAR poniendo
+# DB_CONNECT_TIMEOUT en el .env que vive junto al .exe (ver
+# _leer_connect_timeout() abajo y .env.example).
+#
+# 8 y no 3 (prompt 33d). Con 3 el sistema se rompía al revés que en el
+# 33: en la VM de Windows, un handshake real y sano que pasara de 3s se
+# daba por "sin conexión", se marcaba la caché negativa, y TODO login
+# posterior se resolvía contra la caché local aunque internet estuviera
+# perfecto. Medido al diagnosticarlo: en Mac el handshake completo con
+# Neon (TCP + TLS + SCRAM con channel binding) tarda 0.6s estable y
+# 1.9s en frío; en la VM el migrate de arranque tardaba 4.33s. 8s deja
+# margen real sobre todo lo observado sin ser ilimitado.
+#
+# Contrapartida, medida y aceptada a propósito: connect_timeout es POR
+# DIRECCIÓN IP y el host de Neon resuelve a 3, así que detectar un corte
+# de red REAL pasa de ~9s a ~24s en el peor caso. Eso es tolerable
+# porque desde el 33d ese costo lo paga UN SOLO hilo —los demás esperan
+# su resultado en vez de repetir el intento, ver
+# esperar_sondeo_en_curso() en offline.py— y normalmente lo paga el hilo
+# de sincronización de fondo, no una request. Sigue muy lejos de los 75s
+# del bug original del prompt 33.
+SEGUNDOS_TIMEOUT_CONEXION_POR_DEFECTO = 8
 
 
 def _leer_connect_timeout():

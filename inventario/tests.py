@@ -3,7 +3,7 @@ from decimal import Decimal
 
 from django.contrib.auth.models import Group, User
 from django.core.exceptions import ValidationError
-from django.test import SimpleTestCase, TestCase
+from django.test import SimpleTestCase, TestCase, TransactionTestCase
 from django.urls import reverse
 
 from .forms import ConteoFisicoForm, LoteCompraForm, MovimientoSalidaForm
@@ -1287,73 +1287,137 @@ class SondeoConcurrenteTests(SimpleTestCase):
     detenida.
     """
 
+    # Declarado a propósito: un sondeo SANO llega hasta
+    # ensure_connection(), y SimpleTestCase bloquea toda consulta salvo
+    # que se declaren los alias. Sin esto, el sondeo "sano" de la prueba
+    # de la regresión del 33d fallaría por el bloqueo de Django y
+    # estaríamos midiendo otra cosa.
+    databases = {"default"}
+
     def setUp(self):
         from .offline import reiniciar_cache_conexion
 
         reiniciar_cache_conexion()
         self.addCleanup(reiniciar_cache_conexion)
 
-    def test_mientras_un_hilo_averigua_los_demas_no_pagan_la_espera(self):
-        import threading
+    def _sondeo_lento(self, duracion, falla):
+        """
+        Sustituye _reciclar_conexion_remota por uno que tarda `duracion`
+        y termina en error o en éxito según `falla`.
+
+        Se parchea esa función del MÓDULO y no
+        connections["default"].ensure_connection: el registro de
+        conexiones de Django es por hilo, así que parchear el objeto de
+        conexión desde el hilo principal no le llega al hilo que sondea,
+        y la prueba mediría otra cosa. (Costó un falso "pasa" descubrirlo.)
+        """
         import time
 
         from django.db.utils import OperationalError
 
         from . import offline
 
-        DURACION_SONDEO = 4.0
-        # Se parchea _reciclar_conexion_remota, que es una función del
-        # MÓDULO, y no connections["default"].ensure_connection: el
-        # registro de conexiones de Django es por hilo, así que parchear
-        # el objeto de conexión desde el hilo principal no le llega al
-        # hilo que sondea, y la prueba mediría otra cosa.
         original = offline._reciclar_conexion_remota
 
         def reciclar_lento():
-            # Simula el atasco real: una espera larga que termina en
-            # error de conexión. No se usa una IP inalcanzable de verdad
-            # porque el tiempo dependería de la red de quien corra las
-            # pruebas.
-            time.sleep(DURACION_SONDEO)
-            raise OperationalError("connection timeout expired (simulado)")
+            time.sleep(duracion)
+            if falla:
+                raise OperationalError("connection timeout expired (simulado)")
 
         offline._reciclar_conexion_remota = reciclar_lento
         self.addCleanup(setattr, offline, "_reciclar_conexion_remota", original)
 
-        resultado_lento = {}
+    def test_un_sondeo_sano_pero_lento_no_hace_que_los_demas_se_crean_offline(self):
+        """
+        LA REGRESIÓN DEL PROMPT 33D, blindada.
+
+        Hasta el 33d, si un sondeo llevaba más de 2s los demás hilos
+        DABAN POR HECHO que no había conexión. La justificación escrita
+        era "un sondeo sano contra Neon tarda menos de 1s", medida en
+        Mac; al diagnosticar el 33d, el primer sondeo sano en esa misma
+        Mac tardó 1.936s — 64 ms por debajo del umbral. En la VM de
+        Windows lo superaba de sobra, y como get_new_connection() consulta
+        esa conjetura para decidir si siquiera intenta conectar, bastaba
+        para que un login con internet perfecto se resolviera contra la
+        caché local.
+
+        Ahora los demás ESPERAN el resultado real. Esta prueba fija que un
+        sondeo sano pero lento devuelva True a todos, no False.
+        """
+        import threading
+        import time
+
+        from . import offline
+
+        DURACION_SONDEO = 4.0
+        self._sondeo_lento(DURACION_SONDEO, falla=False)
+
+        resultado_sondeador = {}
 
         def sondear():
-            inicio = time.monotonic()
-            resultado_lento["valor"] = offline.hay_conexion()
-            resultado_lento["duracion"] = time.monotonic() - inicio
+            resultado_sondeador["valor"] = offline.hay_conexion()
 
         hilo = threading.Thread(target=sondear)
         hilo.start()
-        # Se espera a pasar el umbral a partir del cual los demás hilos
-        # dan por hecho que está caída.
-        time.sleep(offline.SEGUNDOS_PARA_ASUMIR_CAIDA_EN_SONDEO + 0.5)
+        time.sleep(2.5)  # más de los 2s que antes bastaban para asumir caída
 
-        inicio = time.monotonic()
-        self.assertTrue(
+        self.assertFalse(
             offline.sin_conexion_reciente(),
-            "Con un sondeo colgado, los demás hilos tienen que dar por hecho que no hay "
-            "conexión en vez de lanzar cada uno el suyo.",
+            "Un sondeo EN CURSO no es evidencia de que no haya conexión. "
+            "sin_conexion_reciente() solo debe reportar un sondeo que YA FALLÓ.",
         )
-        self.assertFalse(offline.hay_conexion())
-        duracion_segundo = time.monotonic() - inicio
+        self.assertTrue(
+            offline.hay_conexion(),
+            "El segundo hilo se creyó sin conexión mientras un sondeo SANO seguía en "
+            "curso — esa es exactamente la regresión del prompt 33d.",
+        )
 
         hilo.join(timeout=DURACION_SONDEO + 5)
         self.assertFalse(hilo.is_alive(), "El hilo que sondea no terminó.")
+        self.assertTrue(resultado_sondeador["valor"])
 
-        self.assertLess(
-            duracion_segundo, 0.5,
-            f"El segundo hilo tardó {duracion_segundo:.2f}s: pagó su propia espera. Eso es "
-            "lo que producía logins de 10, 29 y 38 segundos a la vez.",
-        )
-        self.assertFalse(resultado_lento["valor"])
-        self.assertGreaterEqual(
-            resultado_lento["duracion"], DURACION_SONDEO,
-            "El primer hilo sí debe sondear de verdad: alguien tiene que averiguarlo.",
+    def test_mientras_un_hilo_averigua_los_demas_no_lanzan_su_propio_sondeo(self):
+        """
+        La otra mitad, que NO se puede perder al arreglar la de arriba:
+        sigue sin haber avalancha. Los hilos que llegan durante un sondeo
+        esperan SU resultado en vez de abrir cada uno el suyo — que es lo
+        que producía tres logins de 10, 29 y 38 segundos a la vez (33c).
+        """
+        import threading
+        import time
+
+        from . import offline
+
+        DURACION_SONDEO = 3.0
+        self._sondeo_lento(DURACION_SONDEO, falla=True)
+
+        sondeos_lanzados = {"n": 0}
+        original = offline._reciclar_conexion_remota
+
+        def contar_y_sondear():
+            sondeos_lanzados["n"] += 1
+            return original()
+
+        offline._reciclar_conexion_remota = contar_y_sondear
+        self.addCleanup(setattr, offline, "_reciclar_conexion_remota", original)
+
+        resultados = []
+
+        def pedir():
+            resultados.append(offline.hay_conexion())
+
+        hilos = [threading.Thread(target=pedir) for _ in range(4)]
+        for h in hilos:
+            h.start()
+        for h in hilos:
+            h.join(timeout=DURACION_SONDEO + 8)
+
+        self.assertEqual(len(resultados), 4, "Algún hilo se quedó colgado.")
+        self.assertTrue(all(r is False for r in resultados), "Todos deben ver el mismo resultado real.")
+        self.assertEqual(
+            sondeos_lanzados["n"], 1,
+            f"Se lanzaron {sondeos_lanzados['n']} sondeos en paralelo en vez de 1: volvió "
+            "la avalancha del 33c.",
         )
 
     def test_la_cache_dura_al_menos_el_doble_de_lo_que_costo_averiguarlo(self):
@@ -2277,3 +2341,80 @@ class HistorialFiltrosTests(TestCase):
         self.assertEqual(len(filas), 1)
         self.assertEqual(filas[0]["usuario"], "michelle35")
         self.assertEqual(filas[0]["cantidad"], 3)
+
+
+class LoginConConexionRealTests(TransactionTestCase):
+    """
+    EL SÍNTOMA EXACTO DEL PROMPT 33D: en Windows, con internet activo y
+    funcionando, el login se resolvía contra la caché local en vez de
+    contra Neon.
+
+    TransactionTestCase y no TestCase a propósito: TestCase envuelve cada
+    prueba en una transacción, así que la conexión queda ABIERTA y
+    ensure_connection() nunca llama a get_new_connection() — justo donde
+    vive el corto que causaba el bug. Con la conexión abierta esta prueba
+    pasaría siempre, incluso con el bug presente.
+    """
+
+    databases = {"default", "local_disco"}
+
+    def test_login_no_cae_al_cache_cuando_hay_conexion_pero_el_sondeo_es_lento(self):
+        import threading
+        import time
+
+        from django.contrib.auth.hashers import make_password
+        from django.db import connections
+
+        from . import offline
+        from .models import CredencialOfflineCache
+        from .offline import BackendConRespaldoOffline, guardar_credencial_offline
+
+        if not _es_postgres(connections["default"].settings_dict["ENGINE"]):
+            self.skipTest("El corto vive en el backend de Postgres; con SQLite no aplica.")
+
+        CLAVE_REAL = "clave-real-33d"
+        usuario = User.objects.create_user(username="usuario33d", password=CLAVE_REAL)
+        grupo, _ = Group.objects.get_or_create(name="admin")
+        usuario.groups.add(grupo)
+        guardar_credencial_offline(usuario, "admin")
+
+        # La caché local queda con OTRA contraseña. Así los dos caminos son
+        # distinguibles sin ambigüedad: si el login valida contra Neon
+        # devuelve el usuario; si cae a la caché, el hash no coincide y
+        # devuelve None. No hay forma de confundir cuál se usó.
+        CredencialOfflineCache.objects.using("local_disco").filter(
+            username="usuario33d"
+        ).update(password_hash=make_password("otra-clave-que-ya-no-vale"))
+
+        # Un sondeo SANO pero lento en curso — exactamente lo que pasa en
+        # la VM de Windows, donde el handshake tarda más que en Mac.
+        original = offline._reciclar_conexion_remota
+
+        def reciclar_lento():
+            time.sleep(3.0)
+
+        offline._reciclar_conexion_remota = reciclar_lento
+        self.addCleanup(setattr, offline, "_reciclar_conexion_remota", original)
+        self.addCleanup(offline.reiniciar_cache_conexion)
+        offline.reiniciar_cache_conexion()
+
+        hilo = threading.Thread(target=offline.hay_conexion)
+        hilo.start()
+        time.sleep(2.0)  # el sondeo lleva más de los 2s que antes bastaban
+
+        # Conexión cerrada: el login TIENE que abrir una nueva y pasar por
+        # get_new_connection(), que es donde estaba el corto.
+        connections["default"].close()
+
+        backend = BackendConRespaldoOffline()
+        autenticado = backend.authenticate(None, username="usuario33d", password=CLAVE_REAL)
+
+        hilo.join(timeout=10)
+
+        self.assertIsNotNone(
+            autenticado,
+            "El login se resolvió contra la CACHÉ LOCAL teniendo conexión: la caché tenía "
+            "otra contraseña, así que devolver None prueba que nunca se consultó Neon. "
+            "Esa es exactamente la regresión del prompt 33d.",
+        )
+        self.assertEqual(autenticado.username, "usuario33d")

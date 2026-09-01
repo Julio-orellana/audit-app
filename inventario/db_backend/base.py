@@ -50,7 +50,7 @@ class DatabaseWrapper(base.DatabaseWrapper):
         # e inventario.offline importa modelos.
         from django.conf import settings
 
-        from ..offline import sin_conexion_reciente
+        from ..offline import esperar_sondeo_en_curso, sin_conexion_reciente
 
         if getattr(settings, "BD_NUBE_NO_CONFIGURADA", False):
             # Sin configuración legible el host es un centinela
@@ -64,9 +64,27 @@ class DatabaseWrapper(base.DatabaseWrapper):
             )
 
         if sin_conexion_reciente():
+            # HECHO: un sondeo real falló hace pocos segundos. No es una
+            # conjetura, así que cortar aquí no puede producir un falso
+            # negativo (prompt 33d).
             raise self.Database.OperationalError(
-                "Sin conexión con la base en la nube (verificado hace unos segundos). "
-                "No se reintenta todavía para no dejar la ventana esperando; el motor "
-                "offline vuelve a probar solo en cuanto expire ese margen."
+                "Sin conexión con la base en la nube (un sondeo real falló hace unos "
+                "segundos). No se reintenta todavía para no dejar la ventana esperando; el "
+                "motor offline vuelve a probar solo en cuanto expire ese margen."
+            )
+
+        # Si hay un sondeo EN CURSO, se espera su resultado real en vez de
+        # abrir una segunda conexión en paralelo. Esto es lo que antes
+        # hacía la conjetura de los 2 segundos —"lleva rato, doy por hecho
+        # que no hay red"— y era la causa del prompt 33d: un sondeo sano
+        # pero lento bastaba para que este corto rechazara una conexión
+        # perfectamente posible, y el login terminara resolviéndose contra
+        # la caché local con internet impecable. Esperar el resultado
+        # verdadero conserva la protección contra la avalancha sin poder
+        # equivocarse.
+        if esperar_sondeo_en_curso() is False:
+            raise self.Database.OperationalError(
+                "Sin conexión con la base en la nube (se esperó el resultado del sondeo "
+                "que estaba en curso y falló)."
             )
         return super().get_new_connection(conn_params)

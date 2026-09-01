@@ -199,6 +199,7 @@ def volcar_diagnostico_arranque():
         )
     else:
         logger.info("  configuración de nube: legible y utilizable")
+        _medir_handshake_real(opciones)
 
     logger.info("=" * 70)
 
@@ -381,6 +382,71 @@ def diagnosticar_conectividad_nube():
             "silencio (proxy, DPI, filtrado del hipervisor). Prueba la app en otra red. ***"
         )
     logger.info("-" * 70)
+
+
+def _medir_handshake_real(opciones):
+    """
+    Cuánto tarda DE VERDAD establecer una conexión con Neon en ESTE
+    equipo (prompt 33d).
+
+    Es el número que decide si connect_timeout está bien calibrado, y
+    hasta ahora solo se había medido en Mac (0.6s estable, 1.9s en frío)
+    — nunca en las laptops donde la app va a correr. Calibrar un timeout
+    con la medición de otra máquina fue justo la causa del 33d: con
+    connect_timeout=3, cualquier equipo cuyo handshake pasara de 3s se
+    daba por "sin conexión" y resolvía todos los logins contra la caché
+    local con internet perfecto.
+
+    Cuesta una conexión, que además NO se desperdicia: el migrate del
+    arranque la reutiliza (CONN_MAX_AGE=60), así que en la práctica no
+    agrega tiempo al arranque.
+    """
+    from django.db import connections
+
+    timeout = opciones.get("connect_timeout")
+    conexion = connections["default"]
+    try:
+        conexion.close()
+    except Exception:
+        pass
+
+    inicio = time.monotonic()
+    try:
+        conexion.ensure_connection()
+        duracion = time.monotonic() - inicio
+    except Exception as error:
+        duracion = time.monotonic() - inicio
+        logger.error(
+            "  HANDSHAKE CON LA NUBE: FALLÓ en %.2fs (connect_timeout=%ss) — %s: %s",
+            duracion, timeout, type(error).__name__, " ".join(str(error).split())[:200],
+        )
+        return
+
+    logger.info(
+        "  HANDSHAKE CON LA NUBE: %.2fs (connect_timeout=%ss) — este es el número que "
+        "decide si el timeout está bien calibrado para ESTE equipo.",
+        duracion, timeout,
+    )
+    try:
+        margen = float(timeout) - duracion
+        if margen < 2:
+            logger.error(
+                "  *** El handshake (%.2fs) está a solo %.2fs del connect_timeout (%ss). "
+                "Cualquier lentitud pasajera lo va a cruzar, y entonces la app se creerá "
+                "sin conexión teniendo internet: los logins se resolverán contra la caché "
+                "local. SUBE DB_CONNECT_TIMEOUT en el .env que está junto al .exe "
+                "(sugerido: %d). ***",
+                duracion, margen, timeout, max(8, int(duracion * 4) + 1),
+            )
+        elif margen < 4:
+            logger.warning(
+                "  El handshake (%.2fs) deja solo %.2fs de margen sobre el connect_timeout "
+                "(%ss). Vigílalo: si el log empieza a mostrar 'SONDEO DE CONECTIVIDAD "
+                "FALLIDO' con internet activo, sube DB_CONNECT_TIMEOUT en el .env.",
+                duracion, margen, timeout,
+            )
+    except (TypeError, ValueError):
+        pass
 
 
 def medir(descripcion):

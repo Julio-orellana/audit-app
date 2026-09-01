@@ -97,23 +97,44 @@ _TECHO_UMBRAL_SONDEO = 60.0     # ni callar por encima de esto
 # recordar_direcciones_intentadas().
 _direcciones_del_host = 3
 
-# Cuánto se deja correr un sondeo antes de que los DEMÁS hilos den por
-# hecho que no hay conexión, en vez de lanzar cada uno el suyo.
+# Un solo sondeo a la vez, y los demás ESPERAN SU RESULTADO REAL en vez
+# de adivinarlo (prompt 33d).
 #
-# Medido en la VM de Windows con el adaptador de red apagado: un solo
-# sondeo tardó 28.50s —el DNS se cuelga y connect_timeout NO cubre la
-# resolución, solo se aplica después— y tres logins simultáneos pagaron
-# cada uno su propio atasco: 10.1s, 29.4s y 38.7s. La caché de resultado
-# negativo no los salvaba porque no se marca hasta que el PRIMER sondeo
-# termina, así que todos entraron antes de que hubiera nada que leer.
+# Esto reemplaza a SEGUNDOS_PARA_ASUMIR_CAIDA_EN_SONDEO, que era una
+# conjetura: "si otro hilo lleva más de 2s sondeando, doy por hecho que
+# no hay red". La justificación que escribí entonces era "un sondeo sano
+# contra Neon tarda menos de 1s", medido en Mac. Medido de nuevo en esta
+# misma Mac al diagnosticar el 33d: el PRIMER sondeo sano tarda 1.936s
+# — 64 milisegundos por debajo del umbral. En la VM de Windows, donde el
+# migrate de arranque tarda 4.33s, un sondeo perfectamente sano lo supera
+# con holgura, y entonces TODA request que caiga en esa ventana se cree
+# sin conexión aunque la red esté impecable.
 #
-# 2 segundos porque un sondeo sano contra Neon tarda menos de 1s: nunca
-# se dispara con la red buena, y con la red caída ahorra la espera a
-# todos menos al primero.
-SEGUNDOS_PARA_ASUMIR_CAIDA_EN_SONDEO = 2.0
+# El error de fondo no fue el número, fue dejar que una HEURÍSTICA
+# bloqueara de forma dura el único camino a la base. Una heurística que
+# se equivoca de vez en cuando se vuelve "roto siempre" cuando es la
+# única puerta. Esperar el resultado verdadero no puede equivocarse: si
+# el sondeo va a tener éxito, el que espera se entera; si va a fallar,
+# también. Y sigue sin haber avalancha, que era el objetivo original.
+# Un sondeo SANO que tarde más que esto se registra como aviso temprano:
+# significa que este equipo se está acercando al connect_timeout y
+# conviene subirlo antes de que empiece a fallar. 2s es justo el valor
+# que la conjetura vieja usaba como "esto ya es una caída" — aquí no
+# decide nada, solo informa.
+SEGUNDOS_SONDEO_NOTABLE = 2.0
 
-_sondeo_iniciado_en = 0.0   # 0.0 = ningún sondeo en curso
-_local = threading.local()  # marca al hilo que ESTÁ sondeando
+_evento_sondeo = None           # threading.Event mientras hay un sondeo en curso
+_sondeo_iniciado_en = 0.0       # solo para detectar un sondeo huérfano
+_resultado_ultimo_sondeo = False
+_local = threading.local()      # marca al hilo que ESTÁ sondeando
+
+
+def _connect_timeout_configurado():
+    """El connect_timeout vigente, para poder nombrarlo en el log."""
+    try:
+        return (settings.DATABASES["default"].get("OPTIONS") or {}).get("connect_timeout") or "?"
+    except Exception:
+        return "?"
 
 
 def umbral_sondeo_lento():
@@ -167,29 +188,6 @@ def recordar_direcciones_intentadas(error):
     if cuantas > _direcciones_del_host:
         _direcciones_del_host = min(cuantas, 12)
 
-    esperable = _PISO_UMBRAL_SONDEO
-    try:
-        cfg = settings.DATABASES["default"]
-        timeout = float((cfg.get("OPTIONS") or {}).get("connect_timeout") or 0)
-        if timeout > 0:
-            direcciones = 1
-            try:
-                import socket
-
-                infos = socket.getaddrinfo(cfg.get("HOST"), None, type=socket.SOCK_STREAM)
-                direcciones = max(1, len({i[4][0] for i in infos}))
-            except Exception:
-                # Sin DNS no se puede saber; se asume el caso típico de
-                # Neon (varias direcciones) en vez de una, para no volver
-                # a llenar el log de falsas alarmas.
-                direcciones = 3
-            esperable = timeout * direcciones * _MARGEN_UMBRAL_SONDEO
-    except Exception:
-        pass
-
-    _umbral_sondeo_lento = max(_PISO_UMBRAL_SONDEO, min(esperable, _TECHO_UMBRAL_SONDEO))
-    return _umbral_sondeo_lento
-
 # Cuánto se reutiliza el resultado de un sondeo de conectividad antes de
 # volver a preguntar de verdad (prompt 33). hay_conexion() se llama en
 # CASI TODA request (dashboard, formularios vía _alias_catalogo(),
@@ -218,22 +216,36 @@ def reiniciar_cache_conexion():
     "sin conexión" pegado hasta 15s y haría fallar al siguiente test por
     un motivo que no tiene nada que ver con lo que ese test verifica.
     """
-    global _sin_conexion_hasta, _sondeo_iniciado_en
+    global _sin_conexion_hasta, _sondeo_iniciado_en, _evento_sondeo, _resultado_ultimo_sondeo
     with _lock_cache_conexion:
         _sin_conexion_hasta = 0.0
         _sondeo_iniciado_en = 0.0
+        evento = _evento_sondeo
+        _evento_sondeo = None
+        _resultado_ultimo_sondeo = False
+    if evento is not None:
+        # Que nadie quede esperando un sondeo que se acaba de descartar.
+        evento.set()
     _local.sondeando = False
 
 
 def sin_conexion_reciente():
     """
-    ¿Sabemos YA, sin preguntarle a la red, que ahora mismo no hay
-    conexión? Solo lee la caché; nunca sondea, así que cuesta cero.
+    ¿CONSTA que no hay conexión? Solo lee la caché de un sondeo que YA
+    FALLÓ; nunca sondea ni conjetura, así que cuesta cero y no puede dar
+    un falso negativo.
 
-    Es distinto de `not hay_conexion()`: eso puede disparar un intento
-    real y pagar el connect_timeout entero. Esta función responde False
-    cuando no hay nada cacheado — o sea "no me consta que esté caída",
-    no "está sana".
+    Devuelve False cuando no hay nada cacheado — o sea "no me consta que
+    esté caída", que NO es lo mismo que "está sana". Quien necesite la
+    respuesta de verdad debe llamar a hay_conexion().
+
+    Prompt 33d: hasta este cambio también devolvía True cuando otro hilo
+    llevaba más de 2 segundos sondeando, aunque ese sondeo fuera a tener
+    éxito. Como get_new_connection() la consulta para decidir si siquiera
+    intenta conectar, esa conjetura bastaba para que un login con
+    internet perfecto se resolviera contra la caché local. Ahora esta
+    función solo reporta HECHOS: un sondeo que falló hace poco. La espera
+    coordinada de un sondeo en curso vive en esperar_sondeo_en_curso().
 
     Existe para los caminos que se recorren en CADA request y que no
     pueden permitirse ni un sondeo: ver
@@ -244,17 +256,52 @@ def sin_conexion_reciente():
         # la red, o el sondeo se cortaría a sí mismo y la app quedaría
         # marcada como sin conexión para siempre.
         return False
+    return time.monotonic() < _sin_conexion_hasta
 
-    ahora = time.monotonic()
-    inicio_sondeo = _sondeo_iniciado_en
-    if inicio_sondeo and (ahora - inicio_sondeo) >= SEGUNDOS_PARA_ASUMIR_CAIDA_EN_SONDEO:
-        # Otro hilo lleva rato colgado averiguándolo. No tiene sentido
-        # que este pague la misma espera para llegar a la misma
-        # conclusión — eso es lo que convertía un corte en tres logins
-        # de 10, 29 y 38 segundos a la vez.
-        return True
 
-    return ahora < _sin_conexion_hasta
+def esperar_sondeo_en_curso():
+    """
+    Si otro hilo está sondeando la conectividad, espera su resultado REAL
+    en vez de abrir una conexión propia en paralelo (prompt 33d).
+
+    Devuelve True/False con el resultado del sondeo, o None si no había
+    ninguno en curso (y entonces quien llama debe seguir su camino
+    normal).
+
+    Es la mitad honesta de lo que antes hacía la conjetura de los 2
+    segundos: sigue evitando la avalancha —los hilos que llegan durante
+    un sondeo no lanzan cada uno el suyo, que era el problema de los tres
+    logins de 10, 29 y 38 segundos del 33c— pero sin poder equivocarse,
+    porque no adivina el resultado: lo espera.
+
+    El tope de espera es el mismo umbral_sondeo_lento(): lo máximo que un
+    intento puede tardar según la configuración (connect_timeout x
+    direcciones, con margen). Pasado eso el sondeo está colgado de
+    verdad, no simplemente lento, y se responde que no hay conexión.
+    """
+    if getattr(_local, "sondeando", False):
+        return None
+
+    tope = umbral_sondeo_lento()
+    with _lock_cache_conexion:
+        evento = _evento_sondeo
+        if evento is not None and (time.monotonic() - _sondeo_iniciado_en) > tope * 2:
+            # Sondeo huérfano: el hilo que lo lanzó murió sin liberarlo
+            # (no debería pasar nunca — hay un finally— pero si pasara,
+            # sin esto la app quedaría creyéndose offline para siempre).
+            evento = None
+    if evento is None:
+        return None
+
+    if evento.wait(timeout=tope):
+        return _resultado_ultimo_sondeo
+    logger.error(
+        "Un sondeo de conectividad lleva más de %.1fs sin terminar (el máximo que explica "
+        "connect_timeout x direcciones). Se da por caída la conexión para no dejar la "
+        "ventana esperando más.",
+        tope,
+    )
+    return False
 
 
 def marcar_sin_conexion():
@@ -422,7 +469,7 @@ def hay_conexion():
     la evidencia que hace falta para confirmar el diagnóstico en
     Windows, donde toda la app queda sin responder.
     """
-    global _sin_conexion_hasta, _sondeo_iniciado_en
+    global _sin_conexion_hasta, _sondeo_iniciado_en, _evento_sondeo, _resultado_ultimo_sondeo
 
     # Sin configuración de nube legible (falta el .env junto al .exe):
     # nunca hay conexión y no tiene sentido sondear la red ni una sola
@@ -434,22 +481,33 @@ def hay_conexion():
 
     # Resultado negativo reciente: se reutiliza sin volver a sondear, para
     # no pagar el connect_timeout en cada request (ver
-    # SEGUNDOS_CACHE_SIN_CONEXION).
-    ahora = time.monotonic()
-    if ahora < _sin_conexion_hasta:
-        return False
-
-    # Si otro hilo lleva rato averiguándolo, no se lanza un sondeo más:
-    # se responde con lo que ya se sabe. Ver
-    # SEGUNDOS_PARA_ASUMIR_CAIDA_EN_SONDEO.
+    # SEGUNDOS_CACHE_SIN_CONEXION). Esto es un HECHO —un sondeo que
+    # falló—, no una conjetura.
     if sin_conexion_reciente():
         return False
 
+    # ¿Ya hay alguien sondeando? Entonces se espera SU resultado en vez
+    # de abrir un segundo intento en paralelo (prompt 33d). Un solo hilo
+    # sondea; los demás se enteran de lo que de verdad pasó.
     conexion = connections["default"]
     inicio = time.monotonic()
-    exito = False
     with _lock_cache_conexion:
-        _sondeo_iniciado_en = inicio
+        if _evento_sondeo is not None:
+            soy_quien_sondea = False
+        else:
+            _evento_sondeo = threading.Event()
+            _sondeo_iniciado_en = inicio
+            soy_quien_sondea = True
+
+    if not soy_quien_sondea:
+        resultado = esperar_sondeo_en_curso()
+        if resultado is not None:
+            return bool(resultado)
+        # El sondeo terminó justo entre las dos comprobaciones: su
+        # resultado ya quedó guardado, no hace falta sondear de nuevo.
+        return _resultado_ultimo_sondeo
+
+    exito = False
     _local.sondeando = True
     try:
         _reciclar_conexion_remota()
@@ -469,6 +527,7 @@ def hay_conexion():
         _local.sondeando = False
         with _lock_cache_conexion:
             _sondeo_iniciado_en = 0.0
+            _resultado_ultimo_sondeo = exito
             if exito:
                 # Un "sí hay conexión" nunca se cachea: si la red se cae
                 # justo después, la operación real falla y el manejo de
@@ -484,6 +543,37 @@ def hay_conexion():
                 # siempre más barato que no averiguarlo.
                 margen = max(SEGUNDOS_CACHE_SIN_CONEXION, duracion * 2)
                 _sin_conexion_hasta = time.monotonic() + margen
+            evento_a_liberar = _evento_sondeo
+            _evento_sondeo = None
+        if evento_a_liberar is not None:
+            # Despertar a todos los que estaban esperando ESTE resultado.
+            evento_a_liberar.set()
+
+        # Un sondeo FALLIDO ya no es silencioso (prompt 33d). Antes solo
+        # se registraba si superaba umbral_sondeo_lento() (13.5s con la
+        # configuración de entonces), y un fallo por timeout tardaba ~9s
+        # — o sea que el caso que de verdad importaba no dejaba ni una
+        # línea en el log, y por eso fue imposible verlo desde la VM.
+        if not exito:
+            logger.warning(
+                "SONDEO DE CONECTIVIDAD FALLIDO en %.2fs (connect_timeout=%ss POR "
+                "DIRECCIÓN IP). Se marca 'sin conexión' por %.0fs: durante ese margen los "
+                "logins se resolverán contra la caché local. Si esto aparece con internet "
+                "funcionando, el connect_timeout se está quedando corto para esta red — "
+                "súbelo con DB_CONNECT_TIMEOUT en el .env.",
+                duracion, _connect_timeout_configurado(),
+                max(SEGUNDOS_CACHE_SIN_CONEXION, duracion * 2),
+            )
+        elif duracion >= SEGUNDOS_SONDEO_NOTABLE:
+            # Un sondeo sano pero lento es la señal temprana de que este
+            # equipo está cerca del límite: se registra para poder ajustar
+            # DB_CONNECT_TIMEOUT antes de que empiece a fallar.
+            logger.info(
+                "Sondeo de conectividad OK pero lento: %.2fs (connect_timeout=%ss). "
+                "Si se acerca al connect_timeout, súbelo con DB_CONNECT_TIMEOUT en el .env.",
+                duracion, _connect_timeout_configurado(),
+            )
+
         umbral = umbral_sondeo_lento()
         if duracion >= umbral:
             logger.error(
