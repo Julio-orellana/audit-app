@@ -10,6 +10,21 @@ from .forms import ConteoFisicoForm, LoteCompraForm, MovimientoSalidaForm
 from .models import Categoria, ConteoFisico, LoteCompra, MovimientoSalida, Producto
 
 
+def _es_postgres(engine):
+    """
+    ¿Este ENGINE habla Postgres?
+
+    No basta con comparar contra "django.db.backends.postgresql": desde
+    el prompt 33c la app usa un backend propio
+    ("inventario.db_backend") que es ese mismo backend más un corto para
+    no reintentar la red cuando ya consta que está caída. Comparar por
+    igualdad hacía que TRES pruebas específicas de Postgres se saltaran
+    siempre, en silencio y también contra Neon — o sea que dejaban de
+    proteger nada sin que nadie se enterara.
+    """
+    return engine in ("django.db.backends.postgresql", "inventario.db_backend")
+
+
 class HistorialCompletoTests(TestCase):
     """
     Blinda que la vista de historial (inventario/urls.py -> "historial")
@@ -438,7 +453,7 @@ class ConectividadTests(SimpleTestCase):
         # costar tiempo.
         from django.db import connections
 
-        if connections["default"].settings_dict["ENGINE"] != "django.db.backends.postgresql":
+        if not _es_postgres(connections["default"].settings_dict["ENGINE"]):
             self.skipTest(
                 "Solo aplica contra Postgres/Neon: SQLite no tiene socket ni host que tumbar."
             )
@@ -509,6 +524,48 @@ class ConectividadTests(SimpleTestCase):
         # que es lo que esta prueba mide.
         reiniciar_cache_conexion()
         self.assertTrue(hay_conexion())
+
+    def test_ninguna_consulta_reintenta_la_red_cuando_ya_consta_que_no_hay(self):
+        """
+        Prompt 33c: el corto tiene que estar en la CAPA DE CONEXIÓN, no
+        en cada vista.
+
+        Arreglar get_user() bajó el costo de muchas páginas, pero no de
+        todas: cualquier consulta directa al ORM abría su propio intento
+        y pagaba el timeout entero sin enterarse de que otro hilo ya
+        había comprobado que no hay red. Medido en la VM de Windows, con
+        connect_timeout=3 y un host que resuelve a 3 direcciones (9.2s
+        por intento):
+
+            28506ms  GET 503  /correcciones/
+            27660ms  GET 503  /salidas/176/editar/
+            19450ms  POST 302 /login/
+
+        O sea hasta TRES intentos dentro de una sola request. Esta
+        prueba fija que, con la caché marcada, una consulta cualquiera
+        falle al instante en vez de salir a la red.
+        """
+        import time
+
+        from django.db import connections
+        from django.db.utils import OperationalError
+
+        from .offline import marcar_sin_conexion
+
+        conexion = connections["default"]
+        conexion.close()
+        self.addCleanup(conexion.close)
+        marcar_sin_conexion()
+        inicio = time.monotonic()
+        with self.assertRaises(OperationalError):
+            conexion.ensure_connection()
+        duracion = time.monotonic() - inicio
+
+        self.assertLess(
+            duracion, 0.5,
+            f"El intento tardó {duracion:.2f}s: se salió a la red aunque ya constaba que "
+            "no hay conexión. Eso es lo que dejaba páginas de 28 segundos.",
+        )
 
     def test_dentro_de_una_transaccion_no_se_toca_la_conexion(self):
         """
@@ -1400,7 +1457,7 @@ class ConfiguracionNubeAusenteTests(SimpleTestCase):
         from django.conf import settings
 
         cfg = settings.DATABASES["default"]
-        if cfg["ENGINE"] != "django.db.backends.postgresql":
+        if not _es_postgres(cfg["ENGINE"]):
             self.skipTest("Solo aplica corriendo contra Postgres/Neon (hay .env configurado).")
 
         opciones = cfg.get("OPTIONS") or {}

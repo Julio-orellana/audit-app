@@ -260,14 +260,24 @@ Con la red cortada, y **cronómetro en mano**:
 - [ ] Deja el Inicio abierto 2 minutos sin tocar nada (el tablero
       consulta el estado de sincronización cada 4 segundos). Al volver,
       el primer clic responde de inmediato.
-- [ ] Anota la espera más larga que hayas visto, en segundos: **____ s**.
-      Referencia medida en Mac con la base inalcanzable de verdad (una IP
-      que descarta paquetes, no un puerto que rechaza): de 57 páginas
-      cargadas con los 3 roles, **56 tardaron 0.02 s o menos** y **una
-      sola tardó 3.04 s** — la primera después de caerse la red, que es
-      la que descubre el corte. Si en Windows ves esperas de 3 s
-      repetidas, o cualquiera por encima de ~6 s, anótalo: no es lo
-      esperado.
+- [ ] **No te fíes de la sensación: mira los números.** La primera vuelta
+      de esta prueba se sintió "aceptable" y el log decía 28 segundos —
+      la ventana seguía respondiendo, así que el problema no se notaba
+      pero estaba. Corre esto en PowerShell dentro de
+      `dist\AuditoriaAylupita` y anota los 5 números:
+
+      ```powershell
+      Select-String "TIEMPO" diagnostico.log | ForEach-Object { if ($_ -match "TIEMPO\s+(\d+)ms") { [int]$matches[1] } } | Sort-Object -Descending | Select-Object -First 5
+      ```
+
+      Referencia medida con la base inalcanzable de verdad: de 57 páginas
+      con los 3 roles, **todas por debajo de 0.02 s**, y la request más
+      lenta del servidor en 179 ms. El sondeo que descubre el corte lo
+      paga el hilo de sincronización en segundo plano, no la página que
+      estás mirando.
+
+      Cualquier página por encima de **1 segundo** aquí es algo que hay
+      que mirar, no "aceptable".
 - [ ] Busca en `diagnostico.log` la línea `hay_conexion() tardó`. Si
       aparece, anota el número: significa que un sondeo pasó de 5 s, o
       sea que el `connect_timeout` no se está respetando.
@@ -285,11 +295,13 @@ Con la red cortada, y **cronómetro en mano**:
 
 ### Cómo se ve un problema en el log
 
-- `hay_conexion() tardó XX.XXs` → un sondeo pasó de 5 segundos, o sea
-  que el `connect_timeout=3` no se está respetando (OPTIONS que no llegó
-  al driver, o un DNS colgado antes de la conexión). Con un corte de red
-  normal esta línea **no debe aparecer**: medido contra una IP que
-  descarta paquetes, cada intento falla en 3.03 s.
+- `hay_conexion() tardó XX.XXs, por encima de los YY.Ys que explica la
+  configuración` → el umbral ya no es un número fijo: se calcula como
+  `connect_timeout × direcciones IP del host`, con margen, así que se
+  ajusta solo en cada equipo. Si esta línea aparece, el sondeo tardó más
+  de lo que la configuración puede explicar: `OPTIONS` que no llegó al
+  driver, DNS colgado antes de conectar, o el proceso trabado. Un corte
+  de red normal **ya no dispara esta línea**.
 - `PRUEBA DE ESCRITURA ... FALLÓ` → la app no puede escribir junto al
   `.exe` (permisos de Windows, o Control de acceso a carpetas de
   Windows Defender). Nada se guardaría.

@@ -69,20 +69,66 @@ ERRORES_DE_CONEXION = (OperationalError, InterfaceError)
 # tres roles desde el prompt 19b.
 ALIAS_LOCAL = "local_disco"
 
-# Un sondeo de conectividad que tarde más que esto es, por sí solo, la
-# explicación de que la app quede "insensible" (prompt 33): se registra
-# como error para que quede en el log del equipo donde pasó.
+# Un sondeo de conectividad que tarde más que lo esperable es, por sí
+# solo, la explicación de que la app quede "insensible" (prompt 33): se
+# registra como error para que quede en el log del equipo donde pasó.
 #
-# 5.0 y no 3.0 a propósito (prompt 33c): con connect_timeout=3 en
-# DATABASES["default"]["OPTIONS"], un corte de red REAL falla en ~3.03s
-# — medido contra una IP que descarta paquetes (192.0.2.1). Con el
-# umbral en 3.0, ese caso NORMAL y ya resuelto disparaba un ERROR en
-# cada sondeo, o sea ruido justo en el log que sirve para diagnosticar.
-# Por encima de 5s sí queda un síntoma real: significa que el
-# connect_timeout no se está respetando (OPTIONS que no llegó al
-# driver, un DNS colgado antes de la conexión, o el disco/GIL trabado),
-# que es exactamente lo que hay que ver en el log.
-UMBRAL_SONDEO_LENTO_SEGUNDOS = 5.0
+# El umbral se CALCULA, no se fija a mano, y esa es la corrección del
+# prompt 33c. Lo tuve primero en 3.0 y luego en 5.0, y las dos veces
+# estuvo mal por la misma razón: connect_timeout de libpq es POR
+# DIRECCIÓN IP, no total. En la VM de Windows el host de Neon resuelve a
+# 3 direcciones, así que un corte de red perfectamente normal costaba
+# 3 x 3s = 9.2s y disparaba un ERROR en CADA sondeo — ruido justo en el
+# archivo que sirve para diagnosticar, y encima ruido que parece grave.
+# Yo lo había medido en Mac contra una IP única y por eso no vi el
+# multiplicador.
+#
+# Ahora se deriva de la configuración real (connect_timeout x
+# direcciones, con margen), así que se ajusta solo en cualquier equipo y
+# solo grita cuando de verdad pasa algo que la configuración no explica:
+# un OPTIONS que no llegó al driver, un DNS colgado antes de conectar, o
+# el proceso trabado.
+_MARGEN_UMBRAL_SONDEO = 1.5     # 50% de holgura sobre lo esperable
+_PISO_UMBRAL_SONDEO = 5.0       # nunca alarmar por debajo de esto
+_TECHO_UMBRAL_SONDEO = 60.0     # ni callar por encima de esto
+_umbral_sondeo_lento = None
+
+
+def umbral_sondeo_lento():
+    """
+    Cuántos segundos puede tardar un sondeo ANTES de que sea un síntoma.
+
+    Se resuelve una sola vez por proceso y se guarda: hay_conexion() se
+    llama en casi toda request, así que esto no puede costar una consulta
+    de DNS cada vez. La cantidad de direcciones de un host no cambia en
+    la vida de un proceso lo bastante como para justificar el gasto.
+    """
+    global _umbral_sondeo_lento
+    if _umbral_sondeo_lento is not None:
+        return _umbral_sondeo_lento
+
+    esperable = _PISO_UMBRAL_SONDEO
+    try:
+        cfg = settings.DATABASES["default"]
+        timeout = float((cfg.get("OPTIONS") or {}).get("connect_timeout") or 0)
+        if timeout > 0:
+            direcciones = 1
+            try:
+                import socket
+
+                infos = socket.getaddrinfo(cfg.get("HOST"), None, type=socket.SOCK_STREAM)
+                direcciones = max(1, len({i[4][0] for i in infos}))
+            except Exception:
+                # Sin DNS no se puede saber; se asume el caso típico de
+                # Neon (varias direcciones) en vez de una, para no volver
+                # a llenar el log de falsas alarmas.
+                direcciones = 3
+            esperable = timeout * direcciones * _MARGEN_UMBRAL_SONDEO
+    except Exception:
+        pass
+
+    _umbral_sondeo_lento = max(_PISO_UMBRAL_SONDEO, min(esperable, _TECHO_UMBRAL_SONDEO))
+    return _umbral_sondeo_lento
 
 # Cuánto se reutiliza el resultado de un sondeo de conectividad antes de
 # volver a preguntar de verdad (prompt 33). hay_conexion() se llama en
@@ -341,12 +387,14 @@ def hay_conexion():
                 _sin_conexion_hasta = 0.0
             else:
                 _sin_conexion_hasta = time.monotonic() + SEGUNDOS_CACHE_SIN_CONEXION
-        if duracion >= UMBRAL_SONDEO_LENTO_SEGUNDOS:
+        umbral = umbral_sondeo_lento()
+        if duracion >= umbral:
             logger.error(
-                "hay_conexion() tardó %.2fs (umbral %.1fs). Con waitress en 4 hilos, "
-                "unos pocos sondeos así de lentos dejan la app entera sin responder — "
-                "ver el diagnóstico del prompt 33.",
-                duracion, UMBRAL_SONDEO_LENTO_SEGUNDOS,
+                "hay_conexion() tardó %.2fs, por encima de los %.1fs que explica la "
+                "configuración (connect_timeout x direcciones del host, con margen). Con "
+                "waitress en 4 hilos, unos pocos sondeos así de lentos dejan la app entera "
+                "sin responder — ver el diagnóstico del prompt 33.",
+                duracion, umbral,
             )
 
 

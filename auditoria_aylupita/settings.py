@@ -288,6 +288,12 @@ _config_nube, _motivo_bd_no_configurada = _interpretar_url_de_nube(_url_para_con
 
 if _config_nube is not None:
     DATABASES = {"default": _config_nube}
+    # Backend propio (prompt 33c): es PostgreSQL de siempre, más un
+    # corto que evita reintentar la red cuando ya consta que está
+    # caída. Ver inventario/db_backend/base.py — sin esto, una sola
+    # página sin conexión llegaba a pagar el timeout tres veces
+    # seguidas (27.6s medidos en la VM de Windows).
+    DATABASES["default"]["ENGINE"] = "inventario.db_backend"
     # Detecta una conexión persistente muerta (ej. el cómputo serverless de
     # Neon se suspendió por inactividad) y la reabre en vez de fallar la
     # siguiente request — dj_database_url.parse() no siempre expone este
@@ -407,7 +413,7 @@ elif esta_empaquetado() or _database_url:
     # (ver context_processors.py y templates/base.html).
     DATABASES = {
         "default": {
-            "ENGINE": "django.db.backends.postgresql",
+            "ENGINE": "inventario.db_backend",
             "NAME": "no_configurada",
             "HOST": "base-de-datos-no-configurada.invalid",
             "USER": "",
