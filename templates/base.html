@@ -31,18 +31,90 @@
       a:hover{color:var(--accent); text-decoration:underline;}
       .num{font-variant-numeric:tabular-nums;}
 
-      /* Navbar */
+      /* Navbar (prompt 36: responsivo de verdad)
+         ------------------------------------------------------------
+         Medido antes de tocar nada: con el rol admin (8 enlaces) el
+         ancho natural de marca + enlaces + acciones de la derecha es
+         ~1443px. Cualquier laptop típica (1440x900, 1366x768) queda por
+         DEBAJO de eso, y el escalado de Windows (125%/150%) reduce el
+         ancho EFECTIVO en píxeles CSS todavía más — a 1366x768 con
+         125% son ~1093px CSS, con 150% ~911px. El diseño anterior no
+         tenía ni un solo media query: cuando el contenido no cabía,
+         .app-nav-links (con flex-wrap:wrap) pasaba a una segunda o
+         tercera línea, pero .app-navbar tenía height:64px FIJO — así
+         que esas líneas de más no empujaban el contenido de abajo,
+         sino que se dibujaban encimadas sobre él. Eso es el
+         "traslape" reportado.
+
+         Arreglo: por debajo del umbral (~1850px), los enlaces y las acciones de
+         la derecha se colapsan en un panel que abre un botón
+         hamburguesa (patrón estándar, usando el Collapse de Bootstrap
+         que este proyecto ya carga). El panel es contenido normal del
+         documento —nunca position:absolute/fixed— así que cuando se
+         abre, EMPUJA hacia abajo lo que sigue en vez de superponerse.
+         Por encima del umbral se ve exactamente igual que antes: una
+         sola fila, sin cambios visuales para quien ya lo veía bien. */
       .app-navbar{
-        display:flex; align-items:center; justify-content:space-between;
-        height:64px; padding:0 32px; background:var(--navy); color:#fff;
+        display:flex; flex-wrap:wrap; align-items:center; flex-shrink:0;
+        padding:17px 32px; background:var(--navy); color:#fff;
+        /* SIN min-height a propósito: probado en vivo que en un
+           contenedor flex con flex-wrap:wrap, min-height numérico podía
+           quedar involucrado en el mismo problema de abajo de forma
+           confusa — padding suma siempre al alto natural del contenido
+           sin ese riesgo, y con 17px arriba/abajo da los mismos ~64px de
+           antes en la fila de una sola línea (marca + botón).
+
+           flex-shrink:0 es la pieza que de verdad importa, y la causa
+           real del "traslape": <body> es display:flex con
+           flex-direction:column (ver más abajo, para que el footer
+           quede siempre al fondo). Eso vuelve a <nav> un ÍTEM flex, y
+           por defecto los ítems flex SÍ pueden encogerse (flex-shrink:1
+           heredado de "flex:0 1 auto"). Con el panel colapsable abierto
+           el contenido total (navbar+página+footer) supera el alto de
+           la ventana, y sin esto el navegador ENCOGÍA el navbar de
+           vuelta a su alto de una sola línea (64px) para que todo
+           cupiera en el viewport — con el panel, ya abierto, dibujado
+           por encima de esos 64px en vez de empujar la página. Medido:
+           sin flex-shrink:0 el navbar con el panel abierto medía 64px
+           de alto pese a tener 567px de contenido real; con
+           flex-shrink:0, mide los 567px reales y la página se desplaza
+           hacia abajo como corresponde. El footer (ver .app-footer más
+           abajo) ya tenía este mismo blindaje desde antes — el navbar
+           nunca lo había necesitado porque nunca había crecido más allá
+           del alto de la ventana. */
       }
       .app-navbar .brand{
         display:flex; align-items:center; gap:10px; font-weight:800; font-size:17px;
-        letter-spacing:.2px; color:#fff;
+        letter-spacing:.2px; color:#fff; flex:0 1 auto; min-width:0;
       }
       .app-navbar .brand:hover{color:#fff; text-decoration:none;}
       .app-navbar .brand .accent-word{color:oklch(75% 0.11 55);}
-      .app-nav-links{display:flex; align-items:center; gap:26px; margin-left:36px; flex-wrap:wrap;}
+
+      /* Botón hamburguesa: invisible en pantallas anchas (el panel se ve
+         siempre, en línea); visible solo cuando el panel puede colapsar. */
+      .navbar-toggle{
+        display:none; align-items:center; justify-content:center;
+        width:44px; height:44px; flex:0 0 auto; margin-left:auto;
+        background:rgba(255,255,255,.1); border:1px solid rgba(255,255,255,.2);
+        border-radius:8px; color:#fff; cursor:pointer;
+      }
+      .navbar-toggle:hover{background:rgba(255,255,255,.18);}
+      .navbar-toggle:focus-visible{outline:2px solid #fff; outline-offset:2px;}
+      .navbar-toggle .icon-close{display:none;}
+      .navbar-toggle[aria-expanded="true"] .icon-open{display:none;}
+      .navbar-toggle[aria-expanded="true"] .icon-close{display:block;}
+
+      /* El panel: en pantallas anchas es una fila más del mismo navbar
+         (mismo aspecto que la versión anterior). Bootstrap le pone
+         display:none vía su clase .collapse cuando no tiene .show — se
+         fuerza a visible aquí porque en este ancho el botón que lo
+         controla ni siquiera se muestra. */
+      .app-navbar-menu.collapse{display:flex !important; height:auto !important;}
+      .app-navbar-menu{
+        display:flex; align-items:center; justify-content:space-between;
+        flex:1 1 auto; min-width:0; gap:20px; margin-left:36px;
+      }
+      .app-nav-links{display:flex; align-items:center; gap:26px; flex-wrap:wrap;}
       .app-nav-links a{
         color:rgba(255,255,255,.72); font-size:14.5px; font-weight:500; white-space:nowrap;
       }
@@ -51,8 +123,40 @@
         display:flex; align-items:center; gap:6px; color:oklch(82% 0.09 60); font-weight:700;
       }
       .app-nav-links a.help-link:hover{color:oklch(88% 0.09 60);}
-      .app-navbar-right{display:flex; align-items:center; gap:14px; font-size:14px;}
+      .app-navbar-right{display:flex; align-items:center; gap:14px; font-size:14px; flex:0 0 auto;}
       .app-navbar-right .username{color:rgba(255,255,255,.7);}
+
+      @media (max-width: 1849.98px){
+        /* El umbral se midió, no se adivinó (prompt 36): con el rol
+           admin, el indicador de pendientes de sincronizar visible y un
+           nombre de usuario largo ("Administrador"), el ancho natural de
+           una sola fila llega a ~1735px. 1850px deja margen de sobra
+           incluso para eso — se prefiere colapsar de más (nunca hace
+           daño) que dejar un caso real sin cubrir. */
+        .navbar-toggle{display:inline-flex;}
+        /* flex-basis:100% es el truco que fuerza el salto de línea: el
+           panel pasa a ocupar toda la fila siguiente en vez de intentar
+           compartir la primera con la marca y el botón. */
+        .app-navbar-menu.collapse{display:none !important;}
+        .app-navbar-menu.collapse.show{display:flex !important;}
+        .app-navbar-menu{
+          flex-basis:100%; flex-direction:column; align-items:stretch;
+          justify-content:flex-start; margin-left:0; gap:18px;
+          margin-top:14px; padding-top:16px; border-top:1px solid rgba(255,255,255,.14);
+        }
+        .app-nav-links{flex-direction:column; align-items:stretch; gap:2px;}
+        .app-nav-links a{padding:11px 4px; width:100%;}
+        /* Ojo: ESTAS DOS reglas van con el prefijo "#navbarMenu " a
+           propósito (prompt 36) — .app-navbar-right también es la clase
+           del botón "Entrar" cuando NO hay sesión iniciada (fuera del
+           panel colapsable, siempre en la misma fila que la marca). Sin
+           el prefijo, width:100% hacía que ese contenedor reclamara TODA
+           la fila y el botón "Entrar" se iba solo a una segunda línea,
+           sin ninguna razón de espacio real — comprobado en la vista sin
+           sesión. */
+        #navbarMenu .app-navbar-right{flex-wrap:wrap; width:100%; gap:12px;}
+        #navbarMenu .app-navbar-right form{width:auto;}
+      }
       .btn-nav-exit{
         background:rgba(255,255,255,.1); border:1px solid rgba(255,255,255,.2); color:#fff;
         padding:0 18px; min-height:44px; border-radius:8px; font-size:13.5px; font-weight:600;
@@ -122,12 +226,27 @@
 </head>
 <body>
 <nav class="app-navbar">
-  <div style="display:flex;align-items:center;">
-    <a class="brand" href="{% url 'home' %}">
-      <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M8 2h8l1 5-1 3v10a2 2 0 0 1-2 2H10a2 2 0 0 1-2-2V10L7 7z"/><path d="M8 10h8"/></svg>
-      Auditoría <span class="accent-word">¡Ay Lupita!</span>
-    </a>
-    {% if user.is_authenticated %}
+  <a class="brand" href="{% url 'home' %}">
+    <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M8 2h8l1 5-1 3v10a2 2 0 0 1-2 2H10a2 2 0 0 1-2-2V10L7 7z"/><path d="M8 10h8"/></svg>
+    Auditoría <span class="accent-word">¡Ay Lupita!</span>
+  </a>
+
+  {% if user.is_authenticated %}
+  {% comment %}
+    Botón hamburguesa (prompt 36): invisible por encima del umbral (~1850px) de
+    ancho —ahí el panel de abajo se ve siempre, en línea, igual que
+    antes—, visible por debajo. data-bs-toggle/data-bs-target son de
+    Bootstrap: el bundle.js ya cargado al final de esta página trae su
+    componente Collapse, que hace el show/hide con animación y sincroniza
+    aria-expanded solo — no hace falta escribir JS propio para esto.
+  {% endcomment %}
+  <button type="button" class="navbar-toggle" data-bs-toggle="collapse" data-bs-target="#navbarMenu"
+          aria-expanded="false" aria-controls="navbarMenu" aria-label="Abrir menú de navegación">
+    <svg class="icon-open" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M3 6h18M3 12h18M3 18h18"/></svg>
+    <svg class="icon-close" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M18 6 6 18M6 6l12 12"/></svg>
+  </button>
+
+  <div class="app-navbar-menu collapse" id="navbarMenu">
     <div class="app-nav-links">
       <a href="{% url 'home' %}">Inicio</a>
       {% if rol_usuario != "vendedor" %}
@@ -146,10 +265,7 @@
         Instrucciones
       </a>
     </div>
-    {% endif %}
-  </div>
-  <div class="app-navbar-right">
-    {% if user.is_authenticated %}
+    <div class="app-navbar-right">
       <button type="button" class="btn-nav-exit" onclick="window.location.reload()" title="Recargar los datos de esta pantalla — funciona con o sin conexión">
         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round" style="margin-right:6px;"><path d="M23 4v6h-6"/><path d="M1 20v-6h6"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10"/><path d="M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>
         Refrescar
@@ -172,10 +288,13 @@
         {% csrf_token %}
         <button class="btn-nav-exit" type="submit">Salir</button>
       </form>
-    {% else %}
-      <a class="btn-nav-enter" href="{% url 'login' %}">Entrar</a>
-    {% endif %}
+    </div>
   </div>
+  {% else %}
+  <div class="app-navbar-right" style="margin-left:auto;">
+    <a class="btn-nav-enter" href="{% url 'login' %}">Entrar</a>
+  </div>
+  {% endif %}
 </nav>
 
 <div class="app-page">
