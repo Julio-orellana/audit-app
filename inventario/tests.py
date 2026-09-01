@@ -1,4 +1,4 @@
-from datetime import date
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 
 from django.contrib.auth.models import Group, User
@@ -7,7 +7,16 @@ from django.test import SimpleTestCase, TestCase
 from django.urls import reverse
 
 from .forms import ConteoFisicoForm, LoteCompraForm, MovimientoSalidaForm
-from .models import Categoria, ConteoFisico, LoteCompra, MovimientoSalida, Producto
+from .discrepancias import resolver_discrepancia
+from .models import (
+    Categoria, ConteoFisico, DiscrepanciaInventario, LoteCompra, MovimientoSalida, Producto,
+)
+
+
+def _deserializar_valor_prueba(valor):
+    from .offline import _deserializar_valor
+
+    return _deserializar_valor(valor)
 
 
 def _es_postgres(engine):
@@ -1582,3 +1591,342 @@ class ConfiguracionNubeAusenteTests(SimpleTestCase):
         self.assertIn("connect_timeout", opciones, "Falta connect_timeout: ver el prompt 33.")
         self.assertLessEqual(opciones["connect_timeout"], 15)
         self.assertEqual(opciones.get("keepalives"), 1, "Faltan keepalives para detectar una conexión muerta.")
+
+
+class DiscrepanciasInventarioTests(TestCase):
+    """
+    Los cuatro escenarios del prompt 34, con los números exactos.
+
+    El fallo de fondo que blindan: el sistema comparaba un conteo físico
+    contra el stock teórico "de su fecha" —y `fecha` es un DateField, sin
+    hora— así que un conteo de las 15:03 se medía contra un teórico que ya
+    incluía una venta de las 15:05. La venta se contaba dos veces: una en
+    el teórico y otra en la realidad del piso. Encima, la discrepancia no
+    era un registro sino una resta en vivo, así que un movimiento
+    posterior podía hacerla desaparecer de la pantalla sin que nadie la
+    revisara.
+    """
+
+    databases = {"default", "local_disco"}
+
+    def setUp(self):
+        from django.utils import timezone as tz
+
+        self.hoy = date(2026, 8, 31)
+        categoria = Categoria.objects.create(nombre="Cervezas 34")
+        self.gallo = Producto.objects.create(
+            nombre="Gallo 34", categoria=categoria, precio_venta_actual=Decimal("15.00")
+        )
+        self.ruth = User.objects.create_user(username="ruth34", password="x")
+        self.michelle = User.objects.create_user(username="michelle34", password="x")
+        self.ventas = User.objects.create_user(username="ventas34", password="x")
+        self.tz = tz
+
+    def _instante(self, hora, minuto, segundo=0):
+        """Un instante del día de la prueba, en la zona del servidor."""
+        from django.utils import timezone as tz
+
+        ingenuo = datetime(self.hoy.year, self.hoy.month, self.hoy.day, hora, minuto, segundo)
+        return tz.make_aware(ingenuo, tz.get_current_timezone())
+
+    def _stock_inicial(self, cantidad, hora=8):
+        return LoteCompra.objects.create(
+            producto=self.gallo, fecha=self.hoy, cantidad=cantidad,
+            costo_unitario=Decimal("6.50"), registrado_por=self.ruth,
+            ocurrido_en=self._instante(hora, 0),
+        )
+
+    def _venta(self, cantidad, hora, minuto, segundo=0, usuario=None):
+        return MovimientoSalida.objects.create(
+            producto=self.gallo, fecha=self.hoy, tipo="venta", cantidad=cantidad,
+            precio_venta_unitario=Decimal("15.00"),
+            registrado_por=usuario or self.ruth,
+            ocurrido_en=self._instante(hora, minuto, segundo),
+        )
+
+    def _conteo(self, cantidad, hora, minuto, segundo=0, usuario=None):
+        return ConteoFisico.objects.create(
+            producto=self.gallo, fecha=self.hoy, cantidad_contada=cantidad,
+            registrado_por=usuario or self.michelle,
+            ocurrido_en=self._instante(hora, minuto, segundo),
+        )
+
+    # --- Escenario 1 ---------------------------------------------------
+
+    def test_escenario_1_el_ajuste_se_calcula_contra_el_momento_del_conteo(self):
+        """
+        430 inicial. Ruth vende 6 a las 15:05:30 CON conexión. Michelle
+        cuenta 425 a las 15:03:20 SIN conexión y sincroniza después.
+
+        Antes: 425 contra 424 (teórico del día, que ya descuenta la venta
+        de Ruth) = "+1 sobrante".
+        Correcto: 425 contra 430 (teórico a las 15:03:20) = "5 faltantes".
+        """
+        self._stock_inicial(430)
+        self.assertEqual(self.gallo.stock_teorico(), 430)
+
+        self._venta(6, 15, 5, 30, usuario=self.ruth)
+        conteo = self._conteo(425, 15, 3, 20, usuario=self.michelle)
+
+        # El número viejo, para que quede constancia de qué se corrigió.
+        self.assertEqual(
+            self.gallo.stock_teorico(hasta_fecha=self.hoy), 424,
+            "El teórico al cierre del día sí incluye la venta de Ruth — no es el ancla correcta.",
+        )
+
+        discrepancia = DiscrepanciaInventario.objects.get(conteo=conteo)
+        self.assertEqual(discrepancia.teorico_al_conteo, 430)
+        self.assertEqual(discrepancia.diferencia, -5, "Faltan 5, no sobra 1.")
+        self.assertEqual(discrepancia.estado, DiscrepanciaInventario.PENDIENTE)
+        self.assertIsNone(discrepancia.ajuste, "No se puede haber movido stock solo.")
+
+    # --- Escenario 2 ---------------------------------------------------
+
+    def test_escenario_2_ningun_ajuste_se_aplica_sin_una_persona(self):
+        """
+        Del escenario 1 no puede salir ningún movimiento de stock por su
+        cuenta: el ajuste parte de un número que un humano tiene que
+        confirmar primero.
+        """
+        self._stock_inicial(430)
+        self._venta(6, 15, 5, 30)
+        conteo = self._conteo(425, 15, 3, 20)
+
+        self.assertEqual(
+            MovimientoSalida.objects.filter(tipo="ajuste").count(), 0,
+            "El sistema generó un ajuste sin que nadie lo confirmara.",
+        )
+        self.assertIsNone(conteo.ajuste_generado_id)
+        self.assertEqual(self.gallo.stock_teorico(), 424, "El stock no debe haberse tocado.")
+
+        # Y cuando SÍ lo confirma una persona, se aplica lo que ella diga.
+        discrepancia = DiscrepanciaInventario.objects.get(conteo=conteo)
+        resolver_discrepancia(discrepancia, discrepancia.ajuste_sugerido, self.ruth, "Revisado")
+        discrepancia.refresh_from_db()
+
+        self.assertEqual(discrepancia.estado, DiscrepanciaInventario.RESUELTA)
+        self.assertEqual(discrepancia.cantidad_confirmada, 5, "Faltan 5: el ajuste RESTA 5.")
+        self.assertEqual(discrepancia.resuelta_por, self.ruth)
+        self.assertEqual(self.gallo.stock_teorico(), 419, "424 − 5 = 419.")
+
+    # --- Escenario 3 ---------------------------------------------------
+
+    def test_escenario_3_una_venta_posterior_no_resuelve_la_discrepancia(self):
+        """
+        Con la discrepancia abierta, Ventas registra 1 botella en otro
+        equipo. Antes la resta daba cero y la alerta desaparecía del
+        tablero sin que nadie la hubiera revisado.
+        """
+        self._stock_inicial(430)
+        self._venta(6, 15, 5, 30)
+        conteo = self._conteo(425, 15, 3, 20)
+        discrepancia = DiscrepanciaInventario.objects.get(conteo=conteo)
+        self.assertEqual(discrepancia.diferencia, -5)
+
+        self._venta(1, 16, 0, 0, usuario=self.ventas)
+
+        discrepancia.refresh_from_db()
+        self.assertEqual(
+            discrepancia.estado, DiscrepanciaInventario.PENDIENTE,
+            "La discrepancia se cerró sola por una venta posterior.",
+        )
+        self.assertEqual(
+            discrepancia.diferencia, -5,
+            "La diferencia congelada cambió: dejó de ser un registro y volvió a ser una resta.",
+        )
+        self.assertFalse(
+            discrepancia.requiere_revision,
+            "Una venta POSTERIOR al conteo no cambia su pasado: no hay nada que revisar.",
+        )
+        self.assertEqual(
+            DiscrepanciaInventario.objects.filter(estado=DiscrepanciaInventario.PENDIENTE).count(), 1,
+            "La discrepancia tiene que seguir visible como pendiente.",
+        )
+
+    # --- Escenario adicional: alertas acumuladas -----------------------
+
+    def test_escenario_acumulado_dos_discrepancias_no_se_pisan(self):
+        """
+        Teórico 427. Un conteo registra 430 (+3, sin resolver). Otro
+        registra 420, y debe dar −7 contra los 427 que le corresponden —
+        no −10, que es lo que salía cuando el ajuste de la primera alerta
+        ya había subido el teórico a 430.
+        """
+        self._stock_inicial(427)
+
+        conteo_a = self._conteo(430, 10, 0, 0)
+        discrepancia_a = DiscrepanciaInventario.objects.get(conteo=conteo_a)
+        self.assertEqual(discrepancia_a.diferencia, 3, "430 − 427 = +3 sobrantes.")
+
+        conteo_b = self._conteo(420, 15, 0, 0)
+        discrepancia_b = DiscrepanciaInventario.objects.get(conteo=conteo_b)
+        self.assertEqual(
+            discrepancia_b.diferencia, -7,
+            "La primera alerta sigue pendiente y no movió nada: el segundo conteo se compara "
+            "contra 427, no contra 430.",
+        )
+        self.assertEqual(discrepancia_a.diferencia, 3, "La primera no puede haber cambiado.")
+
+    def test_resolver_la_mas_antigua_marca_la_posterior_para_revisar(self):
+        """
+        Decisión 1 del diseño: resolver A (10:00) después de que B (15:00)
+        quedó congelada cambia el pasado de B. No se corrige solo — se
+        recalcula aparte y se marca, con el número viejo y el nuevo a la
+        vista.
+        """
+        self._stock_inicial(427)
+        conteo_a = self._conteo(430, 10, 0, 0)
+        conteo_b = self._conteo(420, 15, 0, 0)
+        discrepancia_a = DiscrepanciaInventario.objects.get(conteo=conteo_a)
+        discrepancia_b = DiscrepanciaInventario.objects.get(conteo=conteo_b)
+
+        resolver_discrepancia(discrepancia_a, discrepancia_a.ajuste_sugerido, self.ruth, "Sobrante confirmado")
+
+        discrepancia_b.refresh_from_db()
+        self.assertTrue(discrepancia_b.requiere_revision)
+        self.assertEqual(discrepancia_b.diferencia, -7, "El número original se conserva.")
+        self.assertEqual(discrepancia_b.diferencia_recalculada, -10, "Y el nuevo se guarda aparte.")
+        self.assertEqual(
+            discrepancia_b.estado, DiscrepanciaInventario.PENDIENTE,
+            "Marcar para revisar no es resolver.",
+        )
+        self.assertIn("#%d" % discrepancia_a.pk, discrepancia_b.motivo_revision)
+
+    def test_un_movimiento_con_fecha_hacia_atras_marca_las_discrepancias(self):
+        """
+        Decisión 2: mismo problema por otra puerta — alguien registra hoy
+        una compra con fecha anterior al conteo.
+        """
+        self._stock_inicial(427)
+        conteo = self._conteo(420, 15, 0, 0)
+        discrepancia = DiscrepanciaInventario.objects.get(conteo=conteo)
+        self.assertEqual(discrepancia.diferencia, -7)
+
+        LoteCompra.objects.create(
+            producto=self.gallo, fecha=self.hoy - timedelta(days=1), cantidad=10,
+            costo_unitario=Decimal("6.50"), registrado_por=self.ruth,
+            ocurrido_en=self._instante(17, 0),
+        )
+
+        discrepancia.refresh_from_db()
+        self.assertTrue(discrepancia.requiere_revision)
+        self.assertEqual(discrepancia.diferencia_recalculada, -17, "420 − 437 = −17.")
+
+    def test_un_reloj_adelantado_queda_marcado(self):
+        """
+        Decisión 4: no se corrige el reloj, pero un desfase imposible —un
+        registro creado DESPUÉS de haber sido recibido— queda marcado en
+        vez de reordenar el inventario en silencio.
+        """
+        from django.utils import timezone as tz
+
+        futuro = MovimientoSalida.objects.create(
+            producto=self.gallo, fecha=self.hoy, tipo="venta", cantidad=1,
+            precio_venta_unitario=Decimal("15.00"), registrado_por=self.ventas,
+            ocurrido_en=tz.now() + timedelta(hours=3),
+        )
+        normal = self._venta(1, 12, 0)
+
+        self.assertTrue(futuro.reloj_sospechoso, "Un instante en el futuro tiene que marcarse.")
+        self.assertFalse(normal.reloj_sospechoso)
+
+    def test_el_detalle_del_reporte_muestra_la_diferencia_congelada(self):
+        """
+        Lo encontró el Excel de este mismo prompt: el detalle del conteo
+        recalculaba la resta contra el stock ACTUAL, así que después de
+        aplicarle su propio ajuste un conteo cuya diferencia real era −5
+        aparecía como "+7" — un número sin ningún significado, dentro de
+        un reporte financiero.
+        """
+        from .services import movimientos_periodo
+
+        self._stock_inicial(430)
+        self._venta(6, 15, 5, 30)
+        conteo = self._conteo(425, 15, 3, 20)
+        discrepancia = DiscrepanciaInventario.objects.get(conteo=conteo)
+        resolver_discrepancia(discrepancia, discrepancia.ajuste_sugerido, self.ruth, "Faltante real")
+
+        filas = movimientos_periodo(self.hoy, self.hoy)
+        detalle_conteo = next(f["detalle"] for f in filas if f["tipo"] == "Conteo físico")
+
+        self.assertIn("Diferencia: -5", detalle_conteo)
+        self.assertNotIn("+7", detalle_conteo)
+        self.assertIn("ajuste aplicado (+5)", detalle_conteo)
+
+    def test_un_faltante_confirmado_aparece_en_el_reporte(self):
+        """
+        Un ajuste confirmado mueve producto real: tiene que verse en el
+        reporte. El resumen ya calculaba `unidades_ajuste` pero no lo
+        mostraba ni en pantalla ni en el Excel, así que un faltante
+        confirmado no aparecía por ninguna parte.
+        """
+        from .reportes import COLUMNAS_RESUMEN
+        from .services import resumen_producto
+
+        self._stock_inicial(430)
+        self._venta(6, 15, 5, 30)
+        conteo = self._conteo(425, 15, 3, 20)
+        discrepancia = DiscrepanciaInventario.objects.get(conteo=conteo)
+        resolver_discrepancia(discrepancia, discrepancia.ajuste_sugerido, self.ruth, "Faltante real")
+
+        resumen = resumen_producto(self.gallo, self.hoy, self.hoy)
+        self.assertEqual(resumen["unidades_ajuste"], -5)
+        self.assertEqual(resumen["stock_teorico_al_cierre"], 419, "430 − 6 − 5 = 419.")
+        self.assertIn(
+            "unidades_ajuste", [clave for _, clave in COLUMNAS_RESUMEN],
+            "El Excel no incluye la columna de ajustes, así que el faltante queda invisible.",
+        )
+
+    def test_un_conteo_registrado_sin_conexion_conserva_su_hora_real(self):
+        """
+        El caso del escenario 1, por el camino que de verdad lo produce.
+
+        La cola serializa la instancia ANTES de guardarla, así que en ese
+        momento ocurrido_en todavía es None. Sin fijarlo ahí, el payload
+        viaja sin instante y la fila que se crea al sincronizar se sella
+        con la hora de SINCRONIZACIÓN — el bug original de vuelta, y solo
+        en el camino offline, que es justo donde se manifiesta.
+        """
+        from django.utils import timezone as tz
+
+        from .models import PendienteSincronizacion
+        from .offline import encolar_pendiente
+
+        self._stock_inicial(430)
+
+        conteo_sin_guardar = ConteoFisico(
+            producto=self.gallo, fecha=self.hoy, cantidad_contada=425,
+            registrado_por=self.michelle,
+        )
+        self.assertIsNone(conteo_sin_guardar.ocurrido_en, "Antes de guardar no hay instante.")
+
+        antes = tz.now()
+        encolar_pendiente(conteo_sin_guardar)   # el código real, sin simular
+        despues = tz.now()
+
+        payload = PendienteSincronizacion.objects.using("local_disco").get(
+            uuid=conteo_sin_guardar.uuid
+        ).payload
+        self.assertIsNotNone(
+            payload.get("ocurrido_en"),
+            "El instante no viaja en la cola: la fila remota se sellaría con la hora de "
+            "sincronización, que es exactamente el bug del escenario 1.",
+        )
+        instante = _deserializar_valor_prueba(payload["ocurrido_en"])
+        self.assertTrue(
+            antes <= instante <= despues,
+            "El instante encolado no es el momento en que la persona registró el conteo.",
+        )
+
+        # Y al reconstruirlo del otro lado, se respeta. Se deserializa
+        # el payload entero igual que en la sincronización real.
+        from .offline import _deserializar_valor
+
+        kwargs = {clave: _deserializar_valor(valor) for clave, valor in payload.items()}
+        recreado = ConteoFisico.objects.create(**kwargs)
+        self.assertEqual(
+            recreado.ocurrido_en, instante,
+            "Al sincronizar se perdió la hora real y quedó la de sincronización.",
+        )
+        discrepancia = DiscrepanciaInventario.objects.get(conteo=recreado)
+        self.assertEqual(discrepancia.teorico_al_conteo, 430)

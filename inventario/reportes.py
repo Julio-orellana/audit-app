@@ -33,6 +33,15 @@ COLUMNAS_RESUMEN = [
     ("Ganancia bruta", "ganancia_bruta"),
     ("Unidades merma", "unidades_merma"),
     ("Pérdida por merma", "perdida_por_merma"),
+    # Ajustes de inventario confirmados en el período (prompt 34). Con
+    # signo: negativo = faltante encontrado al contar, positivo =
+    # sobrante. El resumen ya calculaba este número pero no lo mostraba
+    # en ningún lado, así que un faltante confirmado —una pérdida real de
+    # producto— no aparecía en el reporte por ninguna parte. No entra en
+    # la ganancia neta a propósito: un ajuste corrige un error de
+    # registro, y darlo por pérdida sin más mezclaría dos cosas
+    # distintas. Queda como columna propia para que se vea y se decida.
+    ("Unidades ajuste", "unidades_ajuste"),
     ("Ganancia neta", "ganancia_neta"),
     ("Stock teórico al cierre", "stock_teorico_al_cierre"),
 ]

@@ -23,6 +23,10 @@ urlpatterns = [
     path("conteos/<int:pk>/generar-ajuste/", views.generar_ajuste, name="conteofisico_generar_ajuste"),
     path("conteos/<int:pk>/editar/", views.ConteoFisicoCorreccionUpdateView.as_view(), name="conteofisico_correccion_editar"),
     path("conteos/<int:pk>/eliminar/", views.ConteoFisicoCorreccionDeleteView.as_view(), name="conteofisico_correccion_eliminar"),
+    # Discrepancias de inventario (prompt 34): reemplazan al botón de
+    # "generar ajuste", que aplicaba un ajuste de un clic sin revisión.
+    path("discrepancias/", views.DiscrepanciaListView.as_view(), name="discrepancias"),
+    path("discrepancias/<int:pk>/", views.DiscrepanciaResolverView.as_view(), name="discrepancia_resolver"),
     path("historial/", views.HistorialView.as_view(), name="historial"),
     path("correcciones/", views.CorreccionHistorialListView.as_view(), name="correcciones_historial"),
     path("reportes/", views.ReporteView.as_view(), name="reportes"),

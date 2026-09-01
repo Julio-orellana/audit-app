@@ -24,16 +24,29 @@
     {% endif %}
   </table>
 
-  {% if conteo.ajuste_generado %}
-    <div class="alert alert-secondary">Ya se generó un ajuste para este conteo: {{ conteo.ajuste_generado }}</div>
-  {% elif conteo.diferencia != 0 %}
-    <form method="post" action="{% url 'conteofisico_generar_ajuste' conteo.pk %}">
-      {% csrf_token %}
-      <button type="submit" class="btn" style="background:var(--danger);color:#fff;">Generar ajuste</button>
-    </form>
-    <p style="color:var(--ink-faint);font-size:13px;margin:10px 0 0;">
-      Corrige el stock teórico para que coincida con el conteo físico, sea que haya sobrado o faltado producto.
-    </p>
+  {% comment %}
+    Prompt 34: aquí había un botón "Generar ajuste" que aplicaba el ajuste
+    de un clic, con la diferencia recalculada en ese momento y sin mostrar
+    qué había pasado entre el conteo y ahora. Ahora lleva a la pantalla de
+    revisión, donde se ve el contexto completo y la cantidad se confirma a
+    mano.
+  {% endcomment %}
+  {% if conteo.discrepancia %}
+    {% if conteo.discrepancia.esta_pendiente %}
+      <a href="{% url 'discrepancia_resolver' conteo.discrepancia.pk %}" class="btn" style="background:var(--accent);color:#fff;">
+        Revisar esta diferencia
+      </a>
+      <p style="color:var(--ink-faint);font-size:13px;margin:10px 0 0;">
+        Antes de ajustar nada verás el stock teórico del momento exacto del conteo y todos los
+        movimientos que se registraron después.
+      </p>
+    {% else %}
+      <div class="alert alert-secondary">
+        Diferencia ya revisada
+        {% if conteo.discrepancia.resuelta_por %}por {{ conteo.discrepancia.resuelta_por }}{% endif %}.
+        <a href="{% url 'discrepancia_resolver' conteo.discrepancia.pk %}">Ver el detalle</a>
+      </div>
+    {% endif %}
   {% endif %}
 
   <a href="{% url 'historial' %}" class="btn btn-link mt-3" style="padding-left:0;">Ver historial</a>

@@ -425,22 +425,38 @@ def movimientos_periodo(fecha_inicio, fecha_fin, productos=None, descendente=Tru
 
     conteos = list(conteos_qs)
     if conteos:
-        # MotorStockCosto se construye UNA vez (3 consultas fijas) y
-        # resuelve conteo.diferencia para cada conteo en memoria — antes,
-        # la property ConteoFisico.diferencia disparaba su propio
-        # stock_teorico(hasta_fecha=...) por cada conteo mostrado (33
-        # consultas con 5 conteos, medido en el prompt 20; crecía 1:1 con
-        # la cantidad de conteos en el rango). El resultado es idéntico a
-        # conteo.diferencia (mismo MotorStockCosto que resumen_general(),
-        # ver ParidadResumenGeneralTests) — solo cambia cómo se calcula.
-        motor = MotorStockCosto()
+        # La diferencia sale de la DiscrepanciaInventario congelada, no de
+        # una resta contra el stock actual (prompt 34). Antes se
+        # recalculaba aquí con hasta_fecha, y el resultado era engañoso en
+        # cuanto llegaba cualquier movimiento posterior: comprobado en el
+        # Excel de este mismo prompt, un conteo cuya diferencia real era
+        # −5 aparecía como "+7" después de aplicarle su propio ajuste,
+        # porque la resta se hacía contra el stock ya corregido. Un número
+        # sin significado en un reporte financiero.
+        from .models import DiscrepanciaInventario
+
+        discrepancias = {
+            d.conteo_id: d
+            for d in DiscrepanciaInventario.objects.filter(conteo__in=conteos)
+        }
         for conteo in conteos:
-            diferencia = conteo.cantidad_contada - motor.stock_teorico(conteo.producto_id, hasta_fecha=conteo.fecha)
-            detalle = f"Contado: {conteo.cantidad_contada} · Diferencia: {diferencia:+d}"
-            if conteo.ajuste_generado_id:
-                detalle += " · ajuste generado"
-            elif diferencia != 0:
-                detalle += " · pendiente de ajuste"
+            discrepancia = discrepancias.get(conteo.pk)
+            if discrepancia is None:
+                # Sin discrepancia registrada el conteo cuadró exacto —o
+                # es anterior al prompt 34, y entonces no hay un número
+                # confiable que mostrar.
+                detalle = f"Contado: {conteo.cantidad_contada}"
+            else:
+                detalle = (
+                    f"Contado: {conteo.cantidad_contada} · "
+                    f"Diferencia: {discrepancia.diferencia:+d}"
+                )
+                if discrepancia.estado == DiscrepanciaInventario.RESUELTA:
+                    detalle += f" · ajuste aplicado ({discrepancia.cantidad_confirmada:+d})"
+                elif discrepancia.estado == DiscrepanciaInventario.DESCARTADA:
+                    detalle += " · revisada sin ajuste"
+                else:
+                    detalle += " · pendiente de revisión"
             if conteo.notas:
                 detalle += f" · {conteo.notas}"
 
@@ -563,57 +579,52 @@ def conteos_activos_por_producto():
 
 def alertas_conteo_fisico(motor=None, conteos_por_producto=None):
     """
-    Productos activos con AL MENOS UN ConteoFisico sin resolver: diferencia
-    distinta de 0 y sin ajuste_generado.
+    Discrepancias PENDIENTES de revisión, para el tablero.
 
-    Importante: antes esta función solo miraba el ÚLTIMO ConteoFisico de
-    cada producto. Eso significaba que si se registraba un conteo nuevo
-    para un producto que ya tenía un conteo anterior sin resolver, el
-    anterior desaparecía de las alertas sin que nadie lo hubiera aprobado
-    y sin que el stock se hubiera movido — parecía que el sistema lo había
-    resuelto solo. Ahora se revisan TODOS los conteos del producto, así
-    que ningún conteo sin ajuste queda invisible.
+    Desde el prompt 34 esto lee registros persistidos
+    (DiscrepanciaInventario) en vez de recalcular la resta contra el
+    stock actual. El cambio es el punto entero del rediseño: antes la
+    alerta era literalmente `if diferencia != 0`, así que una venta
+    posterior que hiciera cuadrar los números la borraba de la pantalla
+    sin que nadie la hubiera revisado — el faltante real seguía ahí, ya
+    sin ninguna señal. Ahora una alerta solo desaparece porque una
+    persona la resolvió o la descartó.
 
-    Devuelve una lista de dicts: {"producto", "conteo", "diferencia",
-    "total_pendientes"}.
-    - "conteo": el conteo sin resolver MÁS ANTIGUO de ese producto (para
-      animar a resolverlos en el orden en que ocurrieron).
-    - "total_pendientes": cuántos conteos sin resolver tiene ese producto
-      en total (normalmente 1; más de 1 solo si se dejaron varios conteos
-      sin generar su ajuste antes de seguir contando).
-    Ordenados por fecha del conteo pendiente más antiguo (más urgente primero).
+    Los parámetros `motor` y `conteos_por_producto` se conservan por
+    compatibilidad con home(), que los venía pasando para no repetir
+    consultas; ya no se usan, porque leer discrepancias es una sola
+    consulta y no hace falta calcular stock para nada.
 
-    Rendimiento (prompt 18b): antes recorría cada producto activo y por
-    cada uno consultaba sus conteos_fisicos más la property .diferencia
-    de cada conteo (consultas proporcionales a productos y conteos).
-    Ahora usa un MotorStockCosto compartido (3 consultas fijas) y una
-    única consulta de conteos — o la que ya trae el llamador via
-    `conteos_por_producto`/`motor`, para no repetirla (ver home()).
+    Devuelve una lista de dicts: {"producto", "conteo", "discrepancia",
+    "diferencia", "total_pendientes", "requiere_revision"}, ordenada por
+    el momento real del conteo pendiente más antiguo de cada producto.
     """
-    motor = motor or MotorStockCosto()
-    if conteos_por_producto is None:
-        conteos_por_producto = conteos_activos_por_producto()
+    from .models import DiscrepanciaInventario
+
+    pendientes = (
+        DiscrepanciaInventario.objects
+        .filter(estado=DiscrepanciaInventario.PENDIENTE)
+        .select_related("conteo", "producto")
+        .order_by("conteo__fecha", "conteo__ocurrido_en")
+    )
+
+    por_producto = {}
+    for discrepancia in pendientes:
+        por_producto.setdefault(discrepancia.producto_id, []).append(discrepancia)
 
     alertas = []
-    for producto_id, conteos in conteos_por_producto.items():
-        pendientes = []
-        for conteo in conteos:
-            if conteo.ajuste_generado_id is not None:
-                continue
-            diferencia = conteo.cantidad_contada - motor.stock_teorico(producto_id, hasta_fecha=conteo.fecha)
-            if diferencia != 0:
-                pendientes.append((conteo, diferencia))
-        if not pendientes:
-            continue
-        conteo_mas_antiguo, diferencia_mas_antigua = pendientes[0]
+    for lista in por_producto.values():
+        primera = lista[0]
         alertas.append(
             {
-                "producto": conteo_mas_antiguo.producto,
-                "conteo": conteo_mas_antiguo,
-                "diferencia": diferencia_mas_antigua,
-                "total_pendientes": len(pendientes),
+                "producto": primera.producto,
+                "conteo": primera.conteo,
+                "discrepancia": primera,
+                "diferencia": primera.diferencia_vigente,
+                "total_pendientes": len(lista),
+                "requiere_revision": any(d.requiere_revision for d in lista),
             }
         )
 
-    alertas.sort(key=lambda a: a["conteo"].fecha)
+    alertas.sort(key=lambda a: (a["conteo"].fecha, a["conteo"].ocurrido_en))
     return alertas

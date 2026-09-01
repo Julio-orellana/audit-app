@@ -1041,6 +1041,16 @@ def encolar_pendiente(instance):
     preparar_bases_locales()
     from .models import PendienteSincronizacion
 
+    # El instante real, ANTES de serializar (prompt 34). Esto se llama
+    # desde ColaOfflineMixin.form_valid() antes de guardar, así que
+    # ocurrido_en todavía es None y AnclaTemporalMixin.save() no ha
+    # corrido. Sin esta línea el payload viajaría sin instante y la fila
+    # remota se sellaría con la hora de SINCRONIZACIÓN — exactamente el
+    # bug que el prompt 34 vino a corregir, reintroducido por la puerta
+    # de atrás y solo en el camino offline, que es justo donde más duele.
+    if hasattr(instance, "ocurrido_en") and instance.ocurrido_en is None:
+        instance.ocurrido_en = timezone.now()
+
     PendienteSincronizacion.objects.using(ALIAS_LOCAL).update_or_create(
         uuid=instance.uuid,
         defaults={
