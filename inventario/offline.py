@@ -97,6 +97,24 @@ _TECHO_UMBRAL_SONDEO = 60.0     # ni callar por encima de esto
 # recordar_direcciones_intentadas().
 _direcciones_del_host = 3
 
+# Cuánto se deja correr un sondeo antes de que los DEMÁS hilos den por
+# hecho que no hay conexión, en vez de lanzar cada uno el suyo.
+#
+# Medido en la VM de Windows con el adaptador de red apagado: un solo
+# sondeo tardó 28.50s —el DNS se cuelga y connect_timeout NO cubre la
+# resolución, solo se aplica después— y tres logins simultáneos pagaron
+# cada uno su propio atasco: 10.1s, 29.4s y 38.7s. La caché de resultado
+# negativo no los salvaba porque no se marca hasta que el PRIMER sondeo
+# termina, así que todos entraron antes de que hubiera nada que leer.
+#
+# 2 segundos porque un sondeo sano contra Neon tarda menos de 1s: nunca
+# se dispara con la red buena, y con la red caída ahorra la espera a
+# todos menos al primero.
+SEGUNDOS_PARA_ASUMIR_CAIDA_EN_SONDEO = 2.0
+
+_sondeo_iniciado_en = 0.0   # 0.0 = ningún sondeo en curso
+_local = threading.local()  # marca al hilo que ESTÁ sondeando
+
 
 def umbral_sondeo_lento():
     """
@@ -200,9 +218,11 @@ def reiniciar_cache_conexion():
     "sin conexión" pegado hasta 15s y haría fallar al siguiente test por
     un motivo que no tiene nada que ver con lo que ese test verifica.
     """
-    global _sin_conexion_hasta
+    global _sin_conexion_hasta, _sondeo_iniciado_en
     with _lock_cache_conexion:
         _sin_conexion_hasta = 0.0
+        _sondeo_iniciado_en = 0.0
+    _local.sondeando = False
 
 
 def sin_conexion_reciente():
@@ -219,7 +239,22 @@ def sin_conexion_reciente():
     pueden permitirse ni un sondeo: ver
     BackendConRespaldoOffline.get_user() (prompt 33c).
     """
-    return time.monotonic() < _sin_conexion_hasta
+    if getattr(_local, "sondeando", False):
+        # Este hilo ES el que está averiguando: tiene que poder salir a
+        # la red, o el sondeo se cortaría a sí mismo y la app quedaría
+        # marcada como sin conexión para siempre.
+        return False
+
+    ahora = time.monotonic()
+    inicio_sondeo = _sondeo_iniciado_en
+    if inicio_sondeo and (ahora - inicio_sondeo) >= SEGUNDOS_PARA_ASUMIR_CAIDA_EN_SONDEO:
+        # Otro hilo lleva rato colgado averiguándolo. No tiene sentido
+        # que este pague la misma espera para llegar a la misma
+        # conclusión — eso es lo que convertía un corte en tres logins
+        # de 10, 29 y 38 segundos a la vez.
+        return True
+
+    return ahora < _sin_conexion_hasta
 
 
 def marcar_sin_conexion():
@@ -387,7 +422,7 @@ def hay_conexion():
     la evidencia que hace falta para confirmar el diagnóstico en
     Windows, donde toda la app queda sin responder.
     """
-    global _sin_conexion_hasta
+    global _sin_conexion_hasta, _sondeo_iniciado_en
 
     # Sin configuración de nube legible (falta el .env junto al .exe):
     # nunca hay conexión y no tiene sentido sondear la red ni una sola
@@ -404,9 +439,18 @@ def hay_conexion():
     if ahora < _sin_conexion_hasta:
         return False
 
+    # Si otro hilo lleva rato averiguándolo, no se lanza un sondeo más:
+    # se responde con lo que ya se sabe. Ver
+    # SEGUNDOS_PARA_ASUMIR_CAIDA_EN_SONDEO.
+    if sin_conexion_reciente():
+        return False
+
     conexion = connections["default"]
     inicio = time.monotonic()
     exito = False
+    with _lock_cache_conexion:
+        _sondeo_iniciado_en = inicio
+    _local.sondeando = True
     try:
         _reciclar_conexion_remota()
         conexion.ensure_connection()
@@ -422,14 +466,24 @@ def hay_conexion():
         return False
     finally:
         duracion = time.monotonic() - inicio
+        _local.sondeando = False
         with _lock_cache_conexion:
+            _sondeo_iniciado_en = 0.0
             if exito:
                 # Un "sí hay conexión" nunca se cachea: si la red se cae
                 # justo después, la operación real falla y el manejo de
                 # errores de siempre la atrapa.
                 _sin_conexion_hasta = 0.0
             else:
-                _sin_conexion_hasta = time.monotonic() + SEGUNDOS_CACHE_SIN_CONEXION
+                # El margen se estira con lo que COSTÓ averiguarlo. Con
+                # un valor fijo de 15s y un sondeo de 28.5s —medido en
+                # Windows con el adaptador apagado, donde el DNS se
+                # cuelga— la caché ya nacía vencida y el siguiente hilo
+                # volvía a pagar la espera entera. Cachear al menos el
+                # doble de lo que tardó garantiza que averiguarlo salga
+                # siempre más barato que no averiguarlo.
+                margen = max(SEGUNDOS_CACHE_SIN_CONEXION, duracion * 2)
+                _sin_conexion_hasta = time.monotonic() + margen
         umbral = umbral_sondeo_lento()
         if duracion >= umbral:
             logger.error(

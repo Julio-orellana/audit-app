@@ -1259,6 +1259,124 @@ class ColaSincronizacionTests(TestCase):
         pendiente.delete(using="local_disco")
 
 
+class SondeoConcurrenteTests(SimpleTestCase):
+    """
+    Un corte de red no puede costar una espera POR CADA hilo (prompt 33c).
+
+    Medido en la VM de Windows con el adaptador apagado: un solo sondeo
+    tardó 28.50s —el DNS se cuelga y connect_timeout no cubre la
+    resolución, solo se aplica después de resolver— y tres inicios de
+    sesión simultáneos pagaron cada uno su propio atasco:
+
+        10165ms  POST 302  /login/
+        38670ms  POST 302  /login/
+        29373ms  POST 302  /login/
+
+    La caché de resultado negativo no los salvaba: no se marca hasta que
+    el PRIMER sondeo termina, así que los tres entraron antes de que
+    hubiera nada que leer. Con 4 hilos en waitress, eso es la app entera
+    detenida.
+    """
+
+    def setUp(self):
+        from .offline import reiniciar_cache_conexion
+
+        reiniciar_cache_conexion()
+        self.addCleanup(reiniciar_cache_conexion)
+
+    def test_mientras_un_hilo_averigua_los_demas_no_pagan_la_espera(self):
+        import threading
+        import time
+
+        from django.db.utils import OperationalError
+
+        from . import offline
+
+        DURACION_SONDEO = 4.0
+        # Se parchea _reciclar_conexion_remota, que es una función del
+        # MÓDULO, y no connections["default"].ensure_connection: el
+        # registro de conexiones de Django es por hilo, así que parchear
+        # el objeto de conexión desde el hilo principal no le llega al
+        # hilo que sondea, y la prueba mediría otra cosa.
+        original = offline._reciclar_conexion_remota
+
+        def reciclar_lento():
+            # Simula el atasco real: una espera larga que termina en
+            # error de conexión. No se usa una IP inalcanzable de verdad
+            # porque el tiempo dependería de la red de quien corra las
+            # pruebas.
+            time.sleep(DURACION_SONDEO)
+            raise OperationalError("connection timeout expired (simulado)")
+
+        offline._reciclar_conexion_remota = reciclar_lento
+        self.addCleanup(setattr, offline, "_reciclar_conexion_remota", original)
+
+        resultado_lento = {}
+
+        def sondear():
+            inicio = time.monotonic()
+            resultado_lento["valor"] = offline.hay_conexion()
+            resultado_lento["duracion"] = time.monotonic() - inicio
+
+        hilo = threading.Thread(target=sondear)
+        hilo.start()
+        # Se espera a pasar el umbral a partir del cual los demás hilos
+        # dan por hecho que está caída.
+        time.sleep(offline.SEGUNDOS_PARA_ASUMIR_CAIDA_EN_SONDEO + 0.5)
+
+        inicio = time.monotonic()
+        self.assertTrue(
+            offline.sin_conexion_reciente(),
+            "Con un sondeo colgado, los demás hilos tienen que dar por hecho que no hay "
+            "conexión en vez de lanzar cada uno el suyo.",
+        )
+        self.assertFalse(offline.hay_conexion())
+        duracion_segundo = time.monotonic() - inicio
+
+        hilo.join(timeout=DURACION_SONDEO + 5)
+        self.assertFalse(hilo.is_alive(), "El hilo que sondea no terminó.")
+
+        self.assertLess(
+            duracion_segundo, 0.5,
+            f"El segundo hilo tardó {duracion_segundo:.2f}s: pagó su propia espera. Eso es "
+            "lo que producía logins de 10, 29 y 38 segundos a la vez.",
+        )
+        self.assertFalse(resultado_lento["valor"])
+        self.assertGreaterEqual(
+            resultado_lento["duracion"], DURACION_SONDEO,
+            "El primer hilo sí debe sondear de verdad: alguien tiene que averiguarlo.",
+        )
+
+    def test_la_cache_dura_al_menos_el_doble_de_lo_que_costo_averiguarlo(self):
+        """
+        Con un margen fijo de 15s y un sondeo de 28.5s, la caché nacía
+        vencida y el siguiente hilo volvía a pagar la espera entera.
+        """
+        import time
+
+        from django.db.utils import OperationalError
+
+        from . import offline
+
+        DURACION_SONDEO = 3.0
+        original = offline._reciclar_conexion_remota
+
+        def reciclar_lento():
+            time.sleep(DURACION_SONDEO)
+            raise OperationalError("connection timeout expired (simulado)")
+
+        offline._reciclar_conexion_remota = reciclar_lento
+        self.addCleanup(setattr, offline, "_reciclar_conexion_remota", original)
+
+        self.assertFalse(offline.hay_conexion())
+        restante = offline._sin_conexion_hasta - time.monotonic()
+        self.assertGreaterEqual(
+            restante, DURACION_SONDEO * 2 - 0.5,
+            f"La caché quedó válida solo {restante:.1f}s tras un sondeo de "
+            f"{DURACION_SONDEO}s: averiguarlo sale más caro que no averiguarlo.",
+        )
+
+
 class ConfiguracionNubeAusenteTests(SimpleTestCase):
     """
     Prompt 33 — el bug que dejó el motor offline completamente inerte en

@@ -278,6 +278,19 @@ Con la red cortada, y **cronómetro en mano**:
 
       Cualquier página por encima de **1 segundo** aquí es algo que hay
       que mirar, no "aceptable".
+
+- [ ] **Comprueba que de verdad estabas sin conexión.** Si el log dice
+      `FIN: migrate` en vez de `FALLÓ: migrate`, la app sí alcanzó la
+      nube y estarías midiendo la latencia a Ohio (~118 ms por consulta,
+      12 consultas en el tablero = ~1.4 s), no el modo offline. Hay que
+      apagar el adaptador **antes** de abrir la app.
+
+- [ ] Se espera **una sola** request lenta: la primera después de que se
+      cae la red, que es la que lo descubre. En Windows con el adaptador
+      apagado esa puede llegar a ~30 s, porque la resolución DNS se
+      cuelga y `connect_timeout` **no cubre el DNS** (solo se aplica
+      después de resolver). Si ves **varias** lentas a la vez, anótalo:
+      eso sí es un defecto.
 - [ ] Busca en `diagnostico.log` la línea `hay_conexion() tardó`. Si
       aparece, anota el número: significa que un sondeo pasó de 5 s, o
       sea que el `connect_timeout` no se está respetando.
