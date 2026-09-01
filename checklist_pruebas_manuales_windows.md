@@ -270,14 +270,27 @@ Con la red cortada, y **cronómetro en mano**:
       Select-String "TIEMPO" diagnostico.log | ForEach-Object { if ($_ -match "TIEMPO\s+(\d+)ms") { [int]$matches[1] } } | Sort-Object -Descending | Select-Object -First 5
       ```
 
-      Referencia medida con la base inalcanzable de verdad: de 57 páginas
-      con los 3 roles, **todas por debajo de 0.02 s**, y la request más
-      lenta del servidor en 179 ms. El sondeo que descubre el corte lo
-      paga el hilo de sincronización en segundo plano, no la página que
-      estás mirando.
+      Referencia **medida en la VM de Windows sin conexión**, que es la
+      que vale:
 
-      Cualquier página por encima de **1 segundo** aquí es algo que hay
-      que mirar, no "aceptable".
+      | Página | ms |
+      |---|---|
+      | `POST /login/` (entrada offline) | 1413 |
+      | `GET /` (redirección de arranque) | 604 |
+      | `GET /` (redirección de arranque) | 491 |
+      | `GET /login/` | 119 |
+      | `GET /login/` | 82 |
+
+      Y ya navegando: Inicio 62 ms, Historial 53 y 42 ms, Sincronización
+      22 ms, Reportes 12 ms, Correcciones 15 ms.
+
+      Los 1413 ms del login **no son red** (`bd=0ms en 0 consultas`): son
+      el hash de la contraseña. Django usa PBKDF2 con 1.5 millones de
+      iteraciones a propósito, para que probar contraseñas a la fuerza
+      sea caro. Cuesta lo mismo con internet que sin él, y no se toca.
+
+      Fuera de eso, cualquier página por encima de **1 segundo** es algo
+      que hay que mirar, no "aceptable".
 
 - [ ] **Comprueba que de verdad estabas sin conexión.** Si el log dice
       `FIN: migrate` en vez de `FALLÓ: migrate`, la app sí alcanzó la
@@ -285,12 +298,21 @@ Con la red cortada, y **cronómetro en mano**:
       12 consultas en el tablero = ~1.4 s), no el modo offline. Hay que
       apagar el adaptador **antes** de abrir la app.
 
-- [ ] Se espera **una sola** request lenta: la primera después de que se
-      cae la red, que es la que lo descubre. En Windows con el adaptador
-      apagado esa puede llegar a ~30 s, porque la resolución DNS se
-      cuelga y `connect_timeout` **no cubre el DNS** (solo se aplica
-      después de resolver). Si ves **varias** lentas a la vez, anótalo:
-      eso sí es un defecto.
+- [ ] Se espera **como mucho una** request lenta: la primera después de
+      que se cae la red, que es la que lo descubre. Cuánto tarde depende
+      de CÓMO esté caída la red, y la diferencia es grande:
+
+      - **Adaptador desactivado**: el DNS falla al instante
+        (`getaddrinfo failed`, Errno 11002) y el arranque ni se entera —
+        medido: 0.09 s.
+      - **Adaptador activo pero sin salida real** (sin ruta, servidor DNS
+        inalcanzable, Wi-Fi conectado a un router sin internet): el DNS
+        se cuelga esperando. Medido: 28.5 s. `connect_timeout` **no
+        cubre el DNS** — solo se aplica después de resolver el nombre.
+
+      Si ves **varias** requests lentas a la vez, anótalo: eso sí es un
+      defecto (era el estado anterior: tres logins de 10, 29 y 38
+      segundos en paralelo).
 - [ ] Busca en `diagnostico.log` la línea `hay_conexion() tardó`. Si
       aparece, anota el número: significa que un sondeo pasó de 5 s, o
       sea que el `connect_timeout` no se está respetando.
