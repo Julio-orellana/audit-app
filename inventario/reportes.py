@@ -42,6 +42,11 @@ COLUMNAS_RESUMEN = [
     # registro, y darlo por pérdida sin más mezclaría dos cosas
     # distintas. Queda como columna propia para que se vea y se decida.
     ("Unidades ajuste", "unidades_ajuste"),
+    # Solo el FALTANTE confirmado (prompt 34b): inventario real que ya no
+    # está, con su costo. Resta de la ganancia neta igual que una merma.
+    # Un sobrante no aparece aquí porque no suma nada — se ve en
+    # "Unidades ajuste", que sí lleva los dos signos.
+    ("Pérdida por ajuste", "perdida_por_ajuste"),
     ("Ganancia neta", "ganancia_neta"),
     ("Stock teórico al cierre", "stock_teorico_al_cierre"),
 ]
@@ -51,6 +56,7 @@ _COLUMNAS_MONETARIAS = {
     "Costo de lo vendido",
     "Ganancia bruta",
     "Pérdida por merma",
+    "Pérdida por ajuste",
     "Ganancia neta",
 }
 

@@ -138,6 +138,26 @@ def _unidades_ajuste_con_signo(ajustes_qs):
     return -total
 
 
+def _perdida_por_ajuste_faltante(ajustes_qs):
+    """
+    Costo del inventario que un ajuste confirmado dio por perdido.
+
+    Solo cuenta los FALTANTES. En MovimientoSalida.cantidad un ajuste
+    guarda su efecto real sobre el stock, así que cantidad > 0 es "resta
+    stock", o sea faltó producto: eso es una pérdida real, con su costo,
+    y resta de la ganancia neta igual que una merma (prompt 34b).
+
+    Un sobrante (cantidad < 0) se deja fuera a propósito. No es una venta
+    realizada; sumarlo como ganancia inflaría el resultado del período por
+    algo que solo significa que el registro estaba mal. Se reporta aparte,
+    en unidades_ajuste, que sí lleva los dos signos.
+    """
+    agregado = ajustes_qs.filter(cantidad__gt=0).aggregate(
+        perdida=Sum(F("cantidad") * F("costo_unitario_snapshot"))
+    )
+    return _money(agregado["perdida"])
+
+
 def resumen_producto(producto, fecha_inicio, fecha_fin):
     """
     Resumen financiero de un producto en el rango [fecha_inicio, fecha_fin]
@@ -174,9 +194,17 @@ def resumen_producto(producto, fecha_inicio, fecha_fin):
     unidades_merma = mermas_agg["unidades"] or 0
     perdida_por_merma = _money(mermas_agg["perdida"])
 
-    unidades_ajuste = _unidades_ajuste_con_signo(salidas.filter(tipo="ajuste"))
+    ajustes = salidas.filter(tipo="ajuste")
+    unidades_ajuste = _unidades_ajuste_con_signo(ajustes)
+    perdida_por_ajuste = _perdida_por_ajuste_faltante(ajustes)
 
-    ganancia_neta = _money(ganancia_bruta - perdida_por_merma)
+    # Un FALTANTE confirmado resta de la ganancia igual que una merma
+    # (prompt 34b): es inventario real que ya no está, con su costo, sin
+    # importar la causa. Un SOBRANTE no suma nada — no es una venta
+    # realizada, y contarlo como ganancia distorsionaría el reporte en la
+    # dirección contraria. Queda visible en unidades_ajuste, que es
+    # informativo y lleva los dos signos.
+    ganancia_neta = _money(ganancia_bruta - perdida_por_merma - perdida_por_ajuste)
 
     return {
         "unidades_compradas": unidades_compradas,
@@ -188,6 +216,7 @@ def resumen_producto(producto, fecha_inicio, fecha_fin):
         "unidades_merma": unidades_merma,
         "perdida_por_merma": perdida_por_merma,
         "unidades_ajuste": unidades_ajuste,
+        "perdida_por_ajuste": perdida_por_ajuste,
         "ganancia_neta": ganancia_neta,
         "stock_teorico_al_cierre": producto.stock_teorico(hasta_fecha=fecha_fin),
     }
@@ -207,9 +236,13 @@ _CLAVES_SUMABLES = (
     "unidades_merma",
     "perdida_por_merma",
     "unidades_ajuste",
+    "perdida_por_ajuste",
     "ganancia_neta",
 )
-_CLAVES_MONETARIAS = ("invertido", "ingreso", "costo_de_lo_vendido", "ganancia_bruta", "perdida_por_merma", "ganancia_neta")
+_CLAVES_MONETARIAS = (
+    "invertido", "ingreso", "costo_de_lo_vendido", "ganancia_bruta",
+    "perdida_por_merma", "perdida_por_ajuste", "ganancia_neta",
+)
 
 
 def resumen_general(fecha_inicio, fecha_fin, productos=None, motor=None):
@@ -283,13 +316,22 @@ def resumen_general(fecha_inicio, fecha_fin, productos=None, motor=None):
         perdida=Sum(F("cantidad") * F("costo_unitario_snapshot")),
     )
     # Mismo signo que _unidades_ajuste_con_signo(): positivo si sobró.
+    ajustes_qs = MovimientoSalida.objects.filter(
+        producto_id__in=producto_ids, fecha__gte=fecha_inicio, fecha__lte=fecha_fin, tipo="ajuste"
+    )
     ajustes_por_producto = {
         fila["producto_id"]: -(fila["total"] or 0)
-        for fila in MovimientoSalida.objects.filter(
-            producto_id__in=producto_ids, fecha__gte=fecha_inicio, fecha__lte=fecha_fin, tipo="ajuste"
-        )
+        for fila in ajustes_qs.values("producto_id").annotate(total=Sum("cantidad"))
+    }
+    # Solo los faltantes (cantidad > 0 = resta stock) pesan en la ganancia
+    # (prompt 34b). Tiene que calcularse igual que en resumen_producto():
+    # las dos implementaciones existen por rendimiento y ParidadResumen
+    # GeneralTests exige que den exactamente lo mismo.
+    perdida_ajuste_por_producto = {
+        fila["producto_id"]: _money(fila["perdida"])
+        for fila in ajustes_qs.filter(cantidad__gt=0)
         .values("producto_id")
-        .annotate(total=Sum("cantidad"))
+        .annotate(perdida=Sum(F("cantidad") * F("costo_unitario_snapshot")))
     }
 
     motor = motor or MotorStockCosto()
@@ -306,7 +348,8 @@ def resumen_general(fecha_inicio, fecha_fin, productos=None, motor=None):
         costo_de_lo_vendido = _money(ventas.get("costo"))
         ganancia_bruta = _money(ingreso - costo_de_lo_vendido)
         perdida_por_merma = _money(mermas.get("perdida"))
-        ganancia_neta = _money(ganancia_bruta - perdida_por_merma)
+        perdida_por_ajuste = perdida_ajuste_por_producto.get(producto.pk, Decimal("0.00"))
+        ganancia_neta = _money(ganancia_bruta - perdida_por_merma - perdida_por_ajuste)
 
         resumen = {
             "unidades_compradas": compras.get("unidades") or 0,
@@ -318,6 +361,7 @@ def resumen_general(fecha_inicio, fecha_fin, productos=None, motor=None):
             "unidades_merma": mermas.get("unidades") or 0,
             "perdida_por_merma": perdida_por_merma,
             "unidades_ajuste": ajustes_por_producto.get(producto.pk, 0),
+            "perdida_por_ajuste": perdida_por_ajuste,
             "ganancia_neta": ganancia_neta,
             "stock_teorico_al_cierre": motor.stock_teorico(producto.pk, hasta_fecha=fecha_fin),
         }

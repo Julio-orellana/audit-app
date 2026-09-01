@@ -64,6 +64,10 @@ def revisar_discrepancias_afectadas(sender, instance, created, raw=False, using=
     """
     if not created or not _es_escritura_real(using, raw):
         return
+    if getattr(instance, "_de_resolucion", False):
+        # Nace de resolver una discrepancia: resolver_discrepancia() ya
+        # avisa a las posteriores, y con un motivo que dice cuál fue.
+        return
     from .discrepancias import marcar_afectadas_por
 
     producto = instance.producto

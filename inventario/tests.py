@@ -1930,3 +1930,60 @@ class DiscrepanciasInventarioTests(TestCase):
         )
         discrepancia = DiscrepanciaInventario.objects.get(conteo=recreado)
         self.assertEqual(discrepancia.teorico_al_conteo, 430)
+
+    def test_un_faltante_resta_de_la_ganancia_y_un_sobrante_no_suma(self):
+        """
+        Prompt 34b: los dos ajustes se tratan distinto a propósito.
+
+        Un faltante es inventario real que ya no está, con su costo — pesa
+        igual que una merma. Un sobrante no es una venta realizada: darlo
+        por ganancia inflaría el período por algo que solo significa que
+        el registro estaba mal. Se ve en su columna, no en la ganancia.
+        """
+        from .services import resumen_general, resumen_producto
+
+        self._stock_inicial(430)                       # 430 a Q6.50
+        self._venta(10, 12, 0)                         # 10 a Q15.00
+        ganancia_sin_ajustes = resumen_producto(self.gallo, self.hoy, self.hoy)["ganancia_neta"]
+        self.assertEqual(ganancia_sin_ajustes, Decimal("85.00"), "10 × (15 − 6.50) = 85.00")
+
+        # --- Faltante de 5 unidades ---
+        conteo_faltante = self._conteo(415, 14, 0)     # teórico 420 → −5
+        faltante = DiscrepanciaInventario.objects.get(conteo=conteo_faltante)
+        self.assertEqual(faltante.diferencia, -5)
+        resolver_discrepancia(faltante, faltante.ajuste_sugerido, self.ruth, "Faltante real")
+
+        con_faltante = resumen_producto(self.gallo, self.hoy, self.hoy)
+        self.assertEqual(con_faltante["unidades_ajuste"], -5)
+        self.assertEqual(
+            con_faltante["perdida_por_ajuste"], Decimal("32.50"), "5 × Q6.50 = Q32.50"
+        )
+        self.assertEqual(
+            con_faltante["ganancia_neta"], Decimal("52.50"),
+            "85.00 − 32.50: el faltante tiene que restar igual que una merma.",
+        )
+
+        # --- Sobrante de 5 unidades, sobre el mismo producto ---
+        conteo_sobrante = self._conteo(420, 16, 0)     # teórico 415 → +5
+        sobrante = DiscrepanciaInventario.objects.get(conteo=conteo_sobrante)
+        self.assertEqual(sobrante.diferencia, 5)
+        resolver_discrepancia(sobrante, sobrante.ajuste_sugerido, self.ruth, "Sobrante confirmado")
+
+        con_ambos = resumen_producto(self.gallo, self.hoy, self.hoy)
+        self.assertEqual(
+            con_ambos["unidades_ajuste"], 0, "−5 y +5 se cancelan en el conteo de unidades."
+        )
+        self.assertEqual(
+            con_ambos["perdida_por_ajuste"], Decimal("32.50"),
+            "El sobrante NO puede cancelar la pérdida del faltante: son cosas distintas.",
+        )
+        self.assertEqual(
+            con_ambos["ganancia_neta"], Decimal("52.50"),
+            "El sobrante no suma nada: la ganancia se queda igual que con solo el faltante.",
+        )
+
+        # --- Y la ruta rápida del reporte tiene que dar lo mismo ---
+        general = resumen_general(self.hoy, self.hoy, productos=[self.gallo])
+        fila = general["productos"][0]
+        self.assertEqual(fila["perdida_por_ajuste"], Decimal("32.50"))
+        self.assertEqual(fila["ganancia_neta"], Decimal("52.50"))

@@ -152,7 +152,7 @@ def resolver_discrepancia(discrepancia, cantidad_ajuste, usuario, nota=""):
     conteo = discrepancia.conteo
     ajuste = None
     if cantidad_ajuste != 0:
-        ajuste = MovimientoSalida.objects.create(
+        ajuste = MovimientoSalida(
             producto_id=discrepancia.producto_id,
             fecha=conteo.fecha,
             ocurrido_en=conteo.ocurrido_en,
@@ -164,6 +164,12 @@ def resolver_discrepancia(discrepancia, cantidad_ajuste, usuario, nota=""):
             ),
             registrado_por_id=getattr(usuario, "pk", None),
         )
+        # Marca para la señal: este movimiento nace de resolver una
+        # discrepancia, así que el aviso a las posteriores lo da esta
+        # función —que sabe cuál fue— y no el mensaje genérico del
+        # post_save.
+        ajuste._de_resolucion = True
+        ajuste.save()
         # Compatibilidad con lo que ya existía: la pantalla del conteo y
         # los reportes miran ConteoFisico.ajuste_generado.
         conteo.ajuste_generado = ajuste
@@ -175,7 +181,14 @@ def resolver_discrepancia(discrepancia, cantidad_ajuste, usuario, nota=""):
     discrepancia.nota_resolucion = nota
     discrepancia.resuelta_por_id = getattr(usuario, "pk", None)
     discrepancia.resuelta_en = timezone.now()
+    # El ajuste que se acaba de crear lleva la fecha e instante del
+    # conteo, así que el post_save lo ve como "un movimiento en el pasado
+    # de esta discrepancia" y la marca a ella misma antes de llegar aquí.
+    # Se limpia: resolverla es precisamente dejar de necesitar revisión.
     discrepancia.requiere_revision = False
+    discrepancia.motivo_revision = ""
+    discrepancia.teorico_recalculado = None
+    discrepancia.diferencia_recalculada = None
     discrepancia.save()
 
     logger.info(
@@ -185,11 +198,17 @@ def resolver_discrepancia(discrepancia, cantidad_ajuste, usuario, nota=""):
     )
 
     if ajuste is not None:
+        # Se marca desde aquí y no desde el post_save del movimiento
+        # porque aquí sí se sabe QUÉ lo causó: "se resolvió la
+        # discrepancia #3 del 28/08, que es anterior a esta" le dice algo
+        # a quien revisa; "se registró un movimiento anterior" no. El
+        # ajuste lleva la marca _de_resolucion para que la señal no
+        # vuelva a recorrer lo mismo con el mensaje genérico.
         marcar_afectadas_por(
             discrepancia.producto_id, conteo.fecha, conteo.ocurrido_en,
             motivo=(
                 f"Se resolvió la discrepancia #{discrepancia.pk} del "
-                f"{conteo.fecha}, que es anterior a esta."
+                f"{conteo.fecha:%d/%m/%Y}, que es anterior a esta."
             ),
             excluir_id=discrepancia.pk,
         )
