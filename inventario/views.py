@@ -8,6 +8,7 @@ from django.contrib.auth.decorators import login_required
 from django.contrib.auth.mixins import LoginRequiredMixin
 from django.contrib.auth import SESSION_KEY
 from django.contrib.auth.views import LoginView, LogoutView
+from django.core.paginator import Paginator
 from django.db import transaction
 from django.http import HttpResponse
 from django.shortcuts import get_object_or_404, redirect, render
@@ -599,9 +600,14 @@ class HistorialView(RequiereRol("admin", "auditor"), ManejoErrorConexionMixin, g
     ella, o si la conexión se cae A MEDIO de esa consulta (ManejoError
     ConexionMixin ya no haría falta para esto, pero se conserva como red
     de seguridad), cae a historial_offline().
+
+    Filtros de tipo/usuario (prompt 35): se combinan con producto/fecha
+    con AND simplemente porque cada uno es un .filter()/comprobación
+    aparte encadenada sobre el mismo conjunto — nunca un OR entre ellos.
     """
     template_name = "inventario/historial.html"
     funciona_sin_conexion = True
+    MOVIMIENTOS_POR_PAGINA = 50
 
     def get_context_data(self, **kwargs):
         context = super().get_context_data(**kwargs)
@@ -611,10 +617,14 @@ class HistorialView(RequiereRol("admin", "auditor"), ManejoErrorConexionMixin, g
         producto = None
         fecha_desde = None
         fecha_hasta = None
+        tipo_movimiento = None
+        usuario_id = None
         if form.is_valid():
             producto = form.cleaned_data.get("producto")
             fecha_desde = form.cleaned_data.get("fecha_desde")
             fecha_hasta = form.cleaned_data.get("fecha_hasta")
+            tipo_movimiento = form.cleaned_data.get("tipo") or None
+            usuario_id = form.cleaned_data.get("usuario")  # ya viene como int o None (clean_usuario)
 
         # Sin filtro de fecha, se muestra todo el historial: un rango muy
         # amplio hace las veces de "sin límite" para movimientos_periodo()
@@ -624,20 +634,43 @@ class HistorialView(RequiereRol("admin", "auditor"), ManejoErrorConexionMixin, g
 
         if hay_conexion():
             try:
-                context["filas"] = movimientos_periodo(
-                    fecha_desde, fecha_hasta, productos=[producto] if producto else None
+                filas = movimientos_periodo(
+                    fecha_desde, fecha_hasta, productos=[producto] if producto else None,
+                    tipo_movimiento=tipo_movimiento, usuario_id=usuario_id,
                 )
                 context["modo_offline"] = False
-                return context
+                return self._paginar(context, filas)
             except ERRORES_DE_CONEXION:
                 # Se cortó la conexión justo a media consulta — cae al
                 # camino offline de abajo en vez de dejar que se propague.
                 pass
 
-        context["filas"] = historial_offline(
-            fecha_desde, fecha_hasta, producto_id=producto.pk if producto else None
+        filas = historial_offline(
+            fecha_desde, fecha_hasta, producto_id=producto.pk if producto else None,
+            tipo_movimiento=tipo_movimiento, usuario_id=usuario_id,
         )
         context["modo_offline"] = True
+        return self._paginar(context, filas)
+
+    def _paginar(self, context, filas):
+        """
+        Historial puede tener varios cientos de movimientos (prompt 35):
+        sin esto, cada visita traía y renderizaba la lista COMPLETA de una
+        sola vez. La paginación va aquí, sobre la lista YA filtrada y YA
+        ordenada por movimientos_periodo()/historial_offline() —nunca
+        antes—, así que "50 resultados" siempre significa 50 de lo que de
+        verdad cumple los filtros activos, nunca 50 sin filtrar más
+        filtro encima.
+
+        `total_filas` se guarda ANTES de paginar: es el contador real que
+        se muestra en pantalla ("N movimientos"), no el tamaño de la
+        página actual.
+        """
+        context["total_filas"] = len(filas)
+        paginador = Paginator(filas, self.MOVIMIENTOS_POR_PAGINA)
+        pagina = paginador.get_page(self.request.GET.get("page"))
+        context["pagina"] = pagina
+        context["filas"] = pagina.object_list
         return context
 
 

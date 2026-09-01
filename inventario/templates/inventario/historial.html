@@ -13,6 +13,14 @@
 
 <form method="get" class="info-card" style="display:flex;align-items:flex-end;gap:14px;padding:18px 20px;margin-bottom:18px;flex-wrap:wrap;">
   <div>
+    <div style="font-size:12px;font-weight:700;color:var(--ink-faint);margin-bottom:6px;text-transform:uppercase;letter-spacing:.03em;">{{ form.tipo.label }}</div>
+    {{ form.tipo }}
+  </div>
+  <div>
+    <div style="font-size:12px;font-weight:700;color:var(--ink-faint);margin-bottom:6px;text-transform:uppercase;letter-spacing:.03em;">{{ form.usuario.label }}</div>
+    {{ form.usuario }}
+  </div>
+  <div>
     <div style="font-size:12px;font-weight:700;color:var(--ink-faint);margin-bottom:6px;text-transform:uppercase;letter-spacing:.03em;">{{ form.producto.label }}</div>
     {{ form.producto }}
   </div>
@@ -31,7 +39,7 @@
     <button type="submit" class="btn btn-primary btn-sm">Filtrar</button>
     <a href="{% url 'historial' %}" class="btn btn-sm" style="border:1.5px solid var(--border);color:var(--ink-soft);">Limpiar</a>
   </div>
-  <span style="margin-left:auto;color:var(--ink-faint);font-size:13.5px;align-self:center;">{{ filas|length }} movimiento{{ filas|length|pluralize }}</span>
+  <span style="margin-left:auto;color:var(--ink-faint);font-size:13.5px;align-self:center;">{{ total_filas }} movimiento{{ total_filas|pluralize }}</span>
 </form>
 
 <div class="info-card" style="overflow:hidden;">
@@ -85,4 +93,20 @@
     <div style="padding:20px;color:var(--ink-faint);">Sin movimientos con estos filtros.</div>
   {% endfor %}
 </div>
+
+{% if pagina.paginator.num_pages > 1 %}
+<div style="display:flex;align-items:center;justify-content:center;gap:14px;margin-top:20px;">
+  {% if pagina.has_previous %}
+    <a href="{% querystring page=pagina.previous_page_number %}" class="btn btn-sm" style="border:1.5px solid var(--border);color:var(--ink-soft);">&larr; Anterior</a>
+  {% else %}
+    <span class="btn btn-sm" style="border:1.5px solid var(--border);color:var(--ink-faint);opacity:.5;pointer-events:none;">&larr; Anterior</span>
+  {% endif %}
+  <span style="color:var(--ink-soft);font-size:13.5px;">Página {{ pagina.number }} de {{ pagina.paginator.num_pages }}</span>
+  {% if pagina.has_next %}
+    <a href="{% querystring page=pagina.next_page_number %}" class="btn btn-sm" style="border:1.5px solid var(--border);color:var(--ink-soft);">Siguiente &rarr;</a>
+  {% else %}
+    <span class="btn btn-sm" style="border:1.5px solid var(--border);color:var(--ink-faint);opacity:.5;pointer-events:none;">Siguiente &rarr;</span>
+  {% endif %}
+</div>
+{% endif %}
 {% endblock %}

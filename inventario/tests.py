@@ -1987,3 +1987,293 @@ class DiscrepanciasInventarioTests(TestCase):
         fila = general["productos"][0]
         self.assertEqual(fila["perdida_por_ajuste"], Decimal("32.50"))
         self.assertEqual(fila["ganancia_neta"], Decimal("52.50"))
+
+
+class HistorialFiltrosTests(TestCase):
+    """
+    Prompt 35: filtros de Historial por tipo de movimiento, usuario,
+    producto y fecha, combinables entre sí con AND, sobre el orden
+    cronológico REAL (ocurrido_en, no creado_en/orden de llegada).
+    """
+
+    databases = {"default", "local_disco"}
+
+    def setUp(self):
+        from django.utils import timezone as tz
+
+        self.hoy = date(2026, 8, 31)
+        self.tz = tz
+        categoria = Categoria.objects.create(nombre="Cervezas 35")
+        self.gallo = Producto.objects.create(
+            nombre="Gallo 35", categoria=categoria, precio_venta_actual=Decimal("15.00")
+        )
+        self.corona = Producto.objects.create(
+            nombre="Corona 35", categoria=categoria, precio_venta_actual=Decimal("18.00")
+        )
+        self.ruth = User.objects.create_user(username="ruth35", password="x")
+        self.michelle = User.objects.create_user(username="michelle35", password="x")
+        grupo_admin, _ = Group.objects.get_or_create(name="admin")
+        self.ruth.groups.add(grupo_admin)
+
+    def _instante(self, hora, minuto, segundo=0, dia=None):
+        dia = dia or self.hoy
+        ingenuo = datetime(dia.year, dia.month, dia.day, hora, minuto, segundo)
+        return self.tz.make_aware(ingenuo, self.tz.get_current_timezone())
+
+    def _venta(self, producto, cantidad, usuario, hora, minuto):
+        return MovimientoSalida.objects.create(
+            producto=producto, fecha=self.hoy, tipo="venta", cantidad=cantidad,
+            precio_venta_unitario=Decimal("15.00"), registrado_por=usuario,
+            ocurrido_en=self._instante(hora, minuto),
+        )
+
+    # --- Cada criterio por separado -------------------------------------
+
+    def test_filtro_por_tipo_venta_no_trae_otros_tipos(self):
+        from .services import TIPO_VENTA, movimientos_periodo
+
+        self._venta(self.gallo, 5, self.ruth, 10, 0)
+        MovimientoSalida.objects.create(
+            producto=self.gallo, fecha=self.hoy, tipo="merma", cantidad=1,
+            costo_unitario_snapshot=Decimal("6.50"), registrado_por=self.ruth,
+            ocurrido_en=self._instante(11, 0),
+        )
+        LoteCompra.objects.create(
+            producto=self.gallo, fecha=self.hoy, cantidad=100, costo_unitario=Decimal("6.50"),
+            registrado_por=self.ruth, ocurrido_en=self._instante(9, 0),
+        )
+
+        filas = movimientos_periodo(self.hoy, self.hoy, tipo_movimiento=TIPO_VENTA)
+
+        self.assertEqual(len(filas), 1)
+        self.assertEqual(filas[0]["tipo"], "Venta")
+
+    def test_filtro_por_usuario_solo(self):
+        """'todos los movimientos de Ruth en la última semana'."""
+        from .services import movimientos_periodo
+
+        self._venta(self.gallo, 5, self.ruth, 10, 0)
+        self._venta(self.gallo, 3, self.michelle, 11, 0)
+
+        filas = movimientos_periodo(self.hoy, self.hoy, usuario_id=self.ruth.pk)
+
+        self.assertEqual(len(filas), 1)
+        self.assertEqual(filas[0]["usuario"], "ruth35")
+
+    # --- Combinación con AND ---------------------------------------------
+
+    def test_tipo_y_usuario_combinados_con_and(self):
+        """'ventas realizadas por Michelle': tipo=venta Y usuario=Michelle."""
+        from .services import TIPO_VENTA, movimientos_periodo
+
+        self._venta(self.gallo, 5, self.ruth, 10, 0)       # venta, pero de Ruth
+        self._venta(self.gallo, 3, self.michelle, 11, 0)    # venta de Michelle -> coincide
+        MovimientoSalida.objects.create(                    # merma de Michelle, pero no es venta
+            producto=self.gallo, fecha=self.hoy, tipo="merma", cantidad=1,
+            costo_unitario_snapshot=Decimal("6.50"), registrado_por=self.michelle,
+            ocurrido_en=self._instante(12, 0),
+        )
+
+        filas = movimientos_periodo(
+            self.hoy, self.hoy, tipo_movimiento=TIPO_VENTA, usuario_id=self.michelle.pk
+        )
+
+        self.assertEqual(len(filas), 1, "AND, no OR: ni la venta de Ruth ni la merma de Michelle deben aparecer.")
+        self.assertEqual(filas[0]["usuario"], "michelle35")
+        self.assertEqual(filas[0]["cantidad"], 3)
+
+    def test_tipo_ajuste_y_producto_combinados(self):
+        """'ajustes realizados sobre el producto Corona'."""
+        from .discrepancias import resolver_discrepancia
+        from .services import TIPO_AJUSTE_FALTANTE, movimientos_periodo
+
+        LoteCompra.objects.create(
+            producto=self.corona, fecha=self.hoy, cantidad=100, costo_unitario=Decimal("8.00"),
+            registrado_por=self.ruth, ocurrido_en=self._instante(8, 0),
+        )
+        LoteCompra.objects.create(
+            producto=self.gallo, fecha=self.hoy, cantidad=100, costo_unitario=Decimal("6.50"),
+            registrado_por=self.ruth, ocurrido_en=self._instante(8, 0),
+        )
+        conteo_corona = ConteoFisico.objects.create(
+            producto=self.corona, fecha=self.hoy, cantidad_contada=95,
+            registrado_por=self.ruth, ocurrido_en=self._instante(14, 0),
+        )
+        conteo_gallo = ConteoFisico.objects.create(
+            producto=self.gallo, fecha=self.hoy, cantidad_contada=90,
+            registrado_por=self.ruth, ocurrido_en=self._instante(14, 0),
+        )
+        resolver_discrepancia(
+            DiscrepanciaInventario.objects.get(conteo=conteo_corona),
+            5, self.ruth, "faltante Corona confirmado",
+        )
+        resolver_discrepancia(
+            DiscrepanciaInventario.objects.get(conteo=conteo_gallo),
+            10, self.ruth, "faltante Gallo confirmado",
+        )
+
+        filas = movimientos_periodo(
+            self.hoy, self.hoy, productos=[self.corona], tipo_movimiento=TIPO_AJUSTE_FALTANTE,
+        )
+
+        self.assertEqual(len(filas), 1)
+        self.assertEqual(filas[0]["producto"], self.corona)
+        self.assertEqual(filas[0]["cantidad"], 5)
+
+    # --- La distinción que el prompt pide explícitamente ------------------
+
+    def test_ajuste_confirmado_y_discrepancia_pendiente_son_tipos_distintos(self):
+        from .discrepancias import resolver_discrepancia
+        from .services import TIPO_AJUSTE_FALTANTE, TIPO_DISCREPANCIA_PENDIENTE, movimientos_periodo
+
+        LoteCompra.objects.create(
+            producto=self.gallo, fecha=self.hoy, cantidad=430, costo_unitario=Decimal("6.50"),
+            registrado_por=self.ruth, ocurrido_en=self._instante(8, 0),
+        )
+        conteo_resuelto = ConteoFisico.objects.create(
+            producto=self.gallo, fecha=self.hoy, cantidad_contada=425,
+            registrado_por=self.ruth, ocurrido_en=self._instante(10, 0),
+        )
+        resolver_discrepancia(
+            DiscrepanciaInventario.objects.get(conteo=conteo_resuelto), 5, self.ruth, "confirmado",
+        )
+        ConteoFisico.objects.create(
+            producto=self.gallo, fecha=self.hoy, cantidad_contada=400,
+            registrado_por=self.ruth, ocurrido_en=self._instante(16, 0),
+        )  # queda pendiente, nadie la resolvió
+
+        solo_ajustes = movimientos_periodo(self.hoy, self.hoy, tipo_movimiento=TIPO_AJUSTE_FALTANTE)
+        solo_pendientes = movimientos_periodo(self.hoy, self.hoy, tipo_movimiento=TIPO_DISCREPANCIA_PENDIENTE)
+
+        self.assertEqual(len(solo_ajustes), 1, "El filtro de ajuste no debe traer la discrepancia pendiente.")
+        self.assertEqual(solo_ajustes[0]["tipo_registro"], "MovimientoSalida")
+        self.assertEqual(len(solo_pendientes), 1, "El filtro de pendientes no debe traer el ajuste ya confirmado.")
+        self.assertEqual(solo_pendientes[0]["tipo_registro"], "ConteoFisico")
+        self.assertEqual(solo_pendientes[0]["cantidad"], 400)
+
+    # --- Orden cronológico real, no de llegada -----------------------------
+
+    def test_orden_usa_ocurrido_en_no_creado_en(self):
+        """
+        Un movimiento con ocurrido_en TEMPRANO pero creado_en (inserción
+        en la base) TARDÍO —el caso de la cola offline sincronizando
+        tarde— debe aparecer en su lugar cronológico real, no al final.
+        """
+        from .services import movimientos_periodo
+
+        temprano = MovimientoSalida.objects.create(
+            producto=self.gallo, fecha=self.hoy, tipo="venta", cantidad=1,
+            precio_venta_unitario=Decimal("15.00"), registrado_por=self.ruth,
+            ocurrido_en=self._instante(8, 0),
+        )
+        tarde = MovimientoSalida.objects.create(
+            producto=self.gallo, fecha=self.hoy, tipo="venta", cantidad=2,
+            precio_venta_unitario=Decimal("15.00"), registrado_por=self.ruth,
+            ocurrido_en=self._instante(20, 0),
+        )
+        # creado_en es auto_now_add: se fija solo, en el orden de creación
+        # real de estas dos filas en la prueba (temprano antes que tarde).
+        # Si el sort usara creado_en, "temprano" seguiría saliendo primero
+        # en orden ascendente — así que se fuerza lo contrario a mano para
+        # que la prueba distinga de verdad cuál campo se está usando.
+        MovimientoSalida.objects.filter(pk=temprano.pk).update(
+            creado_en=self._instante(23, 0)
+        )
+        MovimientoSalida.objects.filter(pk=tarde.pk).update(
+            creado_en=self._instante(1, 0)
+        )
+
+        filas = movimientos_periodo(self.hoy, self.hoy, descendente=False)
+
+        self.assertEqual(
+            [f["cantidad"] for f in filas], [1, 2],
+            "Con ocurrido_en, 'temprano' (08:00) va antes que 'tarde' (20:00) sin importar "
+            "en qué orden se insertaron en la base.",
+        )
+
+    # --- Paginación ---------------------------------------------------------
+
+    def test_paginacion_no_pierde_filas_y_respeta_el_filtro(self):
+        from django.core.paginator import Paginator
+
+        from .services import TIPO_VENTA, movimientos_periodo
+
+        for i in range(75):
+            self._venta(self.gallo, 1, self.ruth, 6 + (i // 60), i % 60)
+        # 5 mermas de más, para confirmar que el filtro de tipo se aplicó
+        # ANTES de paginar y no se cuelan en ninguna página.
+        for i in range(5):
+            MovimientoSalida.objects.create(
+                producto=self.gallo, fecha=self.hoy, tipo="merma", cantidad=1,
+                costo_unitario_snapshot=Decimal("6.50"), registrado_por=self.ruth,
+                ocurrido_en=self._instante(5, i),
+            )
+
+        filas = movimientos_periodo(self.hoy, self.hoy, tipo_movimiento=TIPO_VENTA)
+        self.assertEqual(len(filas), 75)
+
+        paginador = Paginator(filas, 50)
+        self.assertEqual(paginador.num_pages, 2)
+        pagina_1 = paginador.get_page(1)
+        pagina_2 = paginador.get_page(2)
+        self.assertEqual(len(pagina_1.object_list), 50)
+        self.assertEqual(len(pagina_2.object_list), 25)
+        self.assertTrue(all(f["tipo"] == "Venta" for f in pagina_1.object_list))
+        self.assertTrue(all(f["tipo"] == "Venta" for f in pagina_2.object_list))
+        # Ninguna fila se repite ni se pierde entre las dos páginas.
+        ids_pagina_1 = {f["registro_id"] for f in pagina_1.object_list}
+        ids_pagina_2 = {f["registro_id"] for f in pagina_2.object_list}
+        self.assertEqual(len(ids_pagina_1 & ids_pagina_2), 0)
+        self.assertEqual(len(ids_pagina_1 | ids_pagina_2), 75)
+
+    def test_vista_historial_pagina_y_muestra_el_total_filtrado(self):
+        for i in range(60):
+            self._venta(self.gallo, 1, self.ruth, 6, i % 60 if i < 60 else 0)
+
+        self.client.force_login(self.ruth)
+        respuesta = self.client.get(reverse("historial"))
+
+        self.assertEqual(respuesta.status_code, 200)
+        self.assertEqual(len(respuesta.context["filas"]), 50, "La página 1 debe traer 50, no las 60.")
+        self.assertEqual(respuesta.context["total_filas"], 60, "El contador debe ser el TOTAL filtrado, no el de la página.")
+        self.assertContains(respuesta, "60 movimientos")
+        self.assertContains(respuesta, "Página 1 de 2")
+
+        respuesta_2 = self.client.get(reverse("historial"), {"page": 2})
+        self.assertEqual(len(respuesta_2.context["filas"]), 10)
+
+    # --- Los mismos filtros, sin conexión ------------------------------------
+
+    def test_filtros_tambien_aplican_sin_conexion(self):
+        from .models import CredencialOfflineCache, MovimientoHistorialCache
+        from .offline import historial_offline, refrescar_catalogo_cache
+
+        refrescar_catalogo_cache()
+        CredencialOfflineCache.objects.using("local_disco").update_or_create(
+            username="ruth35", defaults={
+                "user_id": self.ruth.pk, "password_hash": "x", "rol": "admin",
+                "is_active": True, "is_staff": True, "is_superuser": True,
+            },
+        )
+        CredencialOfflineCache.objects.using("local_disco").update_or_create(
+            username="michelle35", defaults={
+                "user_id": self.michelle.pk, "password_hash": "x", "rol": "auditor",
+                "is_active": True, "is_staff": False, "is_superuser": False,
+            },
+        )
+        MovimientoHistorialCache.objects.using("local_disco").all().delete()
+        venta_ruth = self._venta(self.gallo, 5, self.ruth, 10, 0)
+        venta_michelle = self._venta(self.gallo, 3, self.michelle, 11, 0)
+        from .offline import refrescar_historial_cache
+
+        refrescar_historial_cache()
+
+        from .services import TIPO_VENTA
+
+        filas = historial_offline(
+            self.hoy, self.hoy, tipo_movimiento=TIPO_VENTA, usuario_id=self.michelle.pk,
+        )
+
+        self.assertEqual(len(filas), 1)
+        self.assertEqual(filas[0]["usuario"], "michelle35")
+        self.assertEqual(filas[0]["cantidad"], 3)

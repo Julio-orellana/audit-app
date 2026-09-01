@@ -1440,29 +1440,49 @@ def _fila_historial_a_payload(fila):
     return {
         "fecha": _serializar_valor(fila["fecha"]),
         "tipo": fila["tipo"],
+        "tipo_codigo": fila.get("tipo_codigo"),
         "producto_nombre": str(fila["producto"]),
         "cantidad": fila["cantidad"],
         "valor_unitario": _serializar_valor(fila["valor_unitario"]) if fila["valor_unitario"] is not None else None,
         "usuario": fila["usuario"],
+        "usuario_id": fila.get("usuario_id"),
         "detalle": fila["detalle"],
         "creado_en": _serializar_valor(fila["creado_en"]),
+        # .get(), no fila["ocurrido_en"]: por si algún día esto se llama
+        # sobre una fila armada a mano sin ese campo (ver el fallback
+        # simétrico en _payload_a_fila_historial).
+        "ocurrido_en": _serializar_valor(fila["ocurrido_en"]) if fila.get("ocurrido_en") else None,
         "tipo_registro": fila["tipo_registro"],
         "registro_id": fila["registro_id"],
     }
 
 
 def _payload_a_fila_historial(payload):
-    """Inverso de _fila_historial_a_payload(): reconstruye la fila lista para la plantilla historial.html."""
+    """
+    Inverso de _fila_historial_a_payload(): reconstruye la fila lista
+    para la plantilla historial.html.
+
+    "ocurrido_en"/"tipo_codigo"/"usuario_id" (prompt 35) se leen con
+    respaldo hacia "creado_en"/None/None: un MovimientoHistorialCache ya
+    guardado en el equipo de un usuario ANTES de este prompt no tiene
+    esas claves todavía, y esto no puede reventar hasta que el próximo
+    refrescar_historial_cache() (cada 5 minutos, con conexión) la
+    reemplace por una fila completa.
+    """
     valor_unitario = payload.get("valor_unitario")
+    ocurrido_en = payload.get("ocurrido_en")
     return {
         "fecha": _deserializar_valor(payload["fecha"]),
         "tipo": payload["tipo"],
+        "tipo_codigo": payload.get("tipo_codigo"),
         "producto": payload["producto_nombre"],
         "cantidad": payload["cantidad"],
         "valor_unitario": _deserializar_valor(valor_unitario) if valor_unitario is not None else None,
         "usuario": payload.get("usuario") or "",
+        "usuario_id": payload.get("usuario_id"),
         "detalle": payload.get("detalle") or "",
         "creado_en": _deserializar_valor(payload["creado_en"]),
+        "ocurrido_en": _deserializar_valor(ocurrido_en) if ocurrido_en else _deserializar_valor(payload["creado_en"]),
         "tipo_registro": payload["tipo_registro"],
         "registro_id": payload["registro_id"],
         "es_pendiente": False,
@@ -1501,6 +1521,32 @@ def refrescar_historial_cache():
             )
 
 
+def _tipo_codigo_pendiente(pendiente):
+    """
+    El TIPO_* (services.py, prompt 35) de un pendiente todavía sin
+    sincronizar — mismo criterio que _tipo_mostrado_pendiente(), pero el
+    código estable para filtrar en vez del texto para mostrar.
+
+    Un ConteoFisico recién encolado NUNCA puede tener tipo_codigo de
+    discrepancia (pendiente/resuelta/descartada): DiscrepanciaInventario
+    vive solo en "default", nunca en los alias locales (ver
+    db_router.MODELOS_PERMITIDOS_EN_LOCALES), y la crea una señal
+    post_save que solo corre cuando el conteo LLEGA a Neon — no puede
+    existir todavía mientras el conteo sigue en la cola de este equipo.
+    """
+    from .services import TIPO_AJUSTE_FALTANTE, TIPO_AJUSTE_SOBRANTE, TIPO_CONTEO, TIPO_ENTRADA, TIPO_MERMA, TIPO_VENTA
+
+    if pendiente.modelo == "LoteCompra":
+        return TIPO_ENTRADA
+    if pendiente.modelo == "ConteoFisico":
+        return TIPO_CONTEO
+    tipo = pendiente.payload.get("tipo")
+    if tipo == "ajuste":
+        cantidad = pendiente.payload.get("cantidad") or 0
+        return TIPO_AJUSTE_SOBRANTE if cantidad < 0 else TIPO_AJUSTE_FALTANTE
+    return {"venta": TIPO_VENTA, "merma": TIPO_MERMA}.get(tipo)
+
+
 def _fila_desde_pendiente_historial(pendiente, productos_por_id, usuarios_por_id):
     """
     Convierte un PendienteSincronizacion en una fila de historial —
@@ -1527,23 +1573,33 @@ def _fila_desde_pendiente_historial(pendiente, productos_por_id, usuarios_por_id
         valor_unitario = None
         detalle = payload.get("notas") or ""
 
+    # payload["ocurrido_en"] existe siempre que el pendiente venga de un
+    # modelo con AnclaTemporalMixin (LoteCompra/MovimientoSalida/
+    # ConteoFisico — o sea, siempre: son los únicos 3 modelos que se
+    # encolan) — encolar_pendiente() lo fija ANTES de serializar (prompt
+    # 34). El respaldo a pendiente.creado_en es solo para un pendiente
+    # que quedó en la cola de ANTES de ese arreglo, con un .exe viejo.
+    ocurrido_en = payload.get("ocurrido_en")
     return {
         "fecha": _deserializar_valor(payload.get("fecha")),
         "tipo": _tipo_mostrado_pendiente(pendiente),
+        "tipo_codigo": _tipo_codigo_pendiente(pendiente),
         "producto": producto_nombre,
         "producto_id": producto_id,
         "cantidad": cantidad,
         "valor_unitario": _deserializar_valor(valor_unitario) if valor_unitario is not None else None,
         "usuario": usuarios_por_id.get(payload.get("registrado_por_id"), ""),
+        "usuario_id": payload.get("registrado_por_id"),
         "detalle": detalle,
         "creado_en": pendiente.creado_en,
+        "ocurrido_en": _deserializar_valor(ocurrido_en) if ocurrido_en else pendiente.creado_en,
         "tipo_registro": pendiente.modelo,
         "registro_id": None,  # todavía no existe en Neon — no se puede editar/eliminar hasta que sincronice
         "es_pendiente": True,
     }
 
 
-def historial_offline(fecha_desde, fecha_hasta, producto_id=None):
+def historial_offline(fecha_desde, fecha_hasta, producto_id=None, tipo_movimiento=None, usuario_id=None):
     """
     Historial combinado sin conexión (prompt 19c, punto 1): los últimos
     movimientos ya sincronizados (MovimientoHistorialCache, refrescada
@@ -1559,6 +1615,15 @@ def historial_offline(fecha_desde, fecha_hasta, producto_id=None):
     filtro de fechas más viejo que lo cacheado simplemente no encuentra
     nada ahí, igual que pasaría si de verdad no hubiera movimientos en
     ese rango.
+
+    `tipo_movimiento`/`usuario_id` (prompt 35): a diferencia de fecha y
+    producto, NO son columnas propias de MovimientoHistorialCache — se
+    filtran en Python sobre el resultado. A propósito: el modelo ya
+    documenta que fecha/producto_id son los únicos dos criterios con
+    columna dedicada, y esta caché está acotada a
+    LIMITE_HISTORIAL_CACHE filas (300), así que filtrar el resto en
+    memoria after-the-fact no pesa nada y no vale la pena una migración
+    para un alias que ni siquiera es la fuente de verdad.
     """
     from .models import CredencialOfflineCache, MovimientoHistorialCache, PendienteSincronizacion, Producto
 
@@ -1567,7 +1632,12 @@ def historial_offline(fecha_desde, fecha_hasta, producto_id=None):
     if producto_id:
         cache_qs = cache_qs.filter(producto_id=producto_id)
     for fila_cache in cache_qs:
-        filas.append(_payload_a_fila_historial(fila_cache.payload))
+        fila = _payload_a_fila_historial(fila_cache.payload)
+        if tipo_movimiento and fila["tipo_codigo"] != tipo_movimiento:
+            continue
+        if usuario_id and fila["usuario_id"] != usuario_id:
+            continue
+        filas.append(fila)
 
     try:
         pendientes = list(PendienteSincronizacion.objects.using(ALIAS_LOCAL).all())
@@ -1584,9 +1654,16 @@ def historial_offline(fecha_desde, fecha_hasta, producto_id=None):
                 continue
             if not (fecha_desde <= fila["fecha"] <= fecha_hasta):
                 continue
+            if tipo_movimiento and fila["tipo_codigo"] != tipo_movimiento:
+                continue
+            if usuario_id and fila["usuario_id"] != usuario_id:
+                continue
             filas.append(fila)
 
-    filas.sort(key=lambda f: (f["fecha"], f["creado_en"]), reverse=True)
+    # ocurrido_en, no creado_en — mismo criterio que movimientos_periodo()
+    # (prompt 35): un pendiente sincronizado tarde debe aparecer donde
+    # ocurrió de verdad, no al final según cuándo se subió.
+    filas.sort(key=lambda f: (f["fecha"], f["ocurrido_en"]), reverse=True)
     return filas
 
 

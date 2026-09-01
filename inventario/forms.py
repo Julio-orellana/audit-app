@@ -3,6 +3,7 @@ from django.utils import timezone
 
 from .models import Categoria, ConteoFisico, LoteCompra, MovimientoSalida, Producto
 from .offline import hay_conexion
+from .services import OPCIONES_TIPO_MOVIMIENTO
 
 
 def _alias_catalogo():
@@ -16,6 +17,31 @@ def _alias_catalogo():
     exige conexión activa de todas formas — ver CorreccionUpdateView).
     """
     return "default" if hay_conexion() else "local_disco"
+
+
+def _opciones_usuario():
+    """
+    Pares (id como string, username) para el desplegable "Usuario" de
+    Historial (prompt 35), en la misma fuente que ya usa _alias_catalogo:
+    auth.User real con conexión, CredencialOfflineCache sin ella —
+    auth.User no existe en los alias locales (ver db_router.py), así que
+    no hay forma de armar un ModelChoiceField único que sirva en los dos
+    casos. Se usa el id (no el username) como VALUE del <option> porque
+    es lo que de verdad se guarda en registrado_por_id/usuario_id en
+    todas las filas de historial, online y offline por igual — y
+    CredencialOfflineCache.user_id es exactamente ese mismo id, no uno
+    aparte, así que el resultado es el mismo filtro sin importar cuál de
+    las dos fuentes lo armó.
+    """
+    if hay_conexion():
+        from django.contrib.auth.models import User
+
+        return [(str(u.pk), u.username) for u in User.objects.order_by("username")]
+
+    from .models import CredencialOfflineCache
+
+    filas = CredencialOfflineCache.objects.using("local_disco").order_by("username")
+    return [(str(c.user_id), c.username) for c in filas]
 
 
 def _queryset_producto_activo_o_actual(instance):
@@ -223,6 +249,23 @@ class HistorialFiltroForm(forms.Form):
         required=False,
         widget=forms.Select(attrs={"class": "form-select"}),
     )
+    # ChoiceField llano, no ModelChoiceField (prompt 35): sin conexión no
+    # hay forma de tener un queryset de auth.User —ese modelo no existe
+    # en los alias locales, ver db_router.py, y "usuario" es justo uno de
+    # los filtros que Historial debe seguir ofreciendo sin conexión—, así
+    # que las opciones se arman a mano en __init__() desde CUALQUIERA de
+    # las dos fuentes (User real, o CredencialOfflineCache), siempre como
+    # pares (id como string, username). El id es el mismo en los dos
+    # casos porque CredencialOfflineCache.user_id ES el pk real de User.
+    tipo = forms.ChoiceField(
+        choices=OPCIONES_TIPO_MOVIMIENTO,
+        required=False,
+        widget=forms.Select(attrs={"class": "form-select"}),
+    )
+    usuario = forms.ChoiceField(
+        required=False,
+        widget=forms.Select(attrs={"class": "form-select"}),
+    )
     fecha_desde = forms.DateField(
         required=False,
         widget=forms.DateInput(attrs={"type": "date", "class": "form-control"}),
@@ -239,6 +282,14 @@ class HistorialFiltroForm(forms.Form):
         # catálogo cacheado ahí también, igual que en los 3 formularios
         # de escritura (ver _alias_catalogo()).
         self.fields["producto"].queryset = Producto.objects.using(_alias_catalogo()).all()
+        self.fields["usuario"].choices = [("", "Todos los usuarios")] + _opciones_usuario()
+
+    def clean_usuario(self):
+        # ChoiceField.clean() ya rechaza cualquier valor que no esté en
+        # choices —construidas en __init__() desde los usuarios reales—,
+        # así que llegar aquí con algo no vacío ya es un id válido.
+        valor = self.cleaned_data.get("usuario")
+        return int(valor) if valor else None
 
     def clean(self):
         cleaned_data = super().clean()

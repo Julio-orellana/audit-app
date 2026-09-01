@@ -384,8 +384,46 @@ def resumen_general(fecha_inicio, fecha_fin, productos=None, motor=None):
 
 _ETIQUETAS_TIPO_SALIDA = {"venta": "Venta", "merma": "Merma"}
 
+# Códigos canónicos de "tipo de movimiento" (prompt 35), independientes
+# del texto que se muestra en pantalla (ese puede llevar acentos,
+# paréntesis, etc. — no sirve como valor de filtro estable). Un ajuste
+# CONFIRMADO (ya existe como MovimientoSalida) y una discrepancia
+# PENDIENTE (todavía ni tiene ajuste) son dos códigos distintos a
+# propósito: son dos momentos distintos de la misma historia, y quien
+# filtra por uno no quiere ver el otro mezclado — ver el docstring de
+# movimientos_periodo() para el detalle de cada caso.
+TIPO_ENTRADA = "entrada"
+TIPO_VENTA = "venta"
+TIPO_MERMA = "merma"
+TIPO_AJUSTE_SOBRANTE = "ajuste_sobrante"
+TIPO_AJUSTE_FALTANTE = "ajuste_faltante"
+TIPO_CONTEO = "conteo"
+TIPO_DISCREPANCIA_PENDIENTE = "discrepancia_pendiente"
+TIPO_DISCREPANCIA_RESUELTA = "discrepancia_resuelta"
+TIPO_DISCREPANCIA_DESCARTADA = "discrepancia_descartada"
 
-def movimientos_periodo(fecha_inicio, fecha_fin, productos=None, descendente=True):
+# Los 3 estados de discrepancia se exponen tal cual —ni más ni menos—
+# porque son justo los que ya distingue DiscrepanciaInventario.ESTADOS
+# (prompt 34): no es un filtro nuevo inventado, es el mismo estado ya
+# modelado, solo hecho filtrable.
+OPCIONES_TIPO_MOVIMIENTO = [
+    ("", "Todos los tipos"),
+    (TIPO_ENTRADA, "Entrada"),
+    (TIPO_VENTA, "Venta"),
+    (TIPO_MERMA, "Merma"),
+    (TIPO_AJUSTE_SOBRANTE, "Ajuste (sobrante)"),
+    (TIPO_AJUSTE_FALTANTE, "Ajuste (faltante)"),
+    (TIPO_CONTEO, "Conteo físico (todos)"),
+    (TIPO_DISCREPANCIA_PENDIENTE, "· Discrepancia pendiente de revisión"),
+    (TIPO_DISCREPANCIA_RESUELTA, "· Discrepancia resuelta"),
+    (TIPO_DISCREPANCIA_DESCARTADA, "· Discrepancia descartada sin ajuste"),
+]
+
+
+def movimientos_periodo(
+    fecha_inicio, fecha_fin, productos=None, descendente=True,
+    tipo_movimiento=None, usuario_id=None,
+):
     """
     Lista combinada y cronológica de TODO lo registrado en el rango
     [fecha_inicio, fecha_fin]: cada LoteCompra ("Entrada"), cada
@@ -395,24 +433,97 @@ def movimientos_periodo(fecha_inicio, fecha_fin, productos=None, descendente=Tru
     "Movimientos" del reporte Excel, así el auditor tiene un registro
     completo de todo lo que se hizo, no solo de lo que movió stock.
 
-    Cada fila es un dict: fecha, tipo, producto, cantidad (siempre positiva,
+    Cada fila es un dict: fecha, tipo (texto para mostrar), tipo_codigo
+    (uno de TIPO_*, para filtrar), producto, cantidad (siempre positiva,
     magnitud), valor_unitario (precio de venta para ventas, costo snapshot
     para merma/ajuste, None para un conteo físico — no aplica), usuario,
-    detalle (motivo, notas, o resumen de la diferencia), creado_en.
+    usuario_id, detalle (motivo, notas, o resumen de la diferencia),
+    creado_en (cuándo se insertó en la base — hora de sincronización para
+    algo que vino de la cola offline), ocurrido_en (prompt 34: el instante
+    real en que la persona lo registró en su equipo — la fecha que
+    importa para el orden cronológico, ver el sort al final).
 
     `productos`: iterable de Producto para filtrar, o None para todos.
     `descendente`: True = más reciente primero (uso en pantalla); False =
     cronológico ascendente (uso típico en un reporte Excel).
+    `tipo_movimiento`: uno de los TIPO_* de arriba, o None/"" para todos
+    (prompt 35). Decide de entrada CUÁLES de las tres tablas hace falta
+    siquiera consultar — pedir solo "venta" no toca LoteCompra ni
+    ConteoFisico en absoluto, ni un query de más.
+    `usuario_id`: pk de auth.User para filtrar por quien registró, o None
+    para todos (prompt 35).
+
+    Un ajuste CONFIRMADO (tipo_codigo="ajuste_sobrante"/"ajuste_faltante")
+    y una discrepancia PENDIENTE (tipo_codigo="discrepancia_pendiente")
+    son cosas DISTINTAS aunque nazcan del mismo conteo: la primera es un
+    MovimientoSalida real que ya movió stock; la segunda es el
+    ConteoFisico esperando revisión, con CERO movimiento de stock detrás
+    (ver inventario/discrepancias.py). Filtrar por "ajuste" nunca debe
+    traer de vuelta algo que todavía está pendiente, y viceversa — es
+    justo la distinción que este prompt pide mantener.
     """
-    lotes_qs = LoteCompra.objects.filter(
-        fecha__gte=fecha_inicio, fecha__lte=fecha_fin
-    ).select_related("producto", "registrado_por")
-    salidas_qs = MovimientoSalida.objects.filter(
-        fecha__gte=fecha_inicio, fecha__lte=fecha_fin
-    ).select_related("producto", "registrado_por")
-    conteos_qs = ConteoFisico.objects.filter(
-        fecha__gte=fecha_inicio, fecha__lte=fecha_fin
-    ).select_related("producto", "registrado_por")
+    from .models import DiscrepanciaInventario
+
+    incluir_lotes = tipo_movimiento in (None, "", TIPO_ENTRADA)
+    incluir_ventas = tipo_movimiento in (None, "", TIPO_VENTA)
+    incluir_mermas = tipo_movimiento in (None, "", TIPO_MERMA)
+    incluir_ajuste_sobrante = tipo_movimiento in (None, "", TIPO_AJUSTE_SOBRANTE)
+    incluir_ajuste_faltante = tipo_movimiento in (None, "", TIPO_AJUSTE_FALTANTE)
+    incluir_conteos = tipo_movimiento in (
+        None, "", TIPO_CONTEO,
+        TIPO_DISCREPANCIA_PENDIENTE, TIPO_DISCREPANCIA_RESUELTA, TIPO_DISCREPANCIA_DESCARTADA,
+    )
+
+    lotes_qs = LoteCompra.objects.none()
+    if incluir_lotes:
+        lotes_qs = LoteCompra.objects.filter(
+            fecha__gte=fecha_inicio, fecha__lte=fecha_fin
+        ).select_related("producto", "registrado_por")
+        if usuario_id:
+            lotes_qs = lotes_qs.filter(registrado_por_id=usuario_id)
+
+    salidas_qs = MovimientoSalida.objects.none()
+    if incluir_ventas or incluir_mermas or incluir_ajuste_sobrante or incluir_ajuste_faltante:
+        salidas_qs = MovimientoSalida.objects.filter(
+            fecha__gte=fecha_inicio, fecha__lte=fecha_fin
+        ).select_related("producto", "registrado_por")
+        if usuario_id:
+            salidas_qs = salidas_qs.filter(registrado_por_id=usuario_id)
+        # Ventas/merma se distinguen por MovimientoSalida.tipo; sobrante
+        # vs. faltante son el MISMO tipo="ajuste" partido por el signo de
+        # cantidad (ver help_text de MovimientoSalida.cantidad) — no hay
+        # forma de pedir "solo sobrante" sin filtrar por cantidad también.
+        if tipo_movimiento == TIPO_VENTA:
+            salidas_qs = salidas_qs.filter(tipo="venta")
+        elif tipo_movimiento == TIPO_MERMA:
+            salidas_qs = salidas_qs.filter(tipo="merma")
+        elif tipo_movimiento == TIPO_AJUSTE_SOBRANTE:
+            salidas_qs = salidas_qs.filter(tipo="ajuste", cantidad__lt=0)
+        elif tipo_movimiento == TIPO_AJUSTE_FALTANTE:
+            salidas_qs = salidas_qs.filter(tipo="ajuste", cantidad__gt=0)
+        elif not tipo_movimiento:
+            pass  # sin filtro de tipo: venta + merma + ajuste, las tres
+        else:
+            # tipo_movimiento pedía algo que no es una MovimientoSalida
+            # (p. ej. "conteo"): no traer NADA de esta tabla.
+            salidas_qs = MovimientoSalida.objects.none()
+
+    conteos_qs = ConteoFisico.objects.none()
+    if incluir_conteos:
+        conteos_qs = ConteoFisico.objects.filter(
+            fecha__gte=fecha_inicio, fecha__lte=fecha_fin
+        ).select_related("producto", "registrado_por")
+        if usuario_id:
+            conteos_qs = conteos_qs.filter(registrado_por_id=usuario_id)
+        # El JOIN contra la discrepancia va a nivel de queryset —no se
+        # traen conteos de más para descartarlos después en Python—
+        # usando el related_name="discrepancia" de la OneToOneField.
+        if tipo_movimiento == TIPO_DISCREPANCIA_PENDIENTE:
+            conteos_qs = conteos_qs.filter(discrepancia__estado=DiscrepanciaInventario.PENDIENTE)
+        elif tipo_movimiento == TIPO_DISCREPANCIA_RESUELTA:
+            conteos_qs = conteos_qs.filter(discrepancia__estado=DiscrepanciaInventario.RESUELTA)
+        elif tipo_movimiento == TIPO_DISCREPANCIA_DESCARTADA:
+            conteos_qs = conteos_qs.filter(discrepancia__estado=DiscrepanciaInventario.DESCARTADA)
 
     if productos is not None:
         lotes_qs = lotes_qs.filter(producto__in=productos)
@@ -428,12 +539,15 @@ def movimientos_periodo(fecha_inicio, fecha_fin, productos=None, descendente=Tru
             {
                 "fecha": lote.fecha,
                 "tipo": "Entrada",
+                "tipo_codigo": TIPO_ENTRADA,
                 "producto": lote.producto,
                 "cantidad": lote.cantidad,
                 "valor_unitario": lote.costo_unitario,
                 "usuario": lote.registrado_por.username if lote.registrado_por else "",
+                "usuario_id": lote.registrado_por_id,
                 "detalle": detalle,
                 "creado_en": lote.creado_en,
+                "ocurrido_en": lote.ocurrido_en,
                 "tipo_registro": "LoteCompra",
                 "registro_id": lote.pk,
             }
@@ -441,14 +555,17 @@ def movimientos_periodo(fecha_inicio, fecha_fin, productos=None, descendente=Tru
 
     for salida in salidas_qs:
         tipo = _ETIQUETAS_TIPO_SALIDA.get(salida.tipo, "Ajuste")
+        tipo_codigo = {"venta": TIPO_VENTA, "merma": TIPO_MERMA}.get(salida.tipo)
         cantidad = salida.cantidad
         if salida.tipo == "ajuste":
             # cantidad negativa = sobrante (sumó stock); positiva = faltante.
             if salida.cantidad < 0:
                 tipo = "Ajuste (sobrante)"
+                tipo_codigo = TIPO_AJUSTE_SOBRANTE
                 cantidad = abs(salida.cantidad)
             else:
                 tipo = "Ajuste (faltante)"
+                tipo_codigo = TIPO_AJUSTE_FALTANTE
 
         valor_unitario = salida.precio_venta_unitario if salida.tipo == "venta" else salida.costo_unitario_snapshot
 
@@ -456,12 +573,15 @@ def movimientos_periodo(fecha_inicio, fecha_fin, productos=None, descendente=Tru
             {
                 "fecha": salida.fecha,
                 "tipo": tipo,
+                "tipo_codigo": tipo_codigo,
                 "producto": salida.producto,
                 "cantidad": cantidad,
                 "valor_unitario": valor_unitario,
                 "usuario": salida.registrado_por.username if salida.registrado_por else "",
+                "usuario_id": salida.registrado_por_id,
                 "detalle": salida.motivo or "",
                 "creado_en": salida.creado_en,
+                "ocurrido_en": salida.ocurrido_en,
                 "tipo_registro": "MovimientoSalida",
                 "registro_id": salida.pk,
             }
@@ -477,8 +597,6 @@ def movimientos_periodo(fecha_inicio, fecha_fin, productos=None, descendente=Tru
         # −5 aparecía como "+7" después de aplicarle su propio ajuste,
         # porque la resta se hacía contra el stock ya corregido. Un número
         # sin significado en un reporte financiero.
-        from .models import DiscrepanciaInventario
-
         discrepancias = {
             d.conteo_id: d
             for d in DiscrepanciaInventario.objects.filter(conteo__in=conteos)
@@ -490,6 +608,7 @@ def movimientos_periodo(fecha_inicio, fecha_fin, productos=None, descendente=Tru
                 # es anterior al prompt 34, y entonces no hay un número
                 # confiable que mostrar.
                 detalle = f"Contado: {conteo.cantidad_contada}"
+                tipo_codigo = TIPO_CONTEO
             else:
                 detalle = (
                     f"Contado: {conteo.cantidad_contada} · "
@@ -497,10 +616,13 @@ def movimientos_periodo(fecha_inicio, fecha_fin, productos=None, descendente=Tru
                 )
                 if discrepancia.estado == DiscrepanciaInventario.RESUELTA:
                     detalle += f" · ajuste aplicado ({discrepancia.cantidad_confirmada:+d})"
+                    tipo_codigo = TIPO_DISCREPANCIA_RESUELTA
                 elif discrepancia.estado == DiscrepanciaInventario.DESCARTADA:
                     detalle += " · revisada sin ajuste"
+                    tipo_codigo = TIPO_DISCREPANCIA_DESCARTADA
                 else:
                     detalle += " · pendiente de revisión"
+                    tipo_codigo = TIPO_DISCREPANCIA_PENDIENTE
             if conteo.notas:
                 detalle += f" · {conteo.notas}"
 
@@ -508,18 +630,27 @@ def movimientos_periodo(fecha_inicio, fecha_fin, productos=None, descendente=Tru
                 {
                     "fecha": conteo.fecha,
                     "tipo": "Conteo físico",
+                    "tipo_codigo": tipo_codigo,
                     "producto": conteo.producto,
                     "cantidad": conteo.cantidad_contada,
                     "valor_unitario": None,
                     "usuario": conteo.registrado_por.username if conteo.registrado_por else "",
+                    "usuario_id": conteo.registrado_por_id,
                     "detalle": detalle,
                     "creado_en": conteo.creado_en,
+                    "ocurrido_en": conteo.ocurrido_en,
                     "tipo_registro": "ConteoFisico",
                     "registro_id": conteo.pk,
                 }
             )
 
-    filas.sort(key=lambda f: (f["fecha"], f["creado_en"]), reverse=descendente)
+    # ocurrido_en, no creado_en (prompt 35): el orden cronológico real es
+    # cuándo se registró en el equipo de quien lo hizo, no cuándo llegó a
+    # la base. Con creado_en, un movimiento cargado sin conexión y
+    # sincronizado horas después aparecía al FINAL de la lista según la
+    # hora de sincronización, en vez de en el lugar que le correspondía
+    # según cuándo ocurrió de verdad — ver AnclaTemporalMixin (prompt 34).
+    filas.sort(key=lambda f: (f["fecha"], f["ocurrido_en"]), reverse=descendente)
     return filas
 
 
