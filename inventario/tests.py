@@ -2842,3 +2842,90 @@ class SelectoresEnEspanolTests(TestCase):
             "Desplegables con el texto por defecto de Django en vez de uno en español: "
             + ", ".join(en_ingles),
         )
+
+
+class DiscrepanciasFaltantesTests(TestCase):
+    """
+    El prompt 34 cambió la alerta de conteo de "se calcula en vivo" a "es
+    un registro que solo cambia si una persona lo cambia", pero la crea
+    una señal post_save — así que los conteos que YA estaban guardados
+    nunca recibieron el suyo. En producción se encontró el caso completo:
+    9 conteos con diferencia y ninguna discrepancia registrada, o sea el
+    tablero callado sobre diferencias reales.
+    """
+
+    def setUp(self):
+        from django.core.management import call_command
+
+        self.call_command = call_command
+        categoria = Categoria.objects.create(nombre="Cervezas 37b")
+        self.gallo = Producto.objects.create(
+            nombre="Gallo 37b", categoria=categoria, precio_venta_actual=Decimal("15.00")
+        )
+        self.ruth = User.objects.create_user(username="ruth37b", password="x")
+        self.hoy = date(2026, 8, 31)
+        LoteCompra.objects.create(
+            producto=self.gallo, fecha=self.hoy, cantidad=100,
+            costo_unitario=Decimal("6.50"), registrado_por=self.ruth,
+        )
+
+    def _conteo_huerfano(self, contado):
+        """Un conteo sin su discrepancia, como los anteriores al prompt 34."""
+        from .models import DiscrepanciaInventario
+
+        conteo = ConteoFisico.objects.create(
+            producto=self.gallo, fecha=self.hoy, cantidad_contada=contado,
+            registrado_por=self.ruth,
+        )
+        DiscrepanciaInventario.objects.filter(conteo=conteo).delete()
+        return conteo
+
+    def _correr(self, **opciones):
+        from io import StringIO
+
+        salida = StringIO()
+        self.call_command(
+            "registrar_discrepancias_faltantes", stdout=salida, sin_confirmar=True, **opciones
+        )
+        return salida.getvalue()
+
+    def test_dry_run_no_escribe_nada(self):
+        from .models import DiscrepanciaInventario
+
+        self._conteo_huerfano(90)
+        salida = self._correr(dry_run=True)
+        self.assertIn("no se escribió nada", salida)
+        self.assertEqual(
+            DiscrepanciaInventario.objects.count(), 0,
+            "--dry-run no puede crear ni un registro.",
+        )
+
+    def test_crea_la_discrepancia_que_faltaba_con_el_numero_correcto(self):
+        from .models import DiscrepanciaInventario
+
+        conteo = self._conteo_huerfano(90)
+        self._correr()
+        discrepancia = DiscrepanciaInventario.objects.get(conteo=conteo)
+        self.assertEqual(discrepancia.diferencia, -10, "Contó 90 sobre un teórico de 100.")
+        self.assertEqual(
+            discrepancia.estado, DiscrepanciaInventario.PENDIENTE,
+            "Se registra para que la revise una persona: nunca se resuelve sola.",
+        )
+        self.assertIsNone(discrepancia.ajuste, "No puede aplicar ningún ajuste al stock.")
+
+    def test_un_conteo_que_cuadra_no_genera_nada(self):
+        from .models import DiscrepanciaInventario
+
+        self._conteo_huerfano(100)
+        self._correr()
+        self.assertEqual(DiscrepanciaInventario.objects.count(), 0)
+
+    def test_es_idempotente(self):
+        from .models import DiscrepanciaInventario
+
+        self._conteo_huerfano(90)
+        self._correr()
+        primera = DiscrepanciaInventario.objects.count()
+        salida = self._correr()
+        self.assertEqual(DiscrepanciaInventario.objects.count(), primera, "No puede duplicar.")
+        self.assertIn("Nada que hacer", salida)
