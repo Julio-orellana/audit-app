@@ -39,6 +39,9 @@ backups_completos/*
 # Salida de PyInstaller (se regenera con build_exe.bat / app.spec)
 build/
 dist/
+# Respaldo temporal de .env y datos locales durante un rebuild — lo crea
+# y lo borra build_exe.bat (prompt 33), nunca debe versionarse.
+_respaldo_datos_locales/
 
 # Variables de entorno / secretos
 .env

@@ -1,0 +1,173 @@
+{% extends "base.html" %}
+{% comment %}
+  Pantalla de revisión de una diferencia de inventario (prompt 34, punto 3).
+
+  Todo lo que hay aquí existe para que la persona pueda decidir con
+  criterio en vez de aceptar un número. Las tres piezas que antes
+  faltaban: la HORA del conteo (no solo la fecha), el stock teórico
+  congelado a ese instante, y la lista de lo que pasó después — con la
+  relación dicha en palabras, porque una tabla de fechas obliga a
+  reconstruir el orden de cabeza y ahí es donde se equivoca uno.
+{% endcomment %}
+{% block title %}Revisar diferencia — {{ discrepancia.producto }} — Auditoría Aylupita{% endblock %}
+{% block content %}
+
+<div style="max-width:820px;">
+
+  <a href="{% url 'discrepancias' %}" class="btn btn-link" style="padding-left:0;">&larr; Todas las diferencias</a>
+
+  <h1 class="form-card-title" style="margin-top:8px;">Diferencia en {{ discrepancia.producto }}</h1>
+  <p class="form-card-subtitle">
+    Contado por {{ discrepancia.conteo.registrado_por|default:"—" }} el
+    {{ discrepancia.conteo.fecha|date:"d/m/Y" }} a las
+    <strong>{{ discrepancia.conteo.ocurrido_en|time:"H:i:s" }}</strong>.
+  </p>
+
+  {% if discrepancia.conteo.reloj_sospechoso %}
+    <div class="alert" style="background:var(--danger-bg);border:1px solid var(--danger);color:var(--danger-ink);">
+      <strong>El reloj de ese equipo estaba adelantado.</strong>
+      La hora de este conteo puede no ser confiable, y con ella el orden respecto a los demás
+      movimientos. Revísalo con más cuidado de lo normal.
+    </div>
+  {% endif %}
+
+  {% if discrepancia.requiere_revision %}
+    <div class="alert" style="background:var(--info-bg);border:1px solid var(--info-border);color:var(--info-ink);">
+      <strong>Este cálculo cambió después de registrarse.</strong>
+      {{ discrepancia.motivo_revision }}
+      El stock teórico de ese momento pasó de <strong>{{ discrepancia.teorico_al_conteo }}</strong>
+      a <strong>{{ discrepancia.teorico_recalculado }}</strong>, así que la diferencia pasa de
+      {{ discrepancia.diferencia|stringformat:"+d" }} a
+      {{ discrepancia.diferencia_recalculada|stringformat:"+d" }}. No se aplicó nada: decide tú con
+      qué número quedarte.
+    </div>
+  {% endif %}
+
+  {% if hay_anteriores_sin_resolver %}
+    <div class="alert" style="background:var(--info-bg);border:1px solid var(--info-border);color:var(--info-ink);">
+      Hay otra diferencia <strong>anterior</strong> de este mismo producto sin revisar. Conviene
+      resolver primero la más vieja: si la resuelves después, esta va a tener que recalcularse.
+    </div>
+  {% endif %}
+
+  <div class="form-card" style="margin-bottom:20px;">
+    <table style="width:100%;">
+      <tr>
+        <th style="text-align:left;color:var(--ink-soft);font-weight:600;padding:8px 0;width:280px;">Contado a mano</th>
+        <td class="num">{{ discrepancia.contado }}</td>
+      </tr>
+      <tr>
+        <th style="text-align:left;color:var(--ink-soft);font-weight:600;padding:8px 0;">
+          Stock teórico a las {{ discrepancia.conteo.ocurrido_en|time:"H:i:s" }}
+        </th>
+        <td class="num">{{ discrepancia.teorico_al_conteo }}</td>
+      </tr>
+      <tr>
+        <th style="text-align:left;color:var(--ink-soft);font-weight:600;padding:8px 0;">Diferencia</th>
+        <td>
+          {% if discrepancia.diferencia_vigente > 0 %}
+            <span class="badge-pill" style="background:var(--sobrante-bg);color:var(--sobrante-ink);">+{{ discrepancia.diferencia_vigente }} sobrante</span>
+          {% else %}
+            <span class="badge-pill" style="background:var(--danger-bg);color:var(--danger-ink);">{{ discrepancia.diferencia_vigente }} faltante</span>
+          {% endif %}
+        </td>
+      </tr>
+      <tr>
+        <th style="text-align:left;color:var(--ink-soft);font-weight:600;padding:8px 0;">Stock teórico ahora</th>
+        <td class="num">{{ stock_actual }}</td>
+      </tr>
+      {% if discrepancia.conteo.notas %}
+      <tr>
+        <th style="text-align:left;color:var(--ink-soft);font-weight:600;padding:8px 0;">Notas del conteo</th>
+        <td>{{ discrepancia.conteo.notas }}</td>
+      </tr>
+      {% endif %}
+    </table>
+  </div>
+
+  <h2 style="font-size:18px;margin:24px 0 6px;">Qué pasó con este producto</h2>
+  <p style="color:var(--ink-faint);font-size:13px;margin:0 0 14px;">
+    En el orden real en que se registró cada movimiento, no en el que llegó al sistema. Lo marcado
+    como <strong>después del conteo</strong> no puede explicar la diferencia.
+  </p>
+
+  {% if movimientos %}
+    <div class="form-card" style="padding:0;overflow:hidden;">
+      {% for m in movimientos %}
+        <div style="display:flex;gap:14px;align-items:flex-start;padding:14px 18px;border-bottom:1px solid var(--border);{% if m.posterior_al_conteo %}background:var(--paper);{% endif %}">
+          <span class="num" style="color:var(--ink-faint);font-size:13px;white-space:nowrap;min-width:64px;">
+            {{ m.ocurrido_en|time:"H:i:s" }}
+          </span>
+          <div style="flex:1;">
+            <div style="font-size:14px;">{{ m.narracion }}</div>
+            {% if m.reloj_sospechoso %}
+              <div style="color:var(--danger);font-size:12px;margin-top:3px;">
+                Registrado por un equipo con el reloj adelantado — su posición en esta lista puede estar mal.
+              </div>
+            {% endif %}
+          </div>
+          {% if m.posterior_al_conteo %}
+            <span class="badge-pill" style="background:var(--paper);color:var(--ink-faint);border:1px solid var(--border);">después</span>
+          {% else %}
+            <span class="badge-pill" style="background:var(--info-bg);color:var(--info-ink);">antes</span>
+          {% endif %}
+        </div>
+      {% endfor %}
+    </div>
+  {% else %}
+    <div class="form-card" style="color:var(--ink-faint);">
+      No se registró ningún movimiento de este producto desde el conteo. La diferencia sigue sin explicación.
+    </div>
+  {% endif %}
+
+  {% if discrepancia.esta_pendiente %}
+    <h2 style="font-size:18px;margin:28px 0 6px;">Tu decisión</h2>
+    <div class="form-card">
+      <form method="post">
+        {% csrf_token %}
+        <label for="cantidad_ajuste" style="display:block;font-weight:600;margin-bottom:4px;">
+          Cantidad a ajustar
+        </label>
+        <p style="color:var(--ink-faint);font-size:13px;margin:0 0 8px;">
+          El sistema sugiere <strong class="num">{{ discrepancia.ajuste_sugerido|stringformat:"+d" }}</strong>,
+          que es lo que haría falta para que el stock cuadre con el conteo. Puedes escribir otra
+          cantidad, o <strong>0</strong> si revisaste y no hay que mover nada.
+          Un número negativo suma stock; uno positivo lo resta.
+        </p>
+        <input type="number" name="cantidad_ajuste" id="cantidad_ajuste" class="form-control"
+               value="{{ discrepancia.ajuste_sugerido }}" style="max-width:200px;" required>
+
+        <label for="nota" style="display:block;font-weight:600;margin:18px 0 4px;">
+          Qué encontraste
+        </label>
+        <textarea name="nota" id="nota" rows="3" class="form-control"
+                  placeholder="Ej: la venta de las 15:05 se registró después de contar, el faltante es real."></textarea>
+
+        <div style="display:flex;gap:10px;flex-wrap:wrap;margin-top:18px;">
+          <button type="submit" name="accion" value="ajustar" class="btn" style="background:var(--accent);color:#fff;">
+            Confirmar y ajustar
+          </button>
+          <button type="submit" name="accion" value="descartar" class="btn" style="background:transparent;border:1px solid var(--border);color:var(--ink-soft);">
+            Cerrar sin ajustar
+          </button>
+        </div>
+        <p style="color:var(--ink-faint);font-size:12px;margin:12px 0 0;">
+          Cerrar sin ajustar exige que escribas el motivo.
+        </p>
+      </form>
+    </div>
+  {% else %}
+    <div class="alert alert-secondary" style="margin-top:24px;">
+      <strong>Ya revisada</strong> por {{ discrepancia.resuelta_por|default:"—" }}
+      el {{ discrepancia.resuelta_en|date:"d/m/Y H:i" }}.
+      {% if discrepancia.ajuste %}
+        Se aplicó un ajuste de <span class="num">{{ discrepancia.cantidad_confirmada|stringformat:"+d" }}</span>.
+      {% else %}
+        Se cerró sin ajuste.
+      {% endif %}
+      {% if discrepancia.nota_resolucion %}<br>{{ discrepancia.nota_resolucion }}{% endif %}
+    </div>
+  {% endif %}
+
+</div>
+{% endblock %}

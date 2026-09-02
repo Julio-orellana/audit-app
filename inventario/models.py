@@ -1,11 +1,13 @@
 # inventario/models.py
 import uuid as uuid_lib
+from datetime import timedelta
 
 from django.core.exceptions import ValidationError
 from django.db import models
 from django.contrib.auth.models import User
 from django.db.models import Sum, F
 from decimal import Decimal
+from django.utils import timezone
 
 
 class Categoria(models.Model):
@@ -99,6 +101,32 @@ class Producto(models.Model):
                 # producto base" (división por cero en stock_teorico()).
                 raise ValidationError({"factor_equivalencia": "El factor de equivalencia debe ser al menos 1."})
 
+    @staticmethod
+    def _hasta(qs, hasta_fecha, hasta_instante=None):
+        """
+        Recorta un queryset de movimientos al corte temporal pedido.
+
+        Con solo `hasta_fecha` se comporta como siempre: todo lo del día
+        entra, sin importar la hora. Es lo correcto para un reporte de
+        período ("stock al cierre del 31 de agosto").
+
+        Con `hasta_instante` el corte es exacto (prompt 34): entra todo
+        lo de fechas anteriores, y del MISMO día solo lo que se creó
+        hasta ese instante. Es lo único que permite comparar un conteo
+        contra el stock que había cuando se contó, y no contra uno que ya
+        incluye ventas posteriores.
+        """
+        if hasta_instante is not None:
+            if hasta_fecha is None:
+                hasta_fecha = timezone.localtime(hasta_instante).date()
+            return qs.filter(
+                models.Q(fecha__lt=hasta_fecha)
+                | models.Q(fecha=hasta_fecha, ocurrido_en__lte=hasta_instante)
+            )
+        if hasta_fecha:
+            return qs.filter(fecha__lte=hasta_fecha)
+        return qs
+
     def costo_promedio(self, hasta_fecha=None):
         """
         Costo promedio ponderado. Un producto derivado no tiene compras
@@ -119,7 +147,7 @@ class Producto(models.Model):
             return Decimal("0.00")
         return (agregado["total_costo"] / agregado["total_unidades"]).quantize(Decimal("0.01"))
 
-    def stock_teorico(self, hasta_fecha=None):
+    def stock_teorico(self, hasta_fecha=None, hasta_instante=None):
         """
         Para un producto BASE (producto_base=None): inventario real —
         compras propias, menos salidas propias, menos las salidas de cada
@@ -134,29 +162,95 @@ class Producto(models.Model):
         de verdad independiente.
         """
         if self.producto_base_id is not None:
-            stock_base = self.producto_base.stock_teorico(hasta_fecha)
+            stock_base = self.producto_base.stock_teorico(hasta_fecha, hasta_instante)
             return stock_base // self.factor_equivalencia
 
-        compras = self.lotes_compra.all()
-        salidas = self.movimientos_salida.all()
-        if hasta_fecha:
-            compras = compras.filter(fecha__lte=hasta_fecha)
-            salidas = salidas.filter(fecha__lte=hasta_fecha)
+        compras = self._hasta(self.lotes_compra.all(), hasta_fecha, hasta_instante)
+        salidas = self._hasta(self.movimientos_salida.all(), hasta_fecha, hasta_instante)
         total_compras = compras.aggregate(t=Sum("cantidad"))["t"] or 0
         total_salidas = salidas.aggregate(t=Sum("cantidad"))["t"] or 0
 
         total_salidas_derivados = 0
         for derivado in self.derivados.all():
-            salidas_derivado = derivado.movimientos_salida.all()
-            if hasta_fecha:
-                salidas_derivado = salidas_derivado.filter(fecha__lte=hasta_fecha)
+            salidas_derivado = self._hasta(
+                derivado.movimientos_salida.all(), hasta_fecha, hasta_instante
+            )
             cantidad_derivado = salidas_derivado.aggregate(t=Sum("cantidad"))["t"] or 0
             total_salidas_derivados += cantidad_derivado * derivado.factor_equivalencia
 
         return total_compras - total_salidas - total_salidas_derivados
 
 
-class LoteCompra(models.Model):
+# Tolerancia para dar por bueno un reloj (prompt 34, decisión 4). Un
+# registro no puede haberse CREADO después de haber sido RECIBIDO: si
+# ocurrido_en supera a creado_en por más que este margen, el reloj del
+# equipo que lo registró está adelantado. Se deja holgura para el desfase
+# normal entre el reloj del cliente y el del servidor.
+TOLERANCIA_RELOJ = timedelta(minutes=2)
+
+
+class AnclaTemporalMixin(models.Model):
+    """
+    Da a cada movimiento un instante real de creación (prompt 34).
+
+    El problema que resuelve: `fecha` es un DateField, así que dentro de
+    un mismo día no existe orden — para el sistema, una venta de las
+    15:05 y un conteo de las 15:03 son simultáneos. Con eso, comparar un
+    conteo contra el stock teórico "de su fecha" incluye movimientos que
+    ocurrieron DESPUÉS de contar, y la diferencia sale mal.
+
+    `ocurrido_en` es el momento en que la PERSONA creó el registro en su
+    equipo, no el momento en que el servidor lo aceptó. La distinción es
+    todo el punto para el modo offline: un conteo creado a las 15:03:20
+    que pierde la conexión y sincroniza a las 15:40 sigue yendo ANTES que
+    una venta creada a las 15:05:30 en otro equipo con conexión, aunque
+    la venta haya llegado primero al servidor.
+
+    `creado_en` (auto_now_add) es lo contrario: la hora del INSERT, o sea
+    cuándo lo recibió el servidor. Se conserva tal cual y es la que sirve
+    para detectar un reloj mal puesto.
+
+    La clave de orden de todo el sistema es el par (fecha, ocurrido_en):
+    manda la fecha contable —una compra registrada hoy con fecha de
+    antier pertenece a antier— y el instante solo desempata dentro del
+    mismo día.
+    """
+
+    ocurrido_en = models.DateTimeField(
+        db_index=True,
+        help_text=(
+            "Momento real en que se creó el registro en el equipo de quien lo registró. "
+            "Para algo registrado sin conexión es la hora local de ese momento, NO la de "
+            "sincronización."
+        ),
+    )
+    reloj_sospechoso = models.BooleanField(
+        default=False,
+        help_text=(
+            "El equipo que registró esto tenía el reloj adelantado respecto al servidor. "
+            "El orden temporal de este registro puede no ser confiable."
+        ),
+    )
+
+    class Meta:
+        abstract = True
+
+    def save(self, *args, **kwargs):
+        if self.ocurrido_en is None:
+            # Registro creado CON conexión: el instante es ahora mismo.
+            # Uno que viene de la cola offline llega aquí con ocurrido_en
+            # ya puesto (la hora local de cuando se registró), y no se
+            # toca.
+            self.ocurrido_en = timezone.now()
+        # El adelanto solo se puede juzgar contra la hora del servidor, y
+        # solo tiene sentido al crear: creado_en es auto_now_add, así que
+        # todavía no existe en este punto para una fila nueva.
+        if self._state.adding and self.ocurrido_en > timezone.now() + TOLERANCIA_RELOJ:
+            self.reloj_sospechoso = True
+        return super().save(*args, **kwargs)
+
+
+class LoteCompra(AnclaTemporalMixin, models.Model):
     """Cada ingreso manual de inventario (ej: '1000 Gallo el 24/08')."""
     # uuid (prompt 19): identifica el registro de forma única desde el
     # momento en que se crea LOCALMENTE, antes de que llegue a la nube —
@@ -189,7 +283,7 @@ class LoteCompra(models.Model):
         return f"{self.producto} +{self.cantidad} ({self.fecha})"
 
 
-class MovimientoSalida(models.Model):
+class MovimientoSalida(AnclaTemporalMixin, models.Model):
     """
     Toda salida de inventario: venta diaria, merma o ajuste de conteo físico.
     Precio y costo se guardan como snapshot al momento del registro, para que
@@ -233,7 +327,7 @@ class MovimientoSalida(models.Model):
         return f"{self.producto} -{self.cantidad} ({self.get_tipo_display()}, {self.fecha})"
 
 
-class ConteoFisico(models.Model):
+class ConteoFisico(AnclaTemporalMixin, models.Model):
     """
     Conteo físico periódico (recomendado: semanal). Compara el stock teórico
     contra lo contado a mano; si hay diferencia, permite generar un
@@ -270,12 +364,129 @@ class ConteoFisico(models.Model):
             })
 
     @property
+    def teorico_al_momento(self):
+        """
+        Stock teórico en el INSTANTE del conteo, no al cierre de su día
+        (prompt 34). La diferencia entre las dos cosas era el escenario 1:
+        un conteo de las 15:03 se comparaba contra un teórico que ya
+        descontaba una venta de las 15:05, así que la venta se contaba dos
+        veces —una en el teórico y otra en la realidad del piso— y un
+        faltante de 5 aparecía como un sobrante de 1.
+        """
+        return self.producto.stock_teorico(
+            hasta_fecha=self.fecha, hasta_instante=self.ocurrido_en
+        )
+
+    @property
     def diferencia(self):
-        teorico = self.producto.stock_teorico(hasta_fecha=self.fecha)
-        return self.cantidad_contada - teorico
+        """
+        Cálculo en vivo, solo para mostrar al registrar el conteo.
+
+        La cifra que MANDA es DiscrepanciaInventario.diferencia, que queda
+        congelada al crearse: esta se mueve cada vez que llega un
+        movimiento nuevo, y era justo lo que hacía que una alerta
+        desapareciera sola cuando una venta posterior hacía cuadrar los
+        números (escenario 3).
+        """
+        return self.cantidad_contada - self.teorico_al_momento
 
     def __str__(self):
         return f"Conteo {self.producto} ({self.fecha}): {self.cantidad_contada}"
+
+
+class DiscrepanciaInventario(models.Model):
+    """
+    Una diferencia entre lo contado y lo que el sistema creía tener, como
+    REGISTRO — no como resta (prompt 34).
+
+    Antes la discrepancia no existía: era `ConteoFisico.diferencia`, una
+    property que se recalculaba cada vez que alguien abría la pantalla, y
+    la alerta del tablero era literalmente `if diferencia != 0`. Con eso,
+    una venta posterior que hiciera cuadrar los números borraba la alerta
+    sola, sin que nadie la hubiera revisado ni resuelto. El faltante real
+    seguía ahí, ahora sin ninguna señal.
+
+    `teorico_al_conteo` y `diferencia` se congelan al crearse y no vuelven
+    a cambiar. Una discrepancia solo sale de "pendiente" porque una
+    persona la sacó, y el sistema nunca modifica el stock por su cuenta:
+    el ajuste se crea únicamente cuando alguien confirma la cantidad.
+    """
+
+    PENDIENTE = "pendiente"
+    RESUELTA = "resuelta"
+    DESCARTADA = "descartada"
+    ESTADOS = [
+        (PENDIENTE, "Pendiente de revisión"),
+        (RESUELTA, "Resuelta con ajuste"),
+        (DESCARTADA, "Revisada sin ajuste"),
+    ]
+
+    conteo = models.OneToOneField(ConteoFisico, on_delete=models.CASCADE, related_name="discrepancia")
+    producto = models.ForeignKey(Producto, on_delete=models.PROTECT, related_name="discrepancias")
+
+    contado = models.PositiveIntegerField()
+    teorico_al_conteo = models.IntegerField(
+        help_text="Stock teórico en el instante exacto del conteo. Congelado: no cambia nunca."
+    )
+    diferencia = models.IntegerField(
+        help_text="contado − teorico_al_conteo. Congelado. Positivo = sobrante, negativo = faltante."
+    )
+
+    estado = models.CharField(max_length=12, choices=ESTADOS, default=PENDIENTE, db_index=True)
+
+    # Recálculo por un movimiento anterior que llegó después (prompt 34,
+    # decisiones 1 y 2): resolver una discrepancia más antigua, o
+    # registrar un movimiento con fecha hacia atrás, cambia el pasado de
+    # esta. No se aplica nada solo — se recalcula, se guarda aparte y se
+    # marca para que la persona vea el número viejo y el nuevo.
+    requiere_revision = models.BooleanField(default=False)
+    teorico_recalculado = models.IntegerField(null=True, blank=True)
+    diferencia_recalculada = models.IntegerField(null=True, blank=True)
+    motivo_revision = models.TextField(blank=True, default="")
+
+    cantidad_confirmada = models.IntegerField(
+        null=True, blank=True,
+        help_text="Lo que la persona decidió ajustar. Puede diferir de lo que sugirió el sistema.",
+    )
+    ajuste = models.OneToOneField(
+        MovimientoSalida, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="discrepancia_origen",
+    )
+    nota_resolucion = models.TextField(blank=True, default="")
+    resuelta_por = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True)
+    resuelta_en = models.DateTimeField(null=True, blank=True)
+
+    creado_en = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-conteo__fecha", "-conteo__ocurrido_en"]
+        verbose_name = "discrepancia de inventario"
+        verbose_name_plural = "discrepancias de inventario"
+
+    def __str__(self):
+        return f"Discrepancia {self.producto} ({self.conteo.fecha}): {self.diferencia:+d}"
+
+    @property
+    def esta_pendiente(self):
+        return self.estado == self.PENDIENTE
+
+    @property
+    def diferencia_vigente(self):
+        """La recalculada si la hay, si no la congelada original."""
+        if self.diferencia_recalculada is not None:
+            return self.diferencia_recalculada
+        return self.diferencia
+
+    @property
+    def ajuste_sugerido(self):
+        """
+        Cuánto habría que mover el stock para cuadrar. Es una SUGERENCIA:
+        quien resuelve puede escribir otra cantidad.
+
+        Signo: MovimientoSalida.cantidad resta stock, así que un sobrante
+        (diferencia positiva) se ajusta con una cantidad negativa.
+        """
+        return -self.diferencia_vigente
 
 
 class CorreccionHistorial(models.Model):
@@ -288,7 +499,22 @@ class CorreccionHistorial(models.Model):
     crea uno de estos sin el cambio real aplicado en la misma transacción,
     ni viceversa (ver las vistas de corrección en views.py).
     """
-    ACCION_CHOICES = (("edicion", "Edición"), ("eliminacion", "Eliminación"))
+    # "nota" (prompt 37) es distinta de las otras dos: no la hace una
+    # persona corrigiendo algo, la escribe el sistema para dejar
+    # constancia de un conflicto de orden que detectó y descartó solo por
+    # no cambiar ningún resultado. Nunca bloquea ni pide revisión — para
+    # eso está DiscrepanciaInventario.requiere_revision. Se guarda aquí y
+    # no en una tabla nueva porque esta YA ES el rastro de auditoría de
+    # "qué le pasó a los registros", ya se muestra en la pantalla de
+    # Correcciones y tiene todos los campos que hacen falta.
+    ACCION_EDICION = "edicion"
+    ACCION_ELIMINACION = "eliminacion"
+    ACCION_NOTA = "nota"
+    ACCION_CHOICES = (
+        (ACCION_EDICION, "Edición"),
+        (ACCION_ELIMINACION, "Eliminación"),
+        (ACCION_NOTA, "Nota automática"),
+    )
 
     tipo_registro = models.CharField(max_length=30)  # "LoteCompra", "MovimientoSalida", "ConteoFisico"
     registro_id = models.PositiveIntegerField()

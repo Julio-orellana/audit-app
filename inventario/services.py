@@ -138,6 +138,26 @@ def _unidades_ajuste_con_signo(ajustes_qs):
     return -total
 
 
+def _perdida_por_ajuste_faltante(ajustes_qs):
+    """
+    Costo del inventario que un ajuste confirmado dio por perdido.
+
+    Solo cuenta los FALTANTES. En MovimientoSalida.cantidad un ajuste
+    guarda su efecto real sobre el stock, así que cantidad > 0 es "resta
+    stock", o sea faltó producto: eso es una pérdida real, con su costo,
+    y resta de la ganancia neta igual que una merma (prompt 34b).
+
+    Un sobrante (cantidad < 0) se deja fuera a propósito. No es una venta
+    realizada; sumarlo como ganancia inflaría el resultado del período por
+    algo que solo significa que el registro estaba mal. Se reporta aparte,
+    en unidades_ajuste, que sí lleva los dos signos.
+    """
+    agregado = ajustes_qs.filter(cantidad__gt=0).aggregate(
+        perdida=Sum(F("cantidad") * F("costo_unitario_snapshot"))
+    )
+    return _money(agregado["perdida"])
+
+
 def resumen_producto(producto, fecha_inicio, fecha_fin):
     """
     Resumen financiero de un producto en el rango [fecha_inicio, fecha_fin]
@@ -174,9 +194,17 @@ def resumen_producto(producto, fecha_inicio, fecha_fin):
     unidades_merma = mermas_agg["unidades"] or 0
     perdida_por_merma = _money(mermas_agg["perdida"])
 
-    unidades_ajuste = _unidades_ajuste_con_signo(salidas.filter(tipo="ajuste"))
+    ajustes = salidas.filter(tipo="ajuste")
+    unidades_ajuste = _unidades_ajuste_con_signo(ajustes)
+    perdida_por_ajuste = _perdida_por_ajuste_faltante(ajustes)
 
-    ganancia_neta = _money(ganancia_bruta - perdida_por_merma)
+    # Un FALTANTE confirmado resta de la ganancia igual que una merma
+    # (prompt 34b): es inventario real que ya no está, con su costo, sin
+    # importar la causa. Un SOBRANTE no suma nada — no es una venta
+    # realizada, y contarlo como ganancia distorsionaría el reporte en la
+    # dirección contraria. Queda visible en unidades_ajuste, que es
+    # informativo y lleva los dos signos.
+    ganancia_neta = _money(ganancia_bruta - perdida_por_merma - perdida_por_ajuste)
 
     return {
         "unidades_compradas": unidades_compradas,
@@ -188,6 +216,7 @@ def resumen_producto(producto, fecha_inicio, fecha_fin):
         "unidades_merma": unidades_merma,
         "perdida_por_merma": perdida_por_merma,
         "unidades_ajuste": unidades_ajuste,
+        "perdida_por_ajuste": perdida_por_ajuste,
         "ganancia_neta": ganancia_neta,
         "stock_teorico_al_cierre": producto.stock_teorico(hasta_fecha=fecha_fin),
     }
@@ -207,9 +236,13 @@ _CLAVES_SUMABLES = (
     "unidades_merma",
     "perdida_por_merma",
     "unidades_ajuste",
+    "perdida_por_ajuste",
     "ganancia_neta",
 )
-_CLAVES_MONETARIAS = ("invertido", "ingreso", "costo_de_lo_vendido", "ganancia_bruta", "perdida_por_merma", "ganancia_neta")
+_CLAVES_MONETARIAS = (
+    "invertido", "ingreso", "costo_de_lo_vendido", "ganancia_bruta",
+    "perdida_por_merma", "perdida_por_ajuste", "ganancia_neta",
+)
 
 
 def resumen_general(fecha_inicio, fecha_fin, productos=None, motor=None):
@@ -283,13 +316,22 @@ def resumen_general(fecha_inicio, fecha_fin, productos=None, motor=None):
         perdida=Sum(F("cantidad") * F("costo_unitario_snapshot")),
     )
     # Mismo signo que _unidades_ajuste_con_signo(): positivo si sobró.
+    ajustes_qs = MovimientoSalida.objects.filter(
+        producto_id__in=producto_ids, fecha__gte=fecha_inicio, fecha__lte=fecha_fin, tipo="ajuste"
+    )
     ajustes_por_producto = {
         fila["producto_id"]: -(fila["total"] or 0)
-        for fila in MovimientoSalida.objects.filter(
-            producto_id__in=producto_ids, fecha__gte=fecha_inicio, fecha__lte=fecha_fin, tipo="ajuste"
-        )
+        for fila in ajustes_qs.values("producto_id").annotate(total=Sum("cantidad"))
+    }
+    # Solo los faltantes (cantidad > 0 = resta stock) pesan en la ganancia
+    # (prompt 34b). Tiene que calcularse igual que en resumen_producto():
+    # las dos implementaciones existen por rendimiento y ParidadResumen
+    # GeneralTests exige que den exactamente lo mismo.
+    perdida_ajuste_por_producto = {
+        fila["producto_id"]: _money(fila["perdida"])
+        for fila in ajustes_qs.filter(cantidad__gt=0)
         .values("producto_id")
-        .annotate(total=Sum("cantidad"))
+        .annotate(perdida=Sum(F("cantidad") * F("costo_unitario_snapshot")))
     }
 
     motor = motor or MotorStockCosto()
@@ -306,7 +348,8 @@ def resumen_general(fecha_inicio, fecha_fin, productos=None, motor=None):
         costo_de_lo_vendido = _money(ventas.get("costo"))
         ganancia_bruta = _money(ingreso - costo_de_lo_vendido)
         perdida_por_merma = _money(mermas.get("perdida"))
-        ganancia_neta = _money(ganancia_bruta - perdida_por_merma)
+        perdida_por_ajuste = perdida_ajuste_por_producto.get(producto.pk, Decimal("0.00"))
+        ganancia_neta = _money(ganancia_bruta - perdida_por_merma - perdida_por_ajuste)
 
         resumen = {
             "unidades_compradas": compras.get("unidades") or 0,
@@ -318,6 +361,7 @@ def resumen_general(fecha_inicio, fecha_fin, productos=None, motor=None):
             "unidades_merma": mermas.get("unidades") or 0,
             "perdida_por_merma": perdida_por_merma,
             "unidades_ajuste": ajustes_por_producto.get(producto.pk, 0),
+            "perdida_por_ajuste": perdida_por_ajuste,
             "ganancia_neta": ganancia_neta,
             "stock_teorico_al_cierre": motor.stock_teorico(producto.pk, hasta_fecha=fecha_fin),
         }
@@ -340,8 +384,59 @@ def resumen_general(fecha_inicio, fecha_fin, productos=None, motor=None):
 
 _ETIQUETAS_TIPO_SALIDA = {"venta": "Venta", "merma": "Merma"}
 
+# Códigos canónicos de "tipo de movimiento" (prompt 35), independientes
+# del texto que se muestra en pantalla (ese puede llevar acentos,
+# paréntesis, etc. — no sirve como valor de filtro estable). Un ajuste
+# CONFIRMADO (ya existe como MovimientoSalida) y una discrepancia
+# PENDIENTE (todavía ni tiene ajuste) son dos códigos distintos a
+# propósito: son dos momentos distintos de la misma historia, y quien
+# filtra por uno no quiere ver el otro mezclado — ver el docstring de
+# movimientos_periodo() para el detalle de cada caso.
+TIPO_ENTRADA = "entrada"
+TIPO_VENTA = "venta"
+TIPO_MERMA = "merma"
+TIPO_AJUSTE_SOBRANTE = "ajuste_sobrante"
+TIPO_AJUSTE_FALTANTE = "ajuste_faltante"
+TIPO_CONTEO = "conteo"
+TIPO_DISCREPANCIA_PENDIENTE = "discrepancia_pendiente"
+TIPO_DISCREPANCIA_RESUELTA = "discrepancia_resuelta"
+TIPO_DISCREPANCIA_DESCARTADA = "discrepancia_descartada"
+# Nota automática (prompt 37): constancia de un conflicto de orden que el
+# sistema detectó y descartó por no cambiar ningún resultado. No es un
+# movimiento —no mueve stock ni dinero— pero vive en el Historial porque
+# es justo ahí donde explica por qué el orden es el que es.
+TIPO_NOTA_AUTOMATICA = "nota_automatica"
 
-def movimientos_periodo(fecha_inicio, fecha_fin, productos=None, descendente=True):
+# Tope de notas automáticas que se traen al Historial. Son constancias
+# informativas, no movimientos: si algún día hubiera miles (una tienda
+# trabajando semanas sin conexión), no deben desplazar del Historial a lo
+# que de verdad movió inventario. Las que queden fuera siguen completas
+# en la pantalla de Correcciones, que es su lugar natural.
+LIMITE_NOTAS_HISTORIAL = 500
+
+# Los 3 estados de discrepancia se exponen tal cual —ni más ni menos—
+# porque son justo los que ya distingue DiscrepanciaInventario.ESTADOS
+# (prompt 34): no es un filtro nuevo inventado, es el mismo estado ya
+# modelado, solo hecho filtrable.
+OPCIONES_TIPO_MOVIMIENTO = [
+    ("", "Todos los tipos"),
+    (TIPO_ENTRADA, "Entrada"),
+    (TIPO_VENTA, "Venta"),
+    (TIPO_MERMA, "Merma"),
+    (TIPO_AJUSTE_SOBRANTE, "Ajuste (sobrante)"),
+    (TIPO_AJUSTE_FALTANTE, "Ajuste (faltante)"),
+    (TIPO_CONTEO, "Conteo físico (todos)"),
+    (TIPO_DISCREPANCIA_PENDIENTE, "· Discrepancia pendiente de revisión"),
+    (TIPO_DISCREPANCIA_RESUELTA, "· Discrepancia resuelta"),
+    (TIPO_DISCREPANCIA_DESCARTADA, "· Discrepancia descartada sin ajuste"),
+    (TIPO_NOTA_AUTOMATICA, "Nota automática del sistema"),
+]
+
+
+def movimientos_periodo(
+    fecha_inicio, fecha_fin, productos=None, descendente=True,
+    tipo_movimiento=None, usuario_id=None,
+):
     """
     Lista combinada y cronológica de TODO lo registrado en el rango
     [fecha_inicio, fecha_fin]: cada LoteCompra ("Entrada"), cada
@@ -351,24 +446,98 @@ def movimientos_periodo(fecha_inicio, fecha_fin, productos=None, descendente=Tru
     "Movimientos" del reporte Excel, así el auditor tiene un registro
     completo de todo lo que se hizo, no solo de lo que movió stock.
 
-    Cada fila es un dict: fecha, tipo, producto, cantidad (siempre positiva,
+    Cada fila es un dict: fecha, tipo (texto para mostrar), tipo_codigo
+    (uno de TIPO_*, para filtrar), producto, cantidad (siempre positiva,
     magnitud), valor_unitario (precio de venta para ventas, costo snapshot
     para merma/ajuste, None para un conteo físico — no aplica), usuario,
-    detalle (motivo, notas, o resumen de la diferencia), creado_en.
+    usuario_id, detalle (motivo, notas, o resumen de la diferencia),
+    creado_en (cuándo se insertó en la base — hora de sincronización para
+    algo que vino de la cola offline), ocurrido_en (prompt 34: el instante
+    real en que la persona lo registró en su equipo — la fecha que
+    importa para el orden cronológico, ver el sort al final).
 
     `productos`: iterable de Producto para filtrar, o None para todos.
     `descendente`: True = más reciente primero (uso en pantalla); False =
     cronológico ascendente (uso típico en un reporte Excel).
+    `tipo_movimiento`: uno de los TIPO_* de arriba, o None/"" para todos
+    (prompt 35). Decide de entrada CUÁLES de las tres tablas hace falta
+    siquiera consultar — pedir solo "venta" no toca LoteCompra ni
+    ConteoFisico en absoluto, ni un query de más.
+    `usuario_id`: pk de auth.User para filtrar por quien registró, o None
+    para todos (prompt 35).
+
+    Un ajuste CONFIRMADO (tipo_codigo="ajuste_sobrante"/"ajuste_faltante")
+    y una discrepancia PENDIENTE (tipo_codigo="discrepancia_pendiente")
+    son cosas DISTINTAS aunque nazcan del mismo conteo: la primera es un
+    MovimientoSalida real que ya movió stock; la segunda es el
+    ConteoFisico esperando revisión, con CERO movimiento de stock detrás
+    (ver inventario/discrepancias.py). Filtrar por "ajuste" nunca debe
+    traer de vuelta algo que todavía está pendiente, y viceversa — es
+    justo la distinción que este prompt pide mantener.
     """
-    lotes_qs = LoteCompra.objects.filter(
-        fecha__gte=fecha_inicio, fecha__lte=fecha_fin
-    ).select_related("producto", "registrado_por")
-    salidas_qs = MovimientoSalida.objects.filter(
-        fecha__gte=fecha_inicio, fecha__lte=fecha_fin
-    ).select_related("producto", "registrado_por")
-    conteos_qs = ConteoFisico.objects.filter(
-        fecha__gte=fecha_inicio, fecha__lte=fecha_fin
-    ).select_related("producto", "registrado_por")
+    from .models import DiscrepanciaInventario
+
+    incluir_lotes = tipo_movimiento in (None, "", TIPO_ENTRADA)
+    incluir_ventas = tipo_movimiento in (None, "", TIPO_VENTA)
+    incluir_mermas = tipo_movimiento in (None, "", TIPO_MERMA)
+    incluir_ajuste_sobrante = tipo_movimiento in (None, "", TIPO_AJUSTE_SOBRANTE)
+    incluir_ajuste_faltante = tipo_movimiento in (None, "", TIPO_AJUSTE_FALTANTE)
+    incluir_conteos = tipo_movimiento in (
+        None, "", TIPO_CONTEO,
+        TIPO_DISCREPANCIA_PENDIENTE, TIPO_DISCREPANCIA_RESUELTA, TIPO_DISCREPANCIA_DESCARTADA,
+    )
+    incluir_notas = tipo_movimiento in (None, "", TIPO_NOTA_AUTOMATICA)
+
+    lotes_qs = LoteCompra.objects.none()
+    if incluir_lotes:
+        lotes_qs = LoteCompra.objects.filter(
+            fecha__gte=fecha_inicio, fecha__lte=fecha_fin
+        ).select_related("producto", "registrado_por")
+        if usuario_id:
+            lotes_qs = lotes_qs.filter(registrado_por_id=usuario_id)
+
+    salidas_qs = MovimientoSalida.objects.none()
+    if incluir_ventas or incluir_mermas or incluir_ajuste_sobrante or incluir_ajuste_faltante:
+        salidas_qs = MovimientoSalida.objects.filter(
+            fecha__gte=fecha_inicio, fecha__lte=fecha_fin
+        ).select_related("producto", "registrado_por")
+        if usuario_id:
+            salidas_qs = salidas_qs.filter(registrado_por_id=usuario_id)
+        # Ventas/merma se distinguen por MovimientoSalida.tipo; sobrante
+        # vs. faltante son el MISMO tipo="ajuste" partido por el signo de
+        # cantidad (ver help_text de MovimientoSalida.cantidad) — no hay
+        # forma de pedir "solo sobrante" sin filtrar por cantidad también.
+        if tipo_movimiento == TIPO_VENTA:
+            salidas_qs = salidas_qs.filter(tipo="venta")
+        elif tipo_movimiento == TIPO_MERMA:
+            salidas_qs = salidas_qs.filter(tipo="merma")
+        elif tipo_movimiento == TIPO_AJUSTE_SOBRANTE:
+            salidas_qs = salidas_qs.filter(tipo="ajuste", cantidad__lt=0)
+        elif tipo_movimiento == TIPO_AJUSTE_FALTANTE:
+            salidas_qs = salidas_qs.filter(tipo="ajuste", cantidad__gt=0)
+        elif not tipo_movimiento:
+            pass  # sin filtro de tipo: venta + merma + ajuste, las tres
+        else:
+            # tipo_movimiento pedía algo que no es una MovimientoSalida
+            # (p. ej. "conteo"): no traer NADA de esta tabla.
+            salidas_qs = MovimientoSalida.objects.none()
+
+    conteos_qs = ConteoFisico.objects.none()
+    if incluir_conteos:
+        conteos_qs = ConteoFisico.objects.filter(
+            fecha__gte=fecha_inicio, fecha__lte=fecha_fin
+        ).select_related("producto", "registrado_por")
+        if usuario_id:
+            conteos_qs = conteos_qs.filter(registrado_por_id=usuario_id)
+        # El JOIN contra la discrepancia va a nivel de queryset —no se
+        # traen conteos de más para descartarlos después en Python—
+        # usando el related_name="discrepancia" de la OneToOneField.
+        if tipo_movimiento == TIPO_DISCREPANCIA_PENDIENTE:
+            conteos_qs = conteos_qs.filter(discrepancia__estado=DiscrepanciaInventario.PENDIENTE)
+        elif tipo_movimiento == TIPO_DISCREPANCIA_RESUELTA:
+            conteos_qs = conteos_qs.filter(discrepancia__estado=DiscrepanciaInventario.RESUELTA)
+        elif tipo_movimiento == TIPO_DISCREPANCIA_DESCARTADA:
+            conteos_qs = conteos_qs.filter(discrepancia__estado=DiscrepanciaInventario.DESCARTADA)
 
     if productos is not None:
         lotes_qs = lotes_qs.filter(producto__in=productos)
@@ -384,12 +553,15 @@ def movimientos_periodo(fecha_inicio, fecha_fin, productos=None, descendente=Tru
             {
                 "fecha": lote.fecha,
                 "tipo": "Entrada",
+                "tipo_codigo": TIPO_ENTRADA,
                 "producto": lote.producto,
                 "cantidad": lote.cantidad,
                 "valor_unitario": lote.costo_unitario,
                 "usuario": lote.registrado_por.username if lote.registrado_por else "",
+                "usuario_id": lote.registrado_por_id,
                 "detalle": detalle,
                 "creado_en": lote.creado_en,
+                "ocurrido_en": lote.ocurrido_en,
                 "tipo_registro": "LoteCompra",
                 "registro_id": lote.pk,
             }
@@ -397,14 +569,17 @@ def movimientos_periodo(fecha_inicio, fecha_fin, productos=None, descendente=Tru
 
     for salida in salidas_qs:
         tipo = _ETIQUETAS_TIPO_SALIDA.get(salida.tipo, "Ajuste")
+        tipo_codigo = {"venta": TIPO_VENTA, "merma": TIPO_MERMA}.get(salida.tipo)
         cantidad = salida.cantidad
         if salida.tipo == "ajuste":
             # cantidad negativa = sobrante (sumó stock); positiva = faltante.
             if salida.cantidad < 0:
                 tipo = "Ajuste (sobrante)"
+                tipo_codigo = TIPO_AJUSTE_SOBRANTE
                 cantidad = abs(salida.cantidad)
             else:
                 tipo = "Ajuste (faltante)"
+                tipo_codigo = TIPO_AJUSTE_FALTANTE
 
         valor_unitario = salida.precio_venta_unitario if salida.tipo == "venta" else salida.costo_unitario_snapshot
 
@@ -412,12 +587,15 @@ def movimientos_periodo(fecha_inicio, fecha_fin, productos=None, descendente=Tru
             {
                 "fecha": salida.fecha,
                 "tipo": tipo,
+                "tipo_codigo": tipo_codigo,
                 "producto": salida.producto,
                 "cantidad": cantidad,
                 "valor_unitario": valor_unitario,
                 "usuario": salida.registrado_por.username if salida.registrado_por else "",
+                "usuario_id": salida.registrado_por_id,
                 "detalle": salida.motivo or "",
                 "creado_en": salida.creado_en,
+                "ocurrido_en": salida.ocurrido_en,
                 "tipo_registro": "MovimientoSalida",
                 "registro_id": salida.pk,
             }
@@ -425,22 +603,40 @@ def movimientos_periodo(fecha_inicio, fecha_fin, productos=None, descendente=Tru
 
     conteos = list(conteos_qs)
     if conteos:
-        # MotorStockCosto se construye UNA vez (3 consultas fijas) y
-        # resuelve conteo.diferencia para cada conteo en memoria — antes,
-        # la property ConteoFisico.diferencia disparaba su propio
-        # stock_teorico(hasta_fecha=...) por cada conteo mostrado (33
-        # consultas con 5 conteos, medido en el prompt 20; crecía 1:1 con
-        # la cantidad de conteos en el rango). El resultado es idéntico a
-        # conteo.diferencia (mismo MotorStockCosto que resumen_general(),
-        # ver ParidadResumenGeneralTests) — solo cambia cómo se calcula.
-        motor = MotorStockCosto()
+        # La diferencia sale de la DiscrepanciaInventario congelada, no de
+        # una resta contra el stock actual (prompt 34). Antes se
+        # recalculaba aquí con hasta_fecha, y el resultado era engañoso en
+        # cuanto llegaba cualquier movimiento posterior: comprobado en el
+        # Excel de este mismo prompt, un conteo cuya diferencia real era
+        # −5 aparecía como "+7" después de aplicarle su propio ajuste,
+        # porque la resta se hacía contra el stock ya corregido. Un número
+        # sin significado en un reporte financiero.
+        discrepancias = {
+            d.conteo_id: d
+            for d in DiscrepanciaInventario.objects.filter(conteo__in=conteos)
+        }
         for conteo in conteos:
-            diferencia = conteo.cantidad_contada - motor.stock_teorico(conteo.producto_id, hasta_fecha=conteo.fecha)
-            detalle = f"Contado: {conteo.cantidad_contada} · Diferencia: {diferencia:+d}"
-            if conteo.ajuste_generado_id:
-                detalle += " · ajuste generado"
-            elif diferencia != 0:
-                detalle += " · pendiente de ajuste"
+            discrepancia = discrepancias.get(conteo.pk)
+            if discrepancia is None:
+                # Sin discrepancia registrada el conteo cuadró exacto —o
+                # es anterior al prompt 34, y entonces no hay un número
+                # confiable que mostrar.
+                detalle = f"Contado: {conteo.cantidad_contada}"
+                tipo_codigo = TIPO_CONTEO
+            else:
+                detalle = (
+                    f"Contado: {conteo.cantidad_contada} · "
+                    f"Diferencia: {discrepancia.diferencia:+d}"
+                )
+                if discrepancia.estado == DiscrepanciaInventario.RESUELTA:
+                    detalle += f" · ajuste aplicado ({discrepancia.cantidad_confirmada:+d})"
+                    tipo_codigo = TIPO_DISCREPANCIA_RESUELTA
+                elif discrepancia.estado == DiscrepanciaInventario.DESCARTADA:
+                    detalle += " · revisada sin ajuste"
+                    tipo_codigo = TIPO_DISCREPANCIA_DESCARTADA
+                else:
+                    detalle += " · pendiente de revisión"
+                    tipo_codigo = TIPO_DISCREPANCIA_PENDIENTE
             if conteo.notas:
                 detalle += f" · {conteo.notas}"
 
@@ -448,18 +644,101 @@ def movimientos_periodo(fecha_inicio, fecha_fin, productos=None, descendente=Tru
                 {
                     "fecha": conteo.fecha,
                     "tipo": "Conteo físico",
+                    "tipo_codigo": tipo_codigo,
                     "producto": conteo.producto,
                     "cantidad": conteo.cantidad_contada,
                     "valor_unitario": None,
                     "usuario": conteo.registrado_por.username if conteo.registrado_por else "",
+                    "usuario_id": conteo.registrado_por_id,
                     "detalle": detalle,
                     "creado_en": conteo.creado_en,
+                    "ocurrido_en": conteo.ocurrido_en,
                     "tipo_registro": "ConteoFisico",
                     "registro_id": conteo.pk,
                 }
             )
 
-    filas.sort(key=lambda f: (f["fecha"], f["creado_en"]), reverse=descendente)
+    if incluir_notas:
+        filas.extend(_filas_de_notas_automaticas(fecha_inicio, fecha_fin, productos, usuario_id))
+
+    # ocurrido_en, no creado_en (prompt 35): el orden cronológico real es
+    # cuándo se registró en el equipo de quien lo hizo, no cuándo llegó a
+    # la base. Con creado_en, un movimiento cargado sin conexión y
+    # sincronizado horas después aparecía al FINAL de la lista según la
+    # hora de sincronización, en vez de en el lugar que le correspondía
+    # según cuándo ocurrió de verdad — ver AnclaTemporalMixin (prompt 34).
+    filas.sort(key=lambda f: (f["fecha"], f["ocurrido_en"]), reverse=descendente)
+    return filas
+
+
+def _filas_de_notas_automaticas(fecha_inicio, fecha_fin, productos=None, usuario_id=None):
+    """
+    Las notas automáticas del sistema como filas de Historial (prompt 37).
+
+    No son movimientos: no mueven stock ni dinero, y por eso no tienen
+    cantidad ni valor. Están en el Historial porque es exactamente ahí
+    donde hacen falta — explican por qué un movimiento aparece donde
+    aparece cuando llegó fuera de orden.
+
+    `usuario_id`: una nota la escribe el SISTEMA, no una persona
+    (realizado_por es NULL), así que filtrar por usuario las excluye
+    siempre. Es lo correcto: quien busca "todo lo de Ruth" no está
+    buscando notas que Ruth no escribió.
+    """
+    from .models import CorreccionHistorial, Producto
+
+    if usuario_id:
+        return []
+
+    notas = list(
+        CorreccionHistorial.objects
+        .filter(accion=CorreccionHistorial.ACCION_NOTA)
+        .order_by("-fecha")[:LIMITE_NOTAS_HISTORIAL]
+    )
+    if not notas:
+        return []
+
+    ids_producto = {n.datos_nuevos.get("producto_id") for n in notas if n.datos_nuevos}
+    ids_producto.discard(None)
+    productos_por_id = {p.pk: p for p in Producto.objects.filter(pk__in=ids_producto)}
+    ids_permitidos = {p.pk for p in productos} if productos is not None else None
+
+    filas = []
+    for nota in notas:
+        datos = nota.datos_nuevos or {}
+        producto = productos_por_id.get(datos.get("producto_id"))
+        if producto is None:
+            continue
+        if ids_permitidos is not None and producto.pk not in ids_permitidos:
+            continue
+        try:
+            fecha = date.fromisoformat(datos["fecha"])
+            ocurrido_en = datetime.fromisoformat(datos["ocurrido_en"])
+        except (KeyError, TypeError, ValueError):
+            # Nota escrita por una versión anterior, sin estos campos: se
+            # omite del Historial en vez de reventarlo. Sigue visible en
+            # la pantalla de Correcciones.
+            continue
+        if not (fecha_inicio <= fecha <= fecha_fin):
+            continue
+
+        filas.append(
+            {
+                "fecha": fecha,
+                "tipo": "Nota automática",
+                "tipo_codigo": TIPO_NOTA_AUTOMATICA,
+                "producto": producto,
+                "cantidad": 0,
+                "valor_unitario": None,
+                "usuario": "",          # la escribió el sistema
+                "usuario_id": None,
+                "detalle": nota.motivo,
+                "creado_en": nota.fecha,
+                "ocurrido_en": ocurrido_en,
+                "tipo_registro": "CorreccionHistorial",
+                "registro_id": nota.pk,
+            }
+        )
     return filas
 
 
@@ -563,57 +842,52 @@ def conteos_activos_por_producto():
 
 def alertas_conteo_fisico(motor=None, conteos_por_producto=None):
     """
-    Productos activos con AL MENOS UN ConteoFisico sin resolver: diferencia
-    distinta de 0 y sin ajuste_generado.
+    Discrepancias PENDIENTES de revisión, para el tablero.
 
-    Importante: antes esta función solo miraba el ÚLTIMO ConteoFisico de
-    cada producto. Eso significaba que si se registraba un conteo nuevo
-    para un producto que ya tenía un conteo anterior sin resolver, el
-    anterior desaparecía de las alertas sin que nadie lo hubiera aprobado
-    y sin que el stock se hubiera movido — parecía que el sistema lo había
-    resuelto solo. Ahora se revisan TODOS los conteos del producto, así
-    que ningún conteo sin ajuste queda invisible.
+    Desde el prompt 34 esto lee registros persistidos
+    (DiscrepanciaInventario) en vez de recalcular la resta contra el
+    stock actual. El cambio es el punto entero del rediseño: antes la
+    alerta era literalmente `if diferencia != 0`, así que una venta
+    posterior que hiciera cuadrar los números la borraba de la pantalla
+    sin que nadie la hubiera revisado — el faltante real seguía ahí, ya
+    sin ninguna señal. Ahora una alerta solo desaparece porque una
+    persona la resolvió o la descartó.
 
-    Devuelve una lista de dicts: {"producto", "conteo", "diferencia",
-    "total_pendientes"}.
-    - "conteo": el conteo sin resolver MÁS ANTIGUO de ese producto (para
-      animar a resolverlos en el orden en que ocurrieron).
-    - "total_pendientes": cuántos conteos sin resolver tiene ese producto
-      en total (normalmente 1; más de 1 solo si se dejaron varios conteos
-      sin generar su ajuste antes de seguir contando).
-    Ordenados por fecha del conteo pendiente más antiguo (más urgente primero).
+    Los parámetros `motor` y `conteos_por_producto` se conservan por
+    compatibilidad con home(), que los venía pasando para no repetir
+    consultas; ya no se usan, porque leer discrepancias es una sola
+    consulta y no hace falta calcular stock para nada.
 
-    Rendimiento (prompt 18b): antes recorría cada producto activo y por
-    cada uno consultaba sus conteos_fisicos más la property .diferencia
-    de cada conteo (consultas proporcionales a productos y conteos).
-    Ahora usa un MotorStockCosto compartido (3 consultas fijas) y una
-    única consulta de conteos — o la que ya trae el llamador via
-    `conteos_por_producto`/`motor`, para no repetirla (ver home()).
+    Devuelve una lista de dicts: {"producto", "conteo", "discrepancia",
+    "diferencia", "total_pendientes", "requiere_revision"}, ordenada por
+    el momento real del conteo pendiente más antiguo de cada producto.
     """
-    motor = motor or MotorStockCosto()
-    if conteos_por_producto is None:
-        conteos_por_producto = conteos_activos_por_producto()
+    from .models import DiscrepanciaInventario
+
+    pendientes = (
+        DiscrepanciaInventario.objects
+        .filter(estado=DiscrepanciaInventario.PENDIENTE)
+        .select_related("conteo", "producto")
+        .order_by("conteo__fecha", "conteo__ocurrido_en")
+    )
+
+    por_producto = {}
+    for discrepancia in pendientes:
+        por_producto.setdefault(discrepancia.producto_id, []).append(discrepancia)
 
     alertas = []
-    for producto_id, conteos in conteos_por_producto.items():
-        pendientes = []
-        for conteo in conteos:
-            if conteo.ajuste_generado_id is not None:
-                continue
-            diferencia = conteo.cantidad_contada - motor.stock_teorico(producto_id, hasta_fecha=conteo.fecha)
-            if diferencia != 0:
-                pendientes.append((conteo, diferencia))
-        if not pendientes:
-            continue
-        conteo_mas_antiguo, diferencia_mas_antigua = pendientes[0]
+    for lista in por_producto.values():
+        primera = lista[0]
         alertas.append(
             {
-                "producto": conteo_mas_antiguo.producto,
-                "conteo": conteo_mas_antiguo,
-                "diferencia": diferencia_mas_antigua,
-                "total_pendientes": len(pendientes),
+                "producto": primera.producto,
+                "conteo": primera.conteo,
+                "discrepancia": primera,
+                "diferencia": primera.diferencia_vigente,
+                "total_pendientes": len(lista),
+                "requiere_revision": any(d.requiere_revision for d in lista),
             }
         )
 
-    alertas.sort(key=lambda a: a["conteo"].fecha)
+    alertas.sort(key=lambda a: (a["conteo"].fecha, a["conteo"].ocurrido_en))
     return alertas

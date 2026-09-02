@@ -42,7 +42,18 @@ BASE_DIR_ESCRIBIBLE = carpeta_escribible()
 # nada y simplemente se usan las variables de entorno del sistema, si las
 # hay — de ahí cae al fallback de SQLite más abajo.
 env = environ.Env()
-environ.Env.read_env(str(BASE_DIR_ESCRIBIBLE / ".env"))
+_RUTA_ENV = BASE_DIR_ESCRIBIBLE / ".env"
+# encoding="utf-8-sig" (prompt 33): el Bloc de notas de Windows —y varios
+# editores más— guardan en UTF-8 CON BOM. django-environ lee por defecto
+# como "utf8", así que el BOM queda pegado al inicio de la PRIMERA línea:
+# "﻿DATABASE_URL=..." ya no hace match con su expresión regular, la
+# descarta como "Invalid line" y esa variable simplemente no existe.
+# Comprobado: con un .env de dos líneas guardado con BOM, DATABASE_URL
+# queda en None y DEBUG (segunda línea) se lee bien — o sea que la app
+# arranca "sin configuración de nube" aunque el archivo esté ahí y se vea
+# perfecto al abrirlo. "utf-8-sig" quita el BOM si existe y no cambia
+# nada si no existe.
+environ.Env.read_env(str(_RUTA_ENV), encoding="utf-8-sig")
 
 
 # Quick-start development settings - unsuitable for production
@@ -112,25 +123,48 @@ MIDDLEWARE = [
 LOGGING = {
     'version': 1,
     'disable_existing_loggers': False,
+    'formatters': {
+        'detallado': {
+            'format': '%(asctime)s [%(levelname)s] %(threadName)s %(name)s: %(message)s',
+        },
+    },
     'handlers': {
         'console': {
             'class': 'logging.StreamHandler',
+            'formatter': 'detallado',
+        },
+        # Log a ARCHIVO, junto al ejecutable (prompt 33). Es la única
+        # forma de tener rastro en el .exe de Windows: con console=False
+        # el proceso no tiene consola, sys.stdout y sys.stderr son None,
+        # y todo lo que va a la consola se descarta en silencio.
+        #
+        # Tiene que estar declarado AQUÍ, dentro de LOGGING, y no
+        # agregarse a mano en tiempo de ejecución: get_wsgi_application()
+        # vuelve a llamar a django.setup(), que re-aplica esta
+        # configuración con dictConfig y borra cualquier handler añadido
+        # por fuera. Ese fue justo el bug que hacía que el archivo solo
+        # tuviera las líneas del arranque y ninguna request — y que me
+        # llevó a concluir, mal, que la app no estaba sirviendo páginas.
+        #
+        # delay=True: no se toca el disco hasta que haya algo que
+        # escribir, así que un directorio sin permiso de escritura no
+        # impide arrancar.
+        'archivo': {
+            'class': 'logging.FileHandler',
+            'filename': str(BASE_DIR_ESCRIBIBLE / 'diagnostico.log'),
+            'encoding': 'utf-8',
+            'delay': True,
+            'formatter': 'detallado',
         },
     },
     'loggers': {
-        'inventario.tiempos': {
-            'handlers': ['console'],
-            'level': 'INFO',
-            'propagate': False,
-        },
-        # Prompt 19b: sin esta entrada, el logger del motor de
-        # sincronización no tenía ningún handler y su nivel efectivo era
-        # WARNING — o sea, "Sincronización offline: N movimientos
-        # confirmados" NUNCA se imprimía y los fallos del hilo pasaban en
-        # silencio. Parte de por qué el punto 2 se veía como "no pasa
-        # nada" en vez de como un error concreto.
-        'inventario.offline': {
-            'handlers': ['console'],
+        # Un solo logger padre: "inventario.tiempos",
+        # "inventario.offline" y "inventario.diagnostico" propagan aquí
+        # por herencia. Antes cada uno se declaraba por separado con
+        # propagate=False, que es justo lo que impedía sumarles un
+        # handler común.
+        'inventario': {
+            'handlers': ['console', 'archivo'],
             'level': 'INFO',
             'propagate': False,
         },
@@ -182,11 +216,123 @@ _es_comando_migrate = len(sys.argv) > 1 and sys.argv[1] == "migrate"
 _database_url = env("DATABASE_URL", default=None)
 _direct_database_url = env("DIRECT_DATABASE_URL", default=None)
 
-if _database_url:
-    _url_para_conectar = _direct_database_url if (_es_comando_migrate and _direct_database_url) else _database_url
-    DATABASES = {
-        "default": dj_database_url.parse(_url_para_conectar, conn_max_age=60, ssl_require=True)
-    }
+
+def _interpretar_url_de_nube(url):
+    """
+    Convierte DATABASE_URL en una configuración de Django utilizable, o
+    explica por qué no se puede. Devuelve (config, motivo_del_fallo);
+    motivo es None cuando la configuración sirve.
+
+    Existe porque "hay DATABASE_URL" y "DATABASE_URL sirve" NO son lo
+    mismo, y confundirlos rompía la app de dos formas distintas
+    (prompt 33c):
+
+    - Una URL basura ('no-es-una-url', o solo espacios) hace que
+      dj_database_url.parse() lance UnknownSchemeError. Como esto corre
+      al importar settings.py, la excepción reventaba el arranque
+      ENTERO: ni ventana, ni log, ni mensaje — nada.
+    - 'postgresql://' a secas sí parsea, pero produce HOST='' y NAME='':
+      la app arranca, nunca puede conectarse, y ni siquiera quedaba
+      marcada como "sin configurar", así que mostraba el aviso de corte
+      de red normal en vez del de problema de configuración.
+
+    Una URL presente pero inservible NUNCA se trata como "el usuario
+    quería SQLite": eso es siempre un error que hay que avisar, también
+    en desarrollo.
+    """
+    if not url or not str(url).strip():
+        return None, "DATABASE_URL no está definida"
+    try:
+        cfg = dj_database_url.parse(url, conn_max_age=60, ssl_require=True)
+    except Exception as error:
+        return None, f"DATABASE_URL no se pudo interpretar ({type(error).__name__})"
+    motor = cfg.get("ENGINE") or ""
+    if "postgresql" not in motor:
+        return None, f"DATABASE_URL no apunta a PostgreSQL (motor detectado: {motor or 'ninguno'})"
+    if not cfg.get("HOST") or not cfg.get("NAME"):
+        return None, "DATABASE_URL no incluye host y/o nombre de base de datos"
+
+    # TLS es obligatorio (ssl_require=True arriba) y así se queda para
+    # cualquier host remoto: Neon lo exige y una conexión sin cifrar a
+    # través de internet expondría las credenciales.
+    #
+    # La única excepción es un Postgres corriendo en esta misma máquina,
+    # que por omisión no habla SSL: sin esto no había forma de correr la
+    # regresión contra Postgres de verdad en local, y quedaba la
+    # disyuntiva de probar contra SQLite (que no reproduce el motor real)
+    # o contra Neon (que cuesta y toca datos que no son de prueba).
+    # Se exige que las DOS cosas se cumplan —host local Y sslmode=disable
+    # escrito a mano en la URL— para que un sslmode=disable copiado por
+    # error a una URL de producción no baje el cifrado en silencio.
+    host = (cfg.get("HOST") or "").lower()
+    if host in ("localhost", "127.0.0.1", "::1") and "sslmode=disable" in str(url).lower():
+        cfg.setdefault("OPTIONS", {})["sslmode"] = "disable"
+
+    return cfg, None
+
+
+# EL VALOR A SUBIR SI ALGUNA LAPTOP RESULTA MÁS LENTA. Está aquí, en una
+# sola constante, y además se puede cambiar SIN RECOMPILAR poniendo
+# DB_CONNECT_TIMEOUT en el .env que vive junto al .exe (ver
+# _leer_connect_timeout() abajo y .env.example).
+#
+# 8 y no 3 (prompt 33d). Con 3 el sistema se rompía al revés que en el
+# 33: en la VM de Windows, un handshake real y sano que pasara de 3s se
+# daba por "sin conexión", se marcaba la caché negativa, y TODO login
+# posterior se resolvía contra la caché local aunque internet estuviera
+# perfecto. Medido al diagnosticarlo: en Mac el handshake completo con
+# Neon (TCP + TLS + SCRAM con channel binding) tarda 0.6s estable y
+# 1.9s en frío; en la VM el migrate de arranque tardaba 4.33s. 8s deja
+# margen real sobre todo lo observado sin ser ilimitado.
+#
+# Contrapartida, medida y aceptada a propósito: connect_timeout es POR
+# DIRECCIÓN IP y el host de Neon resuelve a 3, así que detectar un corte
+# de red REAL pasa de ~9s a ~24s en el peor caso. Eso es tolerable
+# porque desde el 33d ese costo lo paga UN SOLO hilo —los demás esperan
+# su resultado en vez de repetir el intento, ver
+# esperar_sondeo_en_curso() en offline.py— y normalmente lo paga el hilo
+# de sincronización de fondo, no una request. Sigue muy lejos de los 75s
+# del bug original del prompt 33.
+SEGUNDOS_TIMEOUT_CONEXION_POR_DEFECTO = 8
+
+
+def _leer_connect_timeout():
+    """
+    connect_timeout, tomado del .env si está y con respaldo si no.
+
+    Nunca revienta por un valor mal escrito. Ese cuidado no es
+    paranoia: este archivo se lee AL IMPORTAR settings.py, así que
+    cualquier excepción aquí deja la app sin arrancar en absoluto —ni
+    ventana, ni log, ni mensaje— que es justo el fallo que se corrigió
+    para DATABASE_URL en este mismo prompt. Un `DB_CONNECT_TIMEOUT=`
+    vacío, o con letras, o en cero, cae al valor por defecto en vez de
+    tumbar el programa.
+    """
+    crudo = env("DB_CONNECT_TIMEOUT", default=None)
+    if crudo is None or not str(crudo).strip():
+        return SEGUNDOS_TIMEOUT_CONEXION_POR_DEFECTO
+    try:
+        valor = int(str(crudo).strip())
+    except (TypeError, ValueError):
+        return SEGUNDOS_TIMEOUT_CONEXION_POR_DEFECTO
+    # libpq trata 0 como "sin límite", que es exactamente lo que este
+    # ajuste existe para evitar: una espera sin techo cuelga la ventana.
+    if valor < 1:
+        return SEGUNDOS_TIMEOUT_CONEXION_POR_DEFECTO
+    return min(valor, 60)
+
+
+_url_para_conectar = _direct_database_url if (_es_comando_migrate and _direct_database_url) else _database_url
+_config_nube, _motivo_bd_no_configurada = _interpretar_url_de_nube(_url_para_conectar)
+
+if _config_nube is not None:
+    DATABASES = {"default": _config_nube}
+    # Backend propio (prompt 33c): es PostgreSQL de siempre, más un
+    # corto que evita reintentar la red cuando ya consta que está
+    # caída. Ver inventario/db_backend/base.py — sin esto, una sola
+    # página sin conexión llegaba a pagar el timeout tres veces
+    # seguidas (27.6s medidos en la VM de Windows).
+    DATABASES["default"]["ENGINE"] = "inventario.db_backend"
     # Detecta una conexión persistente muerta (ej. el cómputo serverless de
     # Neon se suspendió por inactividad) y la reabre en vez de fallar la
     # siguiente request — dj_database_url.parse() no siempre expone este
@@ -223,30 +369,63 @@ if _database_url:
     # dashboard consultando /estado-sincronizacion/ cada 4s, eso deja la
     # app entera sin responder en menos de 20 segundos.
     #
-    # - connect_timeout: corta el intento de conexión NUEVA. 10s es
-    #   holgado para que Neon despierte su cómputo serverless suspendido
-    #   sin cortar una conexión legítima, y aun así ~7x más rápido que
-    #   los 75s del sistema operativo.
+    # - connect_timeout=3: corta el intento de conexión NUEVA. 25x más
+    #   rápido que los 75s del sistema operativo, y lo bastante corto
+    #   para que la ventana nunca se sienta congelada.
+    #
+    #   Contrapartida asumida a propósito: si el cómputo serverless de
+    #   Neon está suspendido, despertarlo puede tardar más de 3s y esa
+    #   conexión legítima se va a dar por fallida. NO se pierde nada —
+    #   la app entra en modo offline, encola el movimiento, y el hilo de
+    #   fondo reintenta a los 20s, cuando el cómputo ya despertó. O sea
+    #   que el peor caso es un aviso de "sin conexión" pasajero, no un
+    #   dato perdido. Se prefiere eso a que la app se congele: un
+    #   congelamiento no se recupera solo, un reintento sí.
+    #
     # - keepalives*: detectan una conexión YA ESTABLECIDA que murió (el
     #   caso "la app estaba abierta y se cayó la red"). Sin esto, un
     #   SELECT sobre un socket muerto espera el timeout de retransmisión
     #   de TCP, que son MINUTOS. Con esta configuración se detecta en
-    #   ~30 + 3x10 = 60s como máximo, y normalmente mucho antes.
-    #   Se usa keepalives (portable: Windows/macOS/Linux) y no
-    #   tcp_user_timeout, que solo existe en Linux.
+    #   ~10 + 3x5 = 25s como máximo, y normalmente mucho antes.
+    #   keepalives es portable (Windows/macOS/Linux).
+    #
+    # - tcp_user_timeout: refuerza lo anterior, pero SOLO existe en
+    #   Linux; en Windows y macOS libpq lo acepta y lo ignora sin error
+    #   (comprobado). Se deja por si algún día esto corre en Linux.
+    # DB_CONNECT_TIMEOUT se puede fijar en el .env, junto al .exe, SIN
+    # recompilar (prompt 33c). Hace falta porque el valor bueno depende
+    # de la red donde corra la app, y eso no se sabe desde aquí: el
+    # saludo completo con Neon (TCP + TLS + autenticación SCRAM con
+    # channel binding) son 6-8 viajes de ida y vuelta, así que una red
+    # con 400ms de latencia necesita bastante más que una con 20ms. En
+    # la VM de Windows este valor en 3 dejaba fuera conexiones
+    # perfectamente sanas, y sin poder ajustarlo desde el .env la única
+    # salida era recompilar el .exe. La sonda de conectividad
+    # (inventario/diagnostico.py) dice en el log qué número poner.
     DATABASES["default"].setdefault("OPTIONS", {}).update({
-        "connect_timeout": 10,
+        "connect_timeout": _leer_connect_timeout(),
         "keepalives": 1,
-        "keepalives_idle": 30,
-        "keepalives_interval": 10,
+        "keepalives_idle": 10,
+        "keepalives_interval": 5,
         "keepalives_count": 3,
+        "tcp_user_timeout": 10000,  # ms; ignorado fuera de Linux
     })
 
     # La configuración de la nube sí se pudo leer.
     BD_NUBE_NO_CONFIGURADA = False
-elif esta_empaquetado():
-    # Build empaquetado (.exe) SIN configuración de nube legible — falta
-    # el .env junto al ejecutable, o su DATABASE_URL es inválida.
+    BD_MOTIVO_NO_CONFIGURADA = None
+elif esta_empaquetado() or _database_url:
+    # No hay configuración de nube utilizable, y caer a SQLite sería
+    # peligroso. Dos casos entran aquí:
+    #
+    #   a) build empaquetado (.exe) sin .env legible junto al ejecutable;
+    #   b) CUALQUIER entorno —también desarrollo— donde DATABASE_URL
+    #      existe pero no sirve (basura, sin host, motor equivocado).
+    #
+    # El caso (b) se incluye a propósito: quien escribió una DATABASE_URL
+    # quería la nube, no SQLite. Tratar su error de tipeo como "ah,
+    # entonces usemos SQLite" es exactamente el fallo silencioso que
+    # costó este prompt.
     #
     # ESTE ES EL BUG RAÍZ DEL PROMPT 33, confirmado con el log de la VM de
     # Windows: antes se caía en silencio al SQLite local de abajo, y eso
@@ -273,7 +452,7 @@ elif esta_empaquetado():
     # (ver context_processors.py y templates/base.html).
     DATABASES = {
         "default": {
-            "ENGINE": "django.db.backends.postgresql",
+            "ENGINE": "inventario.db_backend",
             "NAME": "no_configurada",
             "HOST": "base-de-datos-no-configurada.invalid",
             "USER": "",
@@ -283,6 +462,7 @@ elif esta_empaquetado():
         }
     }
     BD_NUBE_NO_CONFIGURADA = True
+    BD_MOTIVO_NO_CONFIGURADA = _motivo_bd_no_configurada
 else:
     # Desarrollo sin .env (nunca un .exe): SQLite local de siempre, para
     # poder trabajar sin tener Postgres configurado. Aquí sí es un
@@ -295,6 +475,7 @@ else:
         }
     }
     BD_NUBE_NO_CONFIGURADA = False
+    BD_MOTIVO_NO_CONFIGURADA = None
 
 # "local_disco" (prompt 19, motor de sincronización offline): alias
 # EXCLUSIVAMENTE local, nunca habla con Neon — ver inventario/db_router.py

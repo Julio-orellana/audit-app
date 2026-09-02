@@ -118,26 +118,28 @@
   </div>
 
   <div class="info-card" style="overflow:hidden;margin-bottom:24px;">
-    <div style="display:grid;grid-template-columns:1.6fr 1fr 1fr 1fr 1fr;padding:12px 20px;font-size:12px;font-weight:700;color:var(--ink-faint);text-transform:uppercase;letter-spacing:.03em;border-bottom:1px solid var(--border);">
-      <div>Producto</div><div>Comprado (unid.)</div><div>Vendido (unid.)</div><div>Merma (unid.)</div><div>Ganancia neta (Q)</div>
+    <div style="display:grid;grid-template-columns:1.6fr 1fr 1fr 1fr 1fr 1fr;padding:12px 20px;font-size:12px;font-weight:700;color:var(--ink-faint);text-transform:uppercase;letter-spacing:.03em;border-bottom:1px solid var(--border);">
+      <div>Producto</div><div>Comprado (unid.)</div><div>Vendido (unid.)</div><div>Merma (unid.)</div><div title="Ajustes de inventario confirmados: negativo = faltante encontrado al contar. Un faltante resta de la ganancia neta; un sobrante no suma.">Ajuste (unid.)</div><div>Ganancia neta (Q)</div>
     </div>
     {% for fila in resumen.productos %}
-      <div style="display:grid;grid-template-columns:1.6fr 1fr 1fr 1fr 1fr;padding:11px 20px;align-items:center;border-bottom:1px solid var(--border);font-size:13.5px;">
+      <div style="display:grid;grid-template-columns:1.6fr 1fr 1fr 1fr 1fr 1fr;padding:11px 20px;align-items:center;border-bottom:1px solid var(--border);font-size:13.5px;">
         <div style="font-weight:600;">{{ fila.producto_nombre }}</div>
         <div class="num">{{ fila.unidades_compradas }}</div>
         <div class="num">{{ fila.unidades_vendidas }}</div>
         <div class="num">{{ fila.unidades_merma }}</div>
+        <div class="num" {% if fila.unidades_ajuste < 0 %}style="color:var(--danger-ink);"{% endif %}>{% if fila.unidades_ajuste %}{{ fila.unidades_ajuste|stringformat:"+d" }}{% else %}0{% endif %}</div>
         <div class="num" style="font-weight:700;{% if fila.ganancia_neta < 0 %}color:var(--danger-ink);{% else %}color:var(--success);{% endif %}">Q{{ fila.ganancia_neta }}</div>
       </div>
     {% empty %}
       <div style="padding:16px 20px;color:var(--ink-faint);">Sin productos incluidos.</div>
     {% endfor %}
     {% if resumen.productos %}
-      <div style="display:grid;grid-template-columns:1.6fr 1fr 1fr 1fr 1fr;padding:12px 20px;align-items:center;font-size:13.5px;font-weight:800;background:oklch(96% 0.006 80);">
+      <div style="display:grid;grid-template-columns:1.6fr 1fr 1fr 1fr 1fr 1fr;padding:12px 20px;align-items:center;font-size:13.5px;font-weight:800;background:oklch(96% 0.006 80);">
         <div>TOTAL</div>
         <div class="num">{{ resumen.totales.unidades_compradas }}</div>
         <div class="num">{{ resumen.totales.unidades_vendidas }}</div>
         <div class="num">{{ resumen.totales.unidades_merma }}</div>
+        <div class="num" {% if resumen.totales.unidades_ajuste < 0 %}style="color:var(--danger-ink);"{% endif %}>{% if resumen.totales.unidades_ajuste %}{{ resumen.totales.unidades_ajuste|stringformat:"+d" }}{% else %}0{% endif %}</div>
         <div class="num" style="{% if resumen.totales.ganancia_neta < 0 %}color:var(--danger-ink);{% else %}color:var(--success);{% endif %}">Q{{ resumen.totales.ganancia_neta }}</div>
       </div>
     {% endif %}

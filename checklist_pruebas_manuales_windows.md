@@ -1,78 +1,428 @@
-# Checklist de pruebas manuales — .exe empaquetado en Windows
+# Checklist de pruebas manuales en Windows — motor offline (prompts 33 / 33b / 33c)
 
-Esta lista es para que tú la corras directamente en la VM de Windows, no para Claude Code. Ve marcando cada punto; si algo falla, anota exactamente qué pasó (mensaje, pantalla, comportamiento) para poder armar un prompt correctivo puntual después.
-
-## 1. Instalación y arranque básico
-
-- [ ] Copia la carpeta completa del build a una ubicación normal de Windows (ej. `Escritorio` o `Documentos`), no la corras desde una carpeta temporal o de descarga comprimida sin extraer.
-- [ ] Doble clic en el `.exe` — abre sin mostrar consola/terminal.
-- [ ] El ícono se ve correctamente (no el genérico de Windows).
-- [ ] La ventana carga el login sin errores visibles.
-
-## 2. Login — los tres roles, con conexión
-
-- [ ] `Ruth` inicia sesión con conexión normal.
-- [ ] `Michelle`/`Mich2026` inicia sesión con conexión normal.
-- [ ] `Ventas`/`ventas` inicia sesión con conexión normal.
-
-## 3. Login offline (el punto que más falló antes)
-
-- [ ] Corta la conexión a internet de la VM (desactiva el adaptador de red o desconecta el Wi-Fi/Ethernet).
-- [ ] Cierra la app por completo si estaba abierta.
-- [ ] Ábrela de nuevo sin conexión.
-- [ ] `Ruth` puede iniciar sesión offline usando el caché local.
-- [ ] `Michelle` puede iniciar sesión offline usando el caché local.
-- [ ] `Ventas` puede iniciar sesión offline usando el caché local.
-
-## 4. Operación offline por rol
-
-Con la red aún cortada:
-
-- [ ] `Ventas`: puede registrar una venta; la fecha queda forzada a hoy sin poder elegirla.
-- [ ] `Ventas`: no puede acceder a entradas, mermas, ajustes, conteo físico ni reportes (debe bloquear con mensaje claro, no crashear).
-- [ ] `Ruth`/`Michelle`: pueden registrar entrada, merma, ajuste y conteo físico offline.
-- [ ] `Ruth`/`Michelle`: al intentar editar/eliminar un registro de Historial offline, se bloquea con el mensaje de "requiere conexión", no crashea.
-- [ ] Historial (lectura) se puede consultar offline y muestra los movimientos combinados (locales + ya sincronizados), marcando de alguna forma cuáles son locales/pendientes.
-- [ ] Navega por cada sección del navbar una por una, offline, con cada rol — ninguna debe crashear con un error técnico. Las que no deban funcionar offline (reportes, gestión de productos/usuarios) deben mostrar el mensaje claro.
-- [ ] El indicador de "N movimientos pendientes de sincronizar" aparece visible.
-- [ ] El botón de refrescar funciona estando offline (recarga la vista actual sin errores).
-
-## 5. Persistencia ante cierre forzado (los tres roles)
-
-Con la red aún cortada:
-
-- [ ] Con `Ventas`, registra un movimiento pendiente, fuerza el cierre del proceso desde el Administrador de tareas (no lo cierres normal), reábrelo — el pendiente sigue ahí.
-- [ ] Repite lo mismo con `Ruth` y con `Michelle`.
-
-## 6. Sincronización real al reconectar
-
-- [ ] Con los pendientes generados en el punto anterior, reconecta la red.
-- [ ] Sin tocar nada manualmente, espera un momento y confirma que la sincronización ocurre sola.
-- [ ] Verifica en Neon (o pídeme ayuda para consultarlo) que esos movimientos aparecen, sin duplicados.
-- [ ] El stock/inventario refleja correctamente esos movimientos después de sincronizar.
-- [ ] Al reabrir la app con conexión después de haber tenido pendientes, aparece el indicador de "subiendo cambios pendientes" y el dashboard se refresca solo al terminar.
-
-## 7. Cola de sincronización (pantalla nueva)
-
-- [ ] Accesible para `Ruth`/`Michelle`, lista los pendientes con tipo, producto, cantidad y fecha.
-- [ ] El botón de "reintentar ahora" funciona si fuerzas un fallo (por ejemplo cortando la red justo antes de reintentar).
-
-## 8. Validación de stock
-
-- [ ] Intenta vender más unidades de las que hay disponibles de un producto normal — debe rechazarse con el mensaje de inventario insuficiente.
-- [ ] Repite con un producto derivado (ej. un "Cubetazo") — debe considerar el equivalente correcto según su `factor_equivalencia`.
-- [ ] Prueba esto tanto online como offline.
-
-## 9. Cierre limpio del proceso
-
-- [ ] Cierra la app normalmente (no forzado) y confirma en el Administrador de tareas que el proceso de Python/waitress termina por completo, sin quedar corriendo en segundo plano.
-- [ ] Abre el `.exe` una segunda vez inmediatamente después — no debe haber conflicto de puerto ni error de "ya en uso".
-
-## 10. Prueba de portabilidad (mover la carpeta)
-
-- [ ] Con la app ya usada (con caché de credenciales y algún pendiente generado), copia la carpeta completa del build a una tercera ubicación distinta en la misma VM.
-- [ ] Ábrela desde ahí y confirma que reconoce el caché/pendientes existentes, no que se comporta como una instalación nueva desde cero.
+Esta lista es para correrla a mano en la VM de Windows. Ve marcando cada
+punto; si algo falla, anota **qué pasó exactamente** (mensaje, pantalla,
+comportamiento) y adjunta el `diagnostico.log`.
 
 ---
 
-Si todos estos puntos pasan bien, la app está lista para el prompt 31 (limpieza final) cuando se reinicie tu cuota semanal. Si algo falla, anótalo con el detalle exacto (rol, paso, mensaje de error o comportamiento) para armar un prompt correctivo dirigido a ese punto específico.
+## Preparación (esto es lo que estaba fallando — no lo saltes)
+
+```
+git pull
+build_exe.bat
+```
+
+> **Cada cambio de código exige recompilar.** El `.exe` corre desde su
+> propia copia empaquetada, no desde el código fuente: un `git pull` solo
+> no cambia nada de lo que ves en la app.
+>
+> `build_exe.bat` ahora **respalda y restaura solo** el `.env`, la cola
+> local (`offline_local.sqlite3`), las sesiones y los respaldos — porque
+> PyInstaller borra la carpeta de salida entera antes de reconstruirla.
+> Si compilas de otra forma (`pyinstaller app.spec` a mano), esos
+> archivos **se pierden** y hay que volver a copiar el `.env` y a repetir
+> el Punto 0-bis.
+
+Luego, **el paso crítico**: copia tu `.env` real (el que tiene
+`DATABASE_URL` apuntando a Neon) **dentro de `dist\AuditoriaAylupita\`,
+junto al `.exe`**.
+
+> Ese archivo faltando fue la causa raíz de que todo el motor offline
+> estuviera muerto en Windows: sin él, la app se conectaba a un SQLite
+> local vacío en vez de a Neon, y como un archivo local "siempre
+> conecta", el modo offline nunca se activaba. Ojo: la instrucción vieja
+> (prompt 13b) decía copiar `db.sqlite3`; **eso ya no aplica**, ahora es
+> el `.env`.
+
+- [ ] `.env` copiado junto al `.exe`.
+- [ ] Borra el `db.sqlite3` que haya quedado junto al `.exe` de pruebas
+      anteriores (es la base huérfana del bug; ya no se usa).
+
+### Punto 0 — confirmar que la configuración se leyó bien
+
+Abre el `.exe` una vez **con internet**, ciérralo, y abre el archivo
+`diagnostico.log` que queda junto al `.exe`.
+
+- [ ] Dice `BD engine=django.db.backends.postgresql` y
+      `host=ep-aged-frog-...neon.tech` — **NO** `sqlite3`.
+- [ ] Dice `BD OPTIONS={... 'connect_timeout': 3, 'keepalives': 1, 'keepalives_idle': 10 ...}`.
+- [ ] Dice `configuración de nube: legible y utilizable`.
+- [ ] **NO** aparece la línea `NO se pudo leer la configuración de la base de datos`.
+- [ ] `PRUEBA DE ESCRITURA en carpeta_escribible(): OK`.
+
+Si algo de esto falla, **detente aquí** y mándame el log: los puntos de
+abajo no tienen sentido hasta que esto esté bien.
+
+#### Si dice `FALLÓ: migrate ... connection timeout expired` aunque haya internet
+
+Desde el prompt 33c, cuando la conexión del arranque falla la app corre
+sola una **sonda de conectividad** y escribe en el log un `VEREDICTO`.
+Búscalo, porque distingue dos causas que se ven idénticas y se arreglan
+al revés:
+
+- *"la nube SÍ responde, pero el saludo completo tarda X s"* → la red de
+  ese equipo es lenta y el timeout se quedó corto. **No hay que
+  recompilar**: agrega `DB_CONNECT_TIMEOUT=<el número que sugiere el
+  log>` al `.env` que está junto al `.exe` y vuelve a abrir la app.
+- *"el TCP pasa pero el saludo cifrado no termina NI CON 25 SEGUNDOS"* →
+  algo intercepta el TLS de salida (antivirus con inspección SSL, proxy
+  o firewall de la red, filtrado del hipervisor). Subir el número no
+  sirve; hay que probar en otra red o desactivar esa inspección.
+- *"no hay ni TCP a ninguna dirección"* → sin internet o puerto 5432
+  bloqueado. Si apagaste la red a propósito, es lo esperado.
+
+> Ojo con `DB_CONNECT_TIMEOUT`: el límite es **por dirección IP** y el
+> host de Neon resuelve a varias, así que un corte real cuesta
+> (valor × direcciones) antes de pasar a modo offline. Con 3 direcciones
+> y 15s son 45 segundos de ventana congelada. Entre 3 y 15 es lo sano.
+
+### Punto 0-bis — sembrar el caché de credenciales (obligatorio)
+
+> **Sin este paso el punto 1 falla siempre**, y falla diciendo
+> "usuario o contraseña incorrectos", que despista mucho: parece que las
+> credenciales están mal cuando en realidad **no hay ninguna credencial
+> guardada todavía en ese equipo**.
+>
+> El motor offline nunca guarda contraseñas por su cuenta: solo cachea
+> (como hash) la credencial de un usuario que ya se validó **con
+> internet** en esa máquina. Si ese login online nunca ocurrió — y en la
+> VM nunca ocurrió, porque hasta ahora la app se conectaba a un SQLite
+> vacío — la caché está vacía y no hay contra qué validar sin red.
+
+> **Los nombres de usuario distinguen mayúsculas.** En la base de
+> producción los usuarios son exactamente `Ruth`, `Michelle`, `Ventas` y
+> `admin` — verificado. `ventas` en minúscula o `Mich2026` **no
+> existen** y el login fallará con "usuario o contraseña incorrectos"
+> aunque la contraseña sea la correcta.
+
+**Con internet todavía conectado**, y con el `.env` ya en su lugar:
+
+- [ ] Inicia sesión con `Ruth`, y cierra sesión.
+- [ ] Inicia sesión con `Michelle`, y cierra sesión.
+- [ ] Inicia sesión con `Ventas`, y cierra sesión.
+- [ ] En `diagnostico.log` aparece, por cada uno:
+      `Credencial de '<usuario>' cacheada para poder entrar sin conexión.`
+
+Si alguno de esos tres logins **falla estando con internet**, el problema
+no es del modo offline — mándame el log y paramos ahí.
+
+### Punto 0-ter — el aviso de CONFIGURACIÓN es distinto al de "sin conexión"
+
+> Esta prueba es a propósito destructiva-de-mentira: se rompe el `.env`
+> para ver qué hace la app, y luego se deja como estaba. **Haz una copia
+> del `.env` antes de tocarlo.**
+
+Son dos fallos que en pantalla se parecen y se atienden de forma
+opuesta: "no hay internet" se arregla solo cuando vuelve la red; "no se
+pudo leer la configuración" **no se arregla nunca solo** — hace falta
+que alguien coloque el archivo. Si la app los muestra igual, se pierden
+horas esperando a que se resuelva algo que no se va a resolver.
+
+**Con internet conectado** (para que no se confunda con un corte real):
+
+- [ ] Copia el `.env` a un lugar seguro (`.env.respaldo`).
+- [ ] Renombra el `.env` a `.env.apagado` y abre el `.exe`.
+- [ ] **La app ABRE igual** — no se queda en blanco, no se cierra sola,
+      no niega la entrada. (Es a propósito: perder la base es un estado
+      esperado del motor offline.)
+- [ ] Arriba se ve el aviso **rojo** que dice *"No se pudo leer la
+      configuración de la base de datos"* y *"esto no se arregla
+      reconectándote a internet"* — **no** el aviso amarillo/azul normal
+      de "sin conexión".
+- [ ] El aviso trae abajo, en letra chica, `Detalle para soporte:
+      DATABASE_URL no está definida`.
+- [ ] En `diagnostico.log` aparece `SIN CONFIGURACIÓN DE NUBE UTILIZABLE
+      — motivo: DATABASE_URL no está definida`.
+- [ ] Cierra la app. Ahora edita el `.env` y deja `DATABASE_URL=basura`
+      (sin comillas). Abre el `.exe` otra vez.
+- [ ] **La app vuelve a abrir** (antes esto reventaba el arranque entero:
+      ni ventana, ni log, ni mensaje) y el aviso ahora dice `Detalle para
+      soporte: DATABASE_URL no se pudo interpretar (UnknownSchemeError)`.
+- [ ] Restaura tu `.env` bueno y vuelve a abrir: el aviso rojo
+      desaparece.
+
+---
+
+## Los puntos de prueba
+
+### 1. Abrir el `.exe` SIN conexión y entrar con los tres roles
+
+Desactiva el adaptador de red de la VM **antes** de abrir la app.
+
+- [ ] El `.exe` abre (la ventana aparece; no se queda colgada ni tarda
+      medio minuto).
+- [ ] `Ruth` inicia sesión.
+- [ ] `Michelle` inicia sesión.
+- [ ] `Ventas` inicia sesión.
+
+Si dice "usuario o contraseña incorrectos", **no asumas que la
+contraseña está mal**: busca en `diagnostico.log` la línea que empieza
+con `Login offline RECHAZADO` — ahí dice el motivo real, que puede ser
+"no tiene credencial cacheada en este equipo" (falta el Punto 0-bis),
+"la contraseña no coincide con el hash cacheado", o "está marcado como
+inactivo". Son tres problemas distintos con soluciones distintas.
+
+### 2. Cortar la red con la app ya abierta, en la pantalla de login
+
+- [ ] Abre la app **con** internet, quédate en la pantalla de login.
+- [ ] Desactiva el adaptador de red.
+- [ ] Inicia sesión — debe funcionar igual, sin congelarse.
+- [ ] La ventana sigue respondiendo (los botones y enlaces reaccionan).
+
+### 3. Registrar un movimiento offline con cada rol
+
+Con la red aún cortada:
+
+- [ ] `Ventas`: registra una venta. La fecha queda fija en hoy, sin poder
+      elegirla.
+- [ ] `Michelle`: registra una entrada (o merma, o conteo físico).
+- [ ] `Ruth`: registra otro movimiento.
+- [ ] Aparece el indicador **"N pendientes de sincronizar"** en la barra
+      superior, y el número sube con cada movimiento.
+- [ ] En la sección **Sincronización** se ven los movimientos listados con
+      tipo, producto, cantidad y fecha de creación.
+
+### 4. Cierre forzado con un pendiente, y reabrir sin conexión
+
+Con la red aún cortada y pendientes sin sincronizar:
+
+- [ ] Cierra el proceso **a la fuerza** desde el Administrador de tareas
+      (finalizar tarea), no con la X de la ventana.
+- [ ] Vuelve a abrir el `.exe`, **sin reconectar la red**.
+- [ ] Los pendientes **siguen ahí** (mismo número en el indicador y en la
+      pantalla de Sincronización).
+
+### 5. Reconectar y confirmar que sincroniza sola
+
+- [ ] Reactiva el adaptador de red. **No toques nada más en la app.**
+- [ ] En menos de ~1 minuto, el indicador de pendientes baja a 0 solo.
+- [ ] En `diagnostico.log` aparece `Sincronizado ... contra Neon`.
+- [ ] Los movimientos aparecen en Historial y afectan el stock.
+
+### 6. Navegar offline por todo el navbar, con cada rol
+
+Con la red cortada, entra a **cada** sección de la barra superior, una
+por una, con cada rol. Ninguna debe dejar la app insensible.
+
+Deben **funcionar**:
+- [ ] Inicio (catálogo cacheado)
+- [ ] Historial (lectura; los pendientes salen marcados)
+- [ ] Sincronización
+- [ ] Instrucciones
+- [ ] Registrar venta / entrada / merma / conteo
+
+Deben mostrar **el mensaje claro** de "requiere conexión" (no un error
+técnico, no congelarse):
+- [ ] Reportes
+- [ ] Categorías
+- [ ] Productos
+- [ ] Correcciones
+
+Y con `Ventas`:
+- [ ] No puede entrar a entradas, mermas, ajustes, conteo físico ni
+      reportes (bloqueo por rol, no un crash).
+
+### 6-bis. Historial NO se puede editar ni eliminar sin conexión
+
+> Absorbe el prompt 33b. Se prueba aparte porque es el caso donde un
+> fallo **corrompe datos** en vez de solo molestar: una edición aceptada
+> sin conexión se escribiría contra una base que no está ahí, o peor,
+> quedaría a medias.
+
+Con la red cortada, en **Historial**, con **cada uno de los tres roles**:
+
+- [ ] El aviso amarillo de arriba dice que *"Editar o eliminar un
+      registro sigue necesitando conexión"*.
+- [ ] Haz clic en **Editar** de cualquier fila → sale la pantalla
+      *"Esta función requiere conexión a internet"*. **No** se abre el
+      formulario, **no** sale un error técnico de Django.
+- [ ] Haz clic en **Eliminar** de cualquier fila → lo mismo.
+- [ ] Repite con una fila marcada como **Pendiente** (registrada offline
+      hace un momento) — también debe bloquear.
+- [ ] Lo mismo desde **Correcciones**.
+
+> Si aquí algo **sí** deja editar: anótalo con el número de fila y
+> mándame el log. No lo des por bueno solo porque el resto funcionó.
+
+### 7. La ventana nunca queda insensible
+
+> Este punto no se prueba "de paso": se prueba a propósito, porque el
+> síntoma que reportaste (*la app deja de responder*) es distinto de
+> *la app da error*, y solo se ve haciendo clic de verdad.
+
+Con la red cortada, y **cronómetro en mano**:
+
+- [ ] Haz clic en 5 secciones distintas del navbar, **una tras otra sin
+      esperar** a que termine la anterior. La ventana debe seguir
+      redibujándose; Windows **no** debe mostrar *"(No responde)"* en la
+      barra de título.
+- [ ] Deja el Inicio abierto 2 minutos sin tocar nada (el tablero
+      consulta el estado de sincronización cada 4 segundos). Al volver,
+      el primer clic responde de inmediato.
+- [ ] **No te fíes de la sensación: mira los números.** La primera vuelta
+      de esta prueba se sintió "aceptable" y el log decía 28 segundos —
+      la ventana seguía respondiendo, así que el problema no se notaba
+      pero estaba. Corre esto en PowerShell dentro de
+      `dist\AuditoriaAylupita` y anota los 5 números:
+
+      ```powershell
+      Select-String "TIEMPO" diagnostico.log | ForEach-Object { if ($_ -match "TIEMPO\s+(\d+)ms") { [int]$matches[1] } } | Sort-Object -Descending | Select-Object -First 5
+      ```
+
+      Referencia **medida en la VM de Windows sin conexión**, que es la
+      que vale:
+
+      | Página | ms |
+      |---|---|
+      | `POST /login/` (entrada offline) | 1413 |
+      | `GET /` (redirección de arranque) | 604 |
+      | `GET /` (redirección de arranque) | 491 |
+      | `GET /login/` | 119 |
+      | `GET /login/` | 82 |
+
+      Y ya navegando: Inicio 62 ms, Historial 53 y 42 ms, Sincronización
+      22 ms, Reportes 12 ms, Correcciones 15 ms.
+
+      Los 1413 ms del login **no son red** (`bd=0ms en 0 consultas`): son
+      el hash de la contraseña. Django usa PBKDF2 con 1.5 millones de
+      iteraciones a propósito, para que probar contraseñas a la fuerza
+      sea caro. Cuesta lo mismo con internet que sin él, y no se toca.
+
+      Fuera de eso, cualquier página por encima de **1 segundo** es algo
+      que hay que mirar, no "aceptable".
+
+- [ ] **Comprueba que de verdad estabas sin conexión.** Si el log dice
+      `FIN: migrate` en vez de `FALLÓ: migrate`, la app sí alcanzó la
+      nube y estarías midiendo la latencia a Ohio (~118 ms por consulta,
+      12 consultas en el tablero = ~1.4 s), no el modo offline. Hay que
+      apagar el adaptador **antes** de abrir la app.
+
+- [ ] Se espera **como mucho una** request lenta: la primera después de
+      que se cae la red, que es la que lo descubre. Cuánto tarde depende
+      de CÓMO esté caída la red, y la diferencia es grande:
+
+      - **Adaptador desactivado**: el DNS falla al instante
+        (`getaddrinfo failed`, Errno 11002) y el arranque ni se entera —
+        medido: 0.09 s.
+      - **Adaptador activo pero sin salida real** (sin ruta, servidor DNS
+        inalcanzable, Wi-Fi conectado a un router sin internet): el DNS
+        se cuelga esperando. Medido: 28.5 s. `connect_timeout` **no
+        cubre el DNS** — solo se aplica después de resolver el nombre.
+
+      Si ves **varias** requests lentas a la vez, anótalo: eso sí es un
+      defecto (era el estado anterior: tres logins de 10, 29 y 38
+      segundos en paralelo).
+- [ ] Busca en `diagnostico.log` la línea `hay_conexion() tardó`. Si
+      aparece, anota el número: significa que un sondeo pasó de 5 s, o
+      sea que el `connect_timeout` no se está respetando.
+- [ ] Busca las líneas `TIEMPO  XXXXms`: apunta la más alta.
+
+---
+
+### Punto 8 — el login usa Neon cuando HAY internet (prompt 33d)
+
+> Este punto es el contrario de todo lo demás del checklist: aquí se
+> verifica que la app **NO** use el modo offline cuando no toca. Hasta el
+> 33d, con internet perfecto el login se resolvía igual contra la caché
+> local — la app decidía "no hay conexión" por un sondeo sano pero lento.
+
+**Con internet conectado y estable:**
+
+- [ ] Abre el `.exe` y busca en `diagnostico.log` la línea nueva:
+
+      ```
+      HANDSHAKE CON LA NUBE: X.XXs (connect_timeout=8s)
+      ```
+
+      **Anota ese número: ____ s.** Es cuánto tarda de verdad esta laptop
+      en conectarse a Neon, y es el dato que dice si el timeout está bien
+      calibrado para este equipo. En Mac son 0.6–3.2s.
+
+- [ ] Si debajo aparece un `***` diciendo que el handshake está cerca del
+      `connect_timeout`, **sube `DB_CONNECT_TIMEOUT`** en el `.env` que
+      está junto al `.exe` al número que sugiere el propio mensaje, y
+      reabre la app. No hace falta recompilar.
+
+- [ ] Inicia sesión con `Ruth`, cierra sesión; luego `Michelle`, cierra
+      sesión; luego `Ventas`. **Con cada uno**, confirma en el log que
+      aparece:
+
+      ```
+      Credencial de '<usuario>' cacheada para poder entrar sin conexión.
+      ```
+
+      Esa línea **solo se escribe cuando la validación fue contra Neon**.
+      Si en su lugar ves `Inicio de sesión SIN CONEXIÓN validado contra
+      la caché local`, el bug sigue vivo — mándame el log.
+
+- [ ] Repite el ciclo login/logout **al menos 5 veces seguidas**. Tiene
+      que dar el resultado online las 5 veces: el bug del 33d podía ser
+      intermitente y "a veces sí" no es aprobado.
+
+- [ ] Confirma que **no** aparece `SONDEO DE CONECTIVIDAD FALLIDO` en
+      todo el rato que estuviste con internet. Si aparece con la red
+      funcionando, el `connect_timeout` se está quedando corto para esa
+      red: súbelo con `DB_CONNECT_TIMEOUT`.
+
+**Ahora corta la red de verdad** (adaptador desactivado):
+
+- [ ] El login sigue funcionando con los tres usuarios, ahora sí por
+      caché local (`Inicio de sesión SIN CONEXIÓN validado...`).
+- [ ] En el log, `SONDEO DE CONECTIVIDAD FALLIDO en X.XXs` aparece
+      **una sola vez cada tanto**, no una por cada intento. Anota el
+      número: **____ s** (esperado: hasta ~24s con 3 direcciones IP; muy
+      lejos de los 75s del bug original del prompt 33).
+- [ ] Ninguna pantalla tarda más de ~1 segundo. El costo de descubrir el
+      corte lo paga el hilo de sincronización de fondo, no tus clics —
+      verificado en Mac: 42 peticiones con la red caída, peor latencia
+      0.17s.
+
+**Vuelve a conectar la red:**
+
+- [ ] Sin tocar nada, en menos de un minuto el siguiente login vuelve a
+      validarse contra Neon (`Credencial de ... cacheada`), no contra la
+      caché.
+
+---
+
+## Qué mandarme
+
+1. El archivo **`diagnostico.log`** completo (junto al `.exe`) — es lo más
+   importante. Ahora sí registra cada request y cada sondeo de conexión.
+2. Qué puntos fallaron y qué viste exactamente.
+3. Si algo se congeló: cuántos segundos aproximadamente, y en qué
+   pantalla.
+
+### Cómo se ve un problema en el log
+
+- `SONDEO DE CONECTIVIDAD FALLIDO en X.XXs` **con internet funcionando**
+  → el `connect_timeout` se está quedando corto para esa red, y por eso
+  los logins se están resolviendo contra la caché local. Sube
+  `DB_CONNECT_TIMEOUT` en el `.env` junto al `.exe` (prompt 33d). Con la
+  red caída, en cambio, esta línea es lo esperado.
+- `Sondeo de conectividad OK pero lento: X.XXs` → aviso temprano: la
+  conexión funciona pero este equipo se está acercando al límite.
+  Conviene subir `DB_CONNECT_TIMEOUT` antes de que empiece a fallar.
+- `HANDSHAKE CON LA NUBE: X.XXs` → cuánto tarda de verdad este equipo en
+  conectarse a Neon. Si el mensaje viene seguido de un `***`, hay que
+  subir `DB_CONNECT_TIMEOUT` al valor que él mismo sugiere.
+- `hay_conexion() tardó XX.XXs, por encima de los YY.Ys que explica la
+  configuración` → el umbral ya no es un número fijo: se calcula como
+  `connect_timeout × direcciones IP del host`, con margen, así que se
+  ajusta solo en cada equipo. Si esta línea aparece, el sondeo tardó más
+  de lo que la configuración puede explicar: `OPTIONS` que no llegó al
+  driver, DNS colgado antes de conectar, o el proceso trabado. Un corte
+  de red normal **ya no dispara esta línea**.
+- `PRUEBA DE ESCRITURA ... FALLÓ` → la app no puede escribir junto al
+  `.exe` (permisos de Windows, o Control de acceso a carpetas de
+  Windows Defender). Nada se guardaría.
+- `SIN CONFIGURACIÓN DE NUBE UTILIZABLE — motivo: ...` → falta el
+  `.env` o su `DATABASE_URL` no sirve. El motivo dice cuál de los dos.
+  Volver a la Preparación. Esto **no** se arregla esperando a que vuelva
+  internet.
+- `Login offline RECHAZADO: ... no tiene credencial cacheada` → falta el
+  Punto 0-bis: ese usuario nunca inició sesión con internet en ese equipo.
+- `Login offline RECHAZADO: la contraseña ... no coincide` → la
+  contraseña cambió en la nube después del último login online ahí;
+  hay que entrar una vez con internet para refrescar el hash.

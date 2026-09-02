@@ -8,6 +8,7 @@ from django.contrib.auth.decorators import login_required
 from django.contrib.auth.mixins import LoginRequiredMixin
 from django.contrib.auth import SESSION_KEY
 from django.contrib.auth.views import LoginView, LogoutView
+from django.core.paginator import Paginator
 from django.db import transaction
 from django.http import HttpResponse
 from django.shortcuts import get_object_or_404, redirect, render
@@ -30,7 +31,10 @@ from .forms import (
     ReporteForm,
 )
 from .antiduplicado import ProteccionDobleSubmitMixin
-from .models import Categoria, ConteoFisico, CorreccionHistorial, LoteCompra, MovimientoSalida, Producto
+from .models import (
+    Categoria, ConteoFisico, CorreccionHistorial, DiscrepanciaInventario,
+    LoteCompra, MovimientoSalida, Producto,
+)
 from .offline import (
     ALIAS_LOCAL,
     CLAVE_SESION_OFFLINE,
@@ -433,52 +437,146 @@ class ConteoFisicoDetailView(RequiereRol("admin", "auditor"), RequiereConexionMi
 
     def get_context_data(self, **kwargs):
         context = super().get_context_data(**kwargs)
-        context["stock_teorico"] = self.object.producto.stock_teorico(hasta_fecha=self.object.fecha)
+        # El teórico del INSTANTE del conteo (prompt 34), no el del cierre
+        # de su día: el del día ya incluye movimientos posteriores al
+        # conteo, que es de donde salía la diferencia mal calculada.
+        context["stock_teorico"] = self.object.teorico_al_momento
         return context
 
 
 @requiere_rol("admin", "auditor")
 @requiere_conexion
-@require_POST
 def generar_ajuste(request, pk):
-    # Condición de carrera (prompt 21, hallazgo 4.1 del diagnóstico): dos
-    # POST casi simultáneos aquí podían leer ambos ajuste_generado_id como
-    # None antes de que cualquiera terminara de guardar, y los dos creaban
-    # su propio MovimientoSalida — el ajuste quedaba aplicado dos veces
-    # sobre el stock real. select_for_update() dentro de transaction.atomic()
-    # bloquea la fila del conteo: el segundo request que llega casi al
-    # mismo tiempo espera a que el primero termine su transacción, y
-    # cuando por fin lee el conteo ya ve ajuste_generado seteado — nunca
-    # crea un segundo ajuste. (Ver también el unique=True en
-    # ConteoFisico.ajuste_generado, capa adicional a nivel de base de
-    # datos: nunca deja que dos ConteoFisico distintos terminen apuntando
-    # al mismo MovimientoSalida, sin importar por dónde se haya escrito.)
-    with transaction.atomic():
-        conteo = get_object_or_404(ConteoFisico.objects.select_for_update(), pk=pk)
+    """
+    Ya no genera nada: redirige a la pantalla de revisión (prompt 34).
 
-        if conteo.ajuste_generado_id:
-            messages.info(request, "Este conteo ya tiene un ajuste generado.")
-            return redirect("conteofisico_detail", pk=conteo.pk)
+    Antes esto era un botón que, de un clic, recalculaba la diferencia en
+    el POST y creaba el MovimientoSalida. Tres problemas en esa frase: la
+    recalculaba (contra el stock del momento de revisar, no del momento
+    del conteo), la aplicaba sin que nadie confirmara la cifra, y lo hacía
+    sin mostrar qué había pasado entre el conteo y ahora.
 
-        diferencia = conteo.diferencia
-        if diferencia == 0:
-            messages.info(request, "No hay diferencia que ajustar.")
-            return redirect("conteofisico_detail", pk=conteo.pk)
-
-        ajuste = MovimientoSalida.objects.create(
-            producto=conteo.producto,
-            fecha=conteo.fecha,
-            tipo="ajuste",
-            # -diferencia: si faltó (diferencia<0) resta stock; si sobró
-            # (diferencia>0) suma stock. Ver help_text de MovimientoSalida.cantidad.
-            cantidad=-diferencia,
-            motivo=f"Ajuste generado desde conteo físico #{conteo.pk} (diferencia {diferencia:+d})",
-            registrado_por=request.user,
+    La URL se conserva para no romper enlaces guardados ni el historial
+    del navegador. Acepta GET además de POST justo por eso: un enlace
+    viejo llega por GET y tiene que llevar a algún lado útil, no a un 405.
+    """
+    conteo = get_object_or_404(ConteoFisico, pk=pk)
+    discrepancia = DiscrepanciaInventario.objects.filter(conteo=conteo).first()
+    if discrepancia is None:
+        messages.info(
+            request,
+            "Este conteo no tiene ninguna diferencia pendiente de revisar.",
         )
-        conteo.ajuste_generado = ajuste
-        conteo.save()
-    messages.success(request, "Ajuste generado correctamente.")
-    return redirect("conteofisico_detail", pk=conteo.pk)
+        return redirect("conteofisico_detail", pk=conteo.pk)
+    return redirect("discrepancia_resolver", pk=discrepancia.pk)
+
+
+class DiscrepanciaListView(RequiereRol("admin", "auditor"), RequiereConexionMixin, generic.ListView):
+    """Las diferencias que esperan que alguien las revise."""
+    model = DiscrepanciaInventario
+    template_name = "inventario/discrepancia_list.html"
+    context_object_name = "discrepancias"
+
+    def get_queryset(self):
+        return (
+            DiscrepanciaInventario.objects
+            .filter(estado=DiscrepanciaInventario.PENDIENTE)
+            .select_related("conteo", "producto", "conteo__registrado_por")
+            .order_by("conteo__fecha", "conteo__ocurrido_en")
+        )
+
+    def get_context_data(self, **kwargs):
+        context = super().get_context_data(**kwargs)
+        context["resueltas"] = (
+            DiscrepanciaInventario.objects
+            .exclude(estado=DiscrepanciaInventario.PENDIENTE)
+            .select_related("conteo", "producto", "resuelta_por")
+            .order_by("-resuelta_en")[:15]
+        )
+        return context
+
+
+class DiscrepanciaResolverView(RequiereRol("admin", "auditor"), RequiereConexionMixin,
+                               ProteccionDobleSubmitMixin, generic.DetailView):
+    """
+    Donde una persona decide qué hacer con una diferencia (prompt 34,
+    punto 3).
+
+    Muestra el conteo con su hora, el stock teórico congelado a ESE
+    instante, la diferencia, y todo lo que pasó con el producto desde
+    entonces — ordenado por el momento real de creación de cada
+    movimiento, no por el orden en que llegaron al servidor, y con la
+    relación dicha en palabras ("después del conteo — no explica la
+    diferencia"). Sin eso, el auditor ve una lista de fechas y tiene que
+    reconstruir el orden de cabeza, que es justo donde se equivoca.
+
+    La cantidad sugerida llega al formulario en un campo editable: el
+    sistema propone, la persona decide.
+    """
+    model = DiscrepanciaInventario
+    template_name = "inventario/discrepancia_resolver.html"
+    context_object_name = "discrepancia"
+
+    def get_queryset(self):
+        return DiscrepanciaInventario.objects.select_related(
+            "conteo", "producto", "conteo__registrado_por", "resuelta_por"
+        )
+
+    def get_context_data(self, **kwargs):
+        from .discrepancias import movimientos_alrededor_del_conteo
+
+        context = super().get_context_data(**kwargs)
+        discrepancia = self.object
+        context["movimientos"] = movimientos_alrededor_del_conteo(discrepancia)
+        context["stock_actual"] = discrepancia.producto.stock_teorico()
+        context["hay_anteriores_sin_resolver"] = (
+            DiscrepanciaInventario.objects
+            .filter(
+                producto_id=discrepancia.producto_id,
+                estado=DiscrepanciaInventario.PENDIENTE,
+                conteo__fecha__lte=discrepancia.conteo.fecha,
+            )
+            .exclude(pk=discrepancia.pk)
+            .filter(conteo__ocurrido_en__lt=discrepancia.conteo.ocurrido_en)
+            .exists()
+        )
+        return context
+
+    def post(self, request, *args, **kwargs):
+        from .discrepancias import descartar_discrepancia, resolver_discrepancia
+
+        discrepancia = self.get_object()
+        if not discrepancia.esta_pendiente:
+            messages.info(request, "Esta diferencia ya fue revisada.")
+            return redirect("discrepancia_resolver", pk=discrepancia.pk)
+
+        nota = (request.POST.get("nota") or "").strip()
+        accion = request.POST.get("accion")
+
+        if accion == "descartar":
+            try:
+                descartar_discrepancia(discrepancia, request.user, nota)
+            except ValueError as error:
+                messages.error(request, str(error))
+                return redirect("discrepancia_resolver", pk=discrepancia.pk)
+            messages.success(request, "Diferencia revisada y cerrada sin ajuste.")
+            return redirect("discrepancias")
+
+        try:
+            cantidad = int(request.POST.get("cantidad_ajuste", ""))
+        except (TypeError, ValueError):
+            messages.error(request, "Escribe la cantidad a ajustar (un número entero).")
+            return redirect("discrepancia_resolver", pk=discrepancia.pk)
+
+        resolver_discrepancia(discrepancia, cantidad, request.user, nota)
+        if cantidad == 0:
+            messages.success(request, "Diferencia revisada. No se ajustó nada.")
+        else:
+            messages.success(
+                request,
+                f"Ajuste de {cantidad:+d} aplicado y diferencia cerrada.",
+            )
+        return redirect("discrepancias")
 
 
 # --- Historial -----------------------------------------------------------------
@@ -502,9 +600,14 @@ class HistorialView(RequiereRol("admin", "auditor"), ManejoErrorConexionMixin, g
     ella, o si la conexión se cae A MEDIO de esa consulta (ManejoError
     ConexionMixin ya no haría falta para esto, pero se conserva como red
     de seguridad), cae a historial_offline().
+
+    Filtros de tipo/usuario (prompt 35): se combinan con producto/fecha
+    con AND simplemente porque cada uno es un .filter()/comprobación
+    aparte encadenada sobre el mismo conjunto — nunca un OR entre ellos.
     """
     template_name = "inventario/historial.html"
     funciona_sin_conexion = True
+    MOVIMIENTOS_POR_PAGINA = 50
 
     def get_context_data(self, **kwargs):
         context = super().get_context_data(**kwargs)
@@ -514,10 +617,14 @@ class HistorialView(RequiereRol("admin", "auditor"), ManejoErrorConexionMixin, g
         producto = None
         fecha_desde = None
         fecha_hasta = None
+        tipo_movimiento = None
+        usuario_id = None
         if form.is_valid():
             producto = form.cleaned_data.get("producto")
             fecha_desde = form.cleaned_data.get("fecha_desde")
             fecha_hasta = form.cleaned_data.get("fecha_hasta")
+            tipo_movimiento = form.cleaned_data.get("tipo") or None
+            usuario_id = form.cleaned_data.get("usuario")  # ya viene como int o None (clean_usuario)
 
         # Sin filtro de fecha, se muestra todo el historial: un rango muy
         # amplio hace las veces de "sin límite" para movimientos_periodo()
@@ -527,20 +634,43 @@ class HistorialView(RequiereRol("admin", "auditor"), ManejoErrorConexionMixin, g
 
         if hay_conexion():
             try:
-                context["filas"] = movimientos_periodo(
-                    fecha_desde, fecha_hasta, productos=[producto] if producto else None
+                filas = movimientos_periodo(
+                    fecha_desde, fecha_hasta, productos=[producto] if producto else None,
+                    tipo_movimiento=tipo_movimiento, usuario_id=usuario_id,
                 )
                 context["modo_offline"] = False
-                return context
+                return self._paginar(context, filas)
             except ERRORES_DE_CONEXION:
                 # Se cortó la conexión justo a media consulta — cae al
                 # camino offline de abajo en vez de dejar que se propague.
                 pass
 
-        context["filas"] = historial_offline(
-            fecha_desde, fecha_hasta, producto_id=producto.pk if producto else None
+        filas = historial_offline(
+            fecha_desde, fecha_hasta, producto_id=producto.pk if producto else None,
+            tipo_movimiento=tipo_movimiento, usuario_id=usuario_id,
         )
         context["modo_offline"] = True
+        return self._paginar(context, filas)
+
+    def _paginar(self, context, filas):
+        """
+        Historial puede tener varios cientos de movimientos (prompt 35):
+        sin esto, cada visita traía y renderizaba la lista COMPLETA de una
+        sola vez. La paginación va aquí, sobre la lista YA filtrada y YA
+        ordenada por movimientos_periodo()/historial_offline() —nunca
+        antes—, así que "50 resultados" siempre significa 50 de lo que de
+        verdad cumple los filtros activos, nunca 50 sin filtrar más
+        filtro encima.
+
+        `total_filas` se guarda ANTES de paginar: es el contador real que
+        se muestra en pantalla ("N movimientos"), no el tamaño de la
+        página actual.
+        """
+        context["total_filas"] = len(filas)
+        paginador = Paginator(filas, self.MOVIMIENTOS_POR_PAGINA)
+        pagina = paginador.get_page(self.request.GET.get("page"))
+        context["pagina"] = pagina
+        context["filas"] = pagina.object_list
         return context
 
 

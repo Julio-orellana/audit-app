@@ -42,6 +42,7 @@ ColaOfflineMixin.
 """
 import logging
 import os
+import re
 import sys
 import threading
 import time
@@ -69,10 +70,123 @@ ERRORES_DE_CONEXION = (OperationalError, InterfaceError)
 # tres roles desde el prompt 19b.
 ALIAS_LOCAL = "local_disco"
 
-# Un sondeo de conectividad que tarde más que esto es, por sí solo, la
-# explicación de que la app quede "insensible" (prompt 33): se registra
-# como error para que quede en el log del equipo donde pasó.
-UMBRAL_SONDEO_LENTO_SEGUNDOS = 3.0
+# Un sondeo de conectividad que tarde más que lo esperable es, por sí
+# solo, la explicación de que la app quede "insensible" (prompt 33): se
+# registra como error para que quede en el log del equipo donde pasó.
+#
+# El umbral se CALCULA, no se fija a mano, y esa es la corrección del
+# prompt 33c. Lo tuve primero en 3.0 y luego en 5.0, y las dos veces
+# estuvo mal por la misma razón: connect_timeout de libpq es POR
+# DIRECCIÓN IP, no total. En la VM de Windows el host de Neon resuelve a
+# 3 direcciones, así que un corte de red perfectamente normal costaba
+# 3 x 3s = 9.2s y disparaba un ERROR en CADA sondeo — ruido justo en el
+# archivo que sirve para diagnosticar, y encima ruido que parece grave.
+# Yo lo había medido en Mac contra una IP única y por eso no vi el
+# multiplicador.
+#
+# Ahora se deriva de la configuración real (connect_timeout x
+# direcciones, con margen), así que se ajusta solo en cualquier equipo y
+# solo grita cuando de verdad pasa algo que la configuración no explica:
+# un OPTIONS que no llegó al driver, un DNS colgado antes de conectar, o
+# el proceso trabado.
+_MARGEN_UMBRAL_SONDEO = 1.5     # 50% de holgura sobre lo esperable
+_PISO_UMBRAL_SONDEO = 5.0       # nunca alarmar por debajo de esto
+_TECHO_UMBRAL_SONDEO = 60.0     # ni callar por encima de esto
+# Cuántas direcciones IP prueba libpq antes de rendirse. Se asume el caso
+# típico de Neon y se corrige con evidencia real — ver
+# recordar_direcciones_intentadas().
+_direcciones_del_host = 3
+
+# Un solo sondeo a la vez, y los demás ESPERAN SU RESULTADO REAL en vez
+# de adivinarlo (prompt 33d).
+#
+# Esto reemplaza a SEGUNDOS_PARA_ASUMIR_CAIDA_EN_SONDEO, que era una
+# conjetura: "si otro hilo lleva más de 2s sondeando, doy por hecho que
+# no hay red". La justificación que escribí entonces era "un sondeo sano
+# contra Neon tarda menos de 1s", medido en Mac. Medido de nuevo en esta
+# misma Mac al diagnosticar el 33d: el PRIMER sondeo sano tarda 1.936s
+# — 64 milisegundos por debajo del umbral. En la VM de Windows, donde el
+# migrate de arranque tarda 4.33s, un sondeo perfectamente sano lo supera
+# con holgura, y entonces TODA request que caiga en esa ventana se cree
+# sin conexión aunque la red esté impecable.
+#
+# El error de fondo no fue el número, fue dejar que una HEURÍSTICA
+# bloqueara de forma dura el único camino a la base. Una heurística que
+# se equivoca de vez en cuando se vuelve "roto siempre" cuando es la
+# única puerta. Esperar el resultado verdadero no puede equivocarse: si
+# el sondeo va a tener éxito, el que espera se entera; si va a fallar,
+# también. Y sigue sin haber avalancha, que era el objetivo original.
+# Un sondeo SANO que tarde más que esto se registra como aviso temprano:
+# significa que este equipo se está acercando al connect_timeout y
+# conviene subirlo antes de que empiece a fallar. 2s es justo el valor
+# que la conjetura vieja usaba como "esto ya es una caída" — aquí no
+# decide nada, solo informa.
+SEGUNDOS_SONDEO_NOTABLE = 2.0
+
+_evento_sondeo = None           # threading.Event mientras hay un sondeo en curso
+_sondeo_iniciado_en = 0.0       # solo para detectar un sondeo huérfano
+_resultado_ultimo_sondeo = False
+_local = threading.local()      # marca al hilo que ESTÁ sondeando
+
+
+def _connect_timeout_configurado():
+    """El connect_timeout vigente, para poder nombrarlo en el log."""
+    try:
+        return (settings.DATABASES["default"].get("OPTIONS") or {}).get("connect_timeout") or "?"
+    except Exception:
+        return "?"
+
+
+def umbral_sondeo_lento():
+    """
+    Cuántos segundos puede tardar un sondeo ANTES de que sea un síntoma.
+
+    NO consulta DNS. La primera versión de esta función sí lo hacía, para
+    contar a cuántas direcciones resuelve el host, y era un error de
+    bulto: `socket.getaddrinfo()` sin red se queda esperando —segundos en
+    Windows— y esto se llama desde el `finally` de hay_conexion(), o sea
+    potencialmente en el hilo de una request. Habría metido justo el tipo
+    de espera que este prompt entero existe para eliminar, y encima
+    precisamente cuando no hay conexión, que es cuando más duele.
+
+    En vez de preguntar, se asume el caso típico de Neon (varias
+    direcciones) y se AFINA con evidencia real: cuando un intento falla,
+    libpq enumera en el mensaje de error todas las direcciones que probó,
+    así que `recordar_direcciones_intentadas()` saca el número de ahí sin
+    costar nada.
+    """
+    timeout = 0.0
+    try:
+        timeout = float((settings.DATABASES["default"].get("OPTIONS") or {}).get("connect_timeout") or 0)
+    except Exception:
+        pass
+    if timeout <= 0:
+        return _PISO_UMBRAL_SONDEO
+    esperable = timeout * _direcciones_del_host * _MARGEN_UMBRAL_SONDEO
+    return max(_PISO_UMBRAL_SONDEO, min(esperable, _TECHO_UMBRAL_SONDEO))
+
+
+def recordar_direcciones_intentadas(error):
+    """
+    Aprende del mensaje de error cuántas direcciones probó libpq.
+
+    Cuando falla, psycopg devuelve algo así:
+
+        Multiple connection attempts failed. All failures were:
+        - host: 'ep-...neon.tech', port: None, hostaddr: '18.226.144.228': ...
+        - host: 'ep-...neon.tech', port: None, hostaddr: '3.23.109.155': ...
+        - host: 'ep-...neon.tech', port: None, hostaddr: '16.58.187.204': ...
+
+    Contar esas líneas da el multiplicador real de ese equipo —3 en la VM
+    de Windows, 6 en un equipo con IPv6— gratis y sin tocar la red.
+    """
+    global _direcciones_del_host
+    try:
+        cuantas = len(re.findall(r"hostaddr:", str(error)))
+    except Exception:
+        return
+    if cuantas > _direcciones_del_host:
+        _direcciones_del_host = min(cuantas, 12)
 
 # Cuánto se reutiliza el resultado de un sondeo de conectividad antes de
 # volver a preguntar de verdad (prompt 33). hay_conexion() se llama en
@@ -102,9 +216,109 @@ def reiniciar_cache_conexion():
     "sin conexión" pegado hasta 15s y haría fallar al siguiente test por
     un motivo que no tiene nada que ver con lo que ese test verifica.
     """
-    global _sin_conexion_hasta
+    global _sin_conexion_hasta, _sondeo_iniciado_en, _evento_sondeo, _resultado_ultimo_sondeo
     with _lock_cache_conexion:
         _sin_conexion_hasta = 0.0
+        _sondeo_iniciado_en = 0.0
+        evento = _evento_sondeo
+        _evento_sondeo = None
+        _resultado_ultimo_sondeo = False
+    if evento is not None:
+        # Que nadie quede esperando un sondeo que se acaba de descartar.
+        evento.set()
+    _local.sondeando = False
+
+
+def sin_conexion_reciente():
+    """
+    ¿CONSTA que no hay conexión? Solo lee la caché de un sondeo que YA
+    FALLÓ; nunca sondea ni conjetura, así que cuesta cero y no puede dar
+    un falso negativo.
+
+    Devuelve False cuando no hay nada cacheado — o sea "no me consta que
+    esté caída", que NO es lo mismo que "está sana". Quien necesite la
+    respuesta de verdad debe llamar a hay_conexion().
+
+    Prompt 33d: hasta este cambio también devolvía True cuando otro hilo
+    llevaba más de 2 segundos sondeando, aunque ese sondeo fuera a tener
+    éxito. Como get_new_connection() la consulta para decidir si siquiera
+    intenta conectar, esa conjetura bastaba para que un login con
+    internet perfecto se resolviera contra la caché local. Ahora esta
+    función solo reporta HECHOS: un sondeo que falló hace poco. La espera
+    coordinada de un sondeo en curso vive en esperar_sondeo_en_curso().
+
+    Existe para los caminos que se recorren en CADA request y que no
+    pueden permitirse ni un sondeo: ver
+    BackendConRespaldoOffline.get_user() (prompt 33c).
+    """
+    if getattr(_local, "sondeando", False):
+        # Este hilo ES el que está averiguando: tiene que poder salir a
+        # la red, o el sondeo se cortaría a sí mismo y la app quedaría
+        # marcada como sin conexión para siempre.
+        return False
+    return time.monotonic() < _sin_conexion_hasta
+
+
+def esperar_sondeo_en_curso():
+    """
+    Si otro hilo está sondeando la conectividad, espera su resultado REAL
+    en vez de abrir una conexión propia en paralelo (prompt 33d).
+
+    Devuelve True/False con el resultado del sondeo, o None si no había
+    ninguno en curso (y entonces quien llama debe seguir su camino
+    normal).
+
+    Es la mitad honesta de lo que antes hacía la conjetura de los 2
+    segundos: sigue evitando la avalancha —los hilos que llegan durante
+    un sondeo no lanzan cada uno el suyo, que era el problema de los tres
+    logins de 10, 29 y 38 segundos del 33c— pero sin poder equivocarse,
+    porque no adivina el resultado: lo espera.
+
+    El tope de espera es el mismo umbral_sondeo_lento(): lo máximo que un
+    intento puede tardar según la configuración (connect_timeout x
+    direcciones, con margen). Pasado eso el sondeo está colgado de
+    verdad, no simplemente lento, y se responde que no hay conexión.
+    """
+    if getattr(_local, "sondeando", False):
+        return None
+
+    tope = umbral_sondeo_lento()
+    with _lock_cache_conexion:
+        evento = _evento_sondeo
+        if evento is not None and (time.monotonic() - _sondeo_iniciado_en) > tope * 2:
+            # Sondeo huérfano: el hilo que lo lanzó murió sin liberarlo
+            # (no debería pasar nunca — hay un finally— pero si pasara,
+            # sin esto la app quedaría creyéndose offline para siempre).
+            evento = None
+    if evento is None:
+        return None
+
+    if evento.wait(timeout=tope):
+        return _resultado_ultimo_sondeo
+    logger.error(
+        "Un sondeo de conectividad lleva más de %.1fs sin terminar (el máximo que explica "
+        "connect_timeout x direcciones). Se da por caída la conexión para no dejar la "
+        "ventana esperando más.",
+        tope,
+    )
+    return False
+
+
+def marcar_sin_conexion():
+    """
+    Registra que un intento REAL contra la nube acaba de fallar por
+    conexión, para que el resto del proceso no vuelva a pagar el
+    timeout durante los próximos SEGUNDOS_CACHE_SIN_CONEXION.
+
+    Lo llama quien descubre la caída por su cuenta, sin pasar por
+    hay_conexion() — hoy get_user(), que es el primer código que toca la
+    base en una request. Sin esto, el primer request sin conexión pagaba
+    el timeout dos veces: una en get_user() y otra en el hay_conexion()
+    que la vista hace después para decidir si muestra el aviso offline.
+    """
+    global _sin_conexion_hasta
+    with _lock_cache_conexion:
+        _sin_conexion_hasta = time.monotonic() + SEGUNDOS_CACHE_SIN_CONEXION
 
 
 # Marca en la sesión de que ESTE inicio de sesión se validó contra la
@@ -229,6 +443,17 @@ def _reciclar_conexion_remota():
         conexion.health_check_done = True
 
 
+def resumen_conexion_actual(alias="default"):
+    """
+    {host, dbname} de la conexión activa — para poder decir en el log a
+    QUÉ base se estaba hablando cuando algo falló, en vez de un "no se
+    pudo" sin contexto. Nunca incluye la contraseña.
+    """
+    cfg = settings.DATABASES.get(alias, {})
+    host = cfg.get("HOST") or "(sqlite, sin red)"
+    return {"host": host, "dbname": str(cfg.get("NAME"))}
+
+
 def hay_conexion():
     """
     ¿Se puede hablar con Neon AHORA MISMO? Verifica de verdad la conexión
@@ -244,7 +469,7 @@ def hay_conexion():
     la evidencia que hace falta para confirmar el diagnóstico en
     Windows, donde toda la app queda sin responder.
     """
-    global _sin_conexion_hasta
+    global _sin_conexion_hasta, _sondeo_iniciado_en, _evento_sondeo, _resultado_ultimo_sondeo
 
     # Sin configuración de nube legible (falta el .env junto al .exe):
     # nunca hay conexión y no tiene sentido sondear la red ni una sola
@@ -256,20 +481,41 @@ def hay_conexion():
 
     # Resultado negativo reciente: se reutiliza sin volver a sondear, para
     # no pagar el connect_timeout en cada request (ver
-    # SEGUNDOS_CACHE_SIN_CONEXION).
-    ahora = time.monotonic()
-    if ahora < _sin_conexion_hasta:
+    # SEGUNDOS_CACHE_SIN_CONEXION). Esto es un HECHO —un sondeo que
+    # falló—, no una conjetura.
+    if sin_conexion_reciente():
         return False
 
+    # ¿Ya hay alguien sondeando? Entonces se espera SU resultado en vez
+    # de abrir un segundo intento en paralelo (prompt 33d). Un solo hilo
+    # sondea; los demás se enteran de lo que de verdad pasó.
     conexion = connections["default"]
     inicio = time.monotonic()
+    with _lock_cache_conexion:
+        if _evento_sondeo is not None:
+            soy_quien_sondea = False
+        else:
+            _evento_sondeo = threading.Event()
+            _sondeo_iniciado_en = inicio
+            soy_quien_sondea = True
+
+    if not soy_quien_sondea:
+        resultado = esperar_sondeo_en_curso()
+        if resultado is not None:
+            return bool(resultado)
+        # El sondeo terminó justo entre las dos comprobaciones: su
+        # resultado ya quedó guardado, no hace falta sondear de nuevo.
+        return _resultado_ultimo_sondeo
+
     exito = False
+    _local.sondeando = True
     try:
         _reciclar_conexion_remota()
         conexion.ensure_connection()
         exito = True
         return True
-    except Exception:
+    except Exception as error:
+        recordar_direcciones_intentadas(error)
         if not conexion.in_atomic_block:
             try:
                 conexion.close()
@@ -278,20 +524,64 @@ def hay_conexion():
         return False
     finally:
         duracion = time.monotonic() - inicio
+        _local.sondeando = False
         with _lock_cache_conexion:
+            _sondeo_iniciado_en = 0.0
+            _resultado_ultimo_sondeo = exito
             if exito:
                 # Un "sí hay conexión" nunca se cachea: si la red se cae
                 # justo después, la operación real falla y el manejo de
                 # errores de siempre la atrapa.
                 _sin_conexion_hasta = 0.0
             else:
-                _sin_conexion_hasta = time.monotonic() + SEGUNDOS_CACHE_SIN_CONEXION
-        if duracion >= UMBRAL_SONDEO_LENTO_SEGUNDOS:
+                # El margen se estira con lo que COSTÓ averiguarlo. Con
+                # un valor fijo de 15s y un sondeo de 28.5s —medido en
+                # Windows con el adaptador apagado, donde el DNS se
+                # cuelga— la caché ya nacía vencida y el siguiente hilo
+                # volvía a pagar la espera entera. Cachear al menos el
+                # doble de lo que tardó garantiza que averiguarlo salga
+                # siempre más barato que no averiguarlo.
+                margen = max(SEGUNDOS_CACHE_SIN_CONEXION, duracion * 2)
+                _sin_conexion_hasta = time.monotonic() + margen
+            evento_a_liberar = _evento_sondeo
+            _evento_sondeo = None
+        if evento_a_liberar is not None:
+            # Despertar a todos los que estaban esperando ESTE resultado.
+            evento_a_liberar.set()
+
+        # Un sondeo FALLIDO ya no es silencioso (prompt 33d). Antes solo
+        # se registraba si superaba umbral_sondeo_lento() (13.5s con la
+        # configuración de entonces), y un fallo por timeout tardaba ~9s
+        # — o sea que el caso que de verdad importaba no dejaba ni una
+        # línea en el log, y por eso fue imposible verlo desde la VM.
+        if not exito:
+            logger.warning(
+                "SONDEO DE CONECTIVIDAD FALLIDO en %.2fs (connect_timeout=%ss POR "
+                "DIRECCIÓN IP). Se marca 'sin conexión' por %.0fs: durante ese margen los "
+                "logins se resolverán contra la caché local. Si esto aparece con internet "
+                "funcionando, el connect_timeout se está quedando corto para esta red — "
+                "súbelo con DB_CONNECT_TIMEOUT en el .env.",
+                duracion, _connect_timeout_configurado(),
+                max(SEGUNDOS_CACHE_SIN_CONEXION, duracion * 2),
+            )
+        elif duracion >= SEGUNDOS_SONDEO_NOTABLE:
+            # Un sondeo sano pero lento es la señal temprana de que este
+            # equipo está cerca del límite: se registra para poder ajustar
+            # DB_CONNECT_TIMEOUT antes de que empiece a fallar.
+            logger.info(
+                "Sondeo de conectividad OK pero lento: %.2fs (connect_timeout=%ss). "
+                "Si se acerca al connect_timeout, súbelo con DB_CONNECT_TIMEOUT en el .env.",
+                duracion, _connect_timeout_configurado(),
+            )
+
+        umbral = umbral_sondeo_lento()
+        if duracion >= umbral:
             logger.error(
-                "hay_conexion() tardó %.2fs (umbral %.1fs). Con waitress en 4 hilos, "
-                "unos pocos sondeos así de lentos dejan la app entera sin responder — "
-                "ver el diagnóstico del prompt 33.",
-                duracion, UMBRAL_SONDEO_LENTO_SEGUNDOS,
+                "hay_conexion() tardó %.2fs, por encima de los %.1fs que explica la "
+                "configuración (connect_timeout x direcciones del host, con margen). Con "
+                "waitress en 4 hilos, unos pocos sondeos así de lentos dejan la app entera "
+                "sin responder — ver el diagnóstico del prompt 33.",
+                duracion, umbral,
             )
 
 
@@ -370,6 +660,7 @@ def autenticar_offline(username, password):
     internet: no hay contra qué validarlo.
     """
     if not username or not password:
+        logger.warning("Inicio de sesión offline sin usuario o sin contraseña — no hay nada que validar.")
         return None
     preparar_bases_locales()
     from .models import CredencialOfflineCache
@@ -379,9 +670,34 @@ def autenticar_offline(username, password):
     except Exception:
         logger.exception("No se pudo leer la caché local de credenciales.")
         return None
-    if fila is None or not fila.is_active:
+
+    # Cada motivo de rechazo se registra por separado (prompt 33): al
+    # usuario se le muestra siempre el mismo "usuario o contraseña
+    # incorrectos" —a propósito, para no revelar qué usuarios existen—
+    # pero en el log SÍ hace falta distinguirlos, porque exigen acciones
+    # completamente distintas: "nunca inició sesión con internet aquí" se
+    # resuelve conectando una vez, "la contraseña no coincide" no.
+    if fila is None:
+        cacheados = list(
+            CredencialOfflineCache.objects.using(ALIAS_LOCAL).values_list("username", flat=True)
+        )
+        logger.warning(
+            "Login offline RECHAZADO: '%s' no tiene credencial cacheada en este equipo. "
+            "Solo se puede entrar sin internet con un usuario que ya haya iniciado sesión "
+            "CON internet en esta máquina al menos una vez. Cacheados ahora mismo: %s",
+            username, cacheados or "NINGUNO",
+        )
+        return None
+    if not fila.is_active:
+        logger.warning("Login offline RECHAZADO: el usuario '%s' está marcado como inactivo.", username)
         return None
     if not check_password(password, fila.password_hash):
+        logger.warning(
+            "Login offline RECHAZADO: la contraseña de '%s' no coincide con el hash cacheado "
+            "(actualizado por última vez el %s). Si la contraseña cambió en la nube después de "
+            "esa fecha, hay que iniciar sesión una vez CON internet para refrescarla.",
+            username, fila.actualizado_en,
+        )
         return None
     logger.warning("Inicio de sesión SIN CONEXIÓN validado contra la caché local: %s", username)
     return _usuario_desde_cache(fila)
@@ -422,23 +738,137 @@ class BackendConRespaldoOffline(ModelBackend):
     def authenticate(self, request, username=None, password=None, **kwargs):
         try:
             user = super().authenticate(request, username=username, password=password, **kwargs)
-        except ERRORES_DE_CONEXION:
+        except ERRORES_DE_CONEXION as error:
+            # Camino offline. Se registra explícitamente (prompt 33)
+            # porque hasta ahora era imposible saber, desde el log, si un
+            # login fallido siquiera había llegado hasta aquí o si había
+            # muerto antes por otra razón.
+            logger.warning(
+                "Sin conexión al validar a '%s' contra la nube (%s) — se intenta con la "
+                "caché local de credenciales.",
+                username, type(error).__name__,
+            )
             return autenticar_offline(username or kwargs.get("username"), password)
-        if user is not None:
-            try:
-                from .permisos import rol_de
+        except Exception:
+            # Cualquier otro error de base de datos (no de conexión) NO
+            # debe hacerse pasar por "credenciales incorrectas": eso fue
+            # justo lo que ocultó el bug del prompt 33 durante días.
+            logger.exception(
+                "Error NO esperado validando a '%s' contra la nube — no es un problema de "
+                "conexión, así que no se intenta la caché local.",
+                username,
+            )
+            raise
+        if user is None:
+            # ModelBackend devuelve None tanto si el usuario no existe
+            # como si la contraseña no coincide, y son dos problemas
+            # completamente distintos: "no existe" casi siempre significa
+            # que la app está apuntando a OTRA base de datos (el .env
+            # equivocado), mientras que "existe pero no coincide" es una
+            # contraseña mal escrita o cambiada. Se distinguen aquí
+            # porque, sin eso, perseguir el problema equivocado cuesta
+            # días — ya pasó con el prompt 33.
+            #
+            # Sí, esto revela en el LOG si un usuario existe. Es un
+            # archivo local del equipo del operador, no una respuesta que
+            # se le devuelva a nadie por la red: el mensaje que ve quien
+            # intenta entrar sigue siendo el genérico de siempre.
+            self._registrar_por_que_fallo_el_login(username)
+            return None
+        try:
+            from .permisos import rol_de
 
-                guardar_credencial_offline(user, rol_de(user))
-            except Exception:
-                # Que falle el refresco de la caché nunca debe impedir un
-                # inicio de sesión que YA se validó correctamente.
-                logger.exception("Inicio de sesión correcto pero no se pudo cachear la credencial.")
+            guardar_credencial_offline(user, rol_de(user))
+            logger.info("Credencial de '%s' cacheada para poder entrar sin conexión.", username)
+        except Exception:
+            # Que falle el refresco de la caché nunca debe impedir un
+            # inicio de sesión que YA se validó correctamente.
+            logger.exception("Inicio de sesión correcto pero no se pudo cachear la credencial.")
         return user
 
+    @staticmethod
+    def _registrar_por_que_fallo_el_login(username):
+        """
+        Deja en el log el motivo REAL de un login online rechazado, junto
+        con a qué base se está hablando — que es el dato que de verdad
+        resuelve el caso cuando "las credenciales son correctas" pero la
+        app dice que no.
+        """
+        from django.contrib.auth.models import User
+
+        try:
+            info = resumen_conexion_actual()
+            existe = User.objects.filter(username=username).exists()
+            total = User.objects.count()
+        except Exception:
+            logger.exception("Login rechazado para '%s' y además falló el diagnóstico.", username)
+            return
+
+        if existe:
+            logger.warning(
+                "Login RECHAZADO para '%s': el usuario SÍ existe en %s (host %s), así que la "
+                "contraseña no coincide. No es un problema de configuración ni de conexión.",
+                username, info["dbname"], info["host"],
+            )
+        else:
+            # Se listan los usuarios que SÍ existen: casi siempre el
+            # problema no es "la base está vacía" sino que el nombre de
+            # usuario está escrito distinto — y Django compara el nombre
+            # respetando mayúsculas, así que 'ventas' y 'Ventas' son dos
+            # usuarios distintos. Ver eso de un vistazo ahorra horas.
+            try:
+                existentes = sorted(User.objects.values_list("username", flat=True)[:20])
+            except Exception:
+                existentes = []
+            logger.error(
+                "Login RECHAZADO para '%s': ese usuario NO EXISTE en la base a la que está "
+                "conectada la app — %s (host %s), que tiene %d usuario(s): %s. "
+                "Ojo con las mayúsculas: el nombre de usuario distingue entre 'ventas' y "
+                "'Ventas'. Si la lista de arriba se ve vacía o ajena, revisa que el .env "
+                "junto al ejecutable apunte a la base correcta.",
+                username, info["dbname"], info["host"], total, existentes or "(ninguno)",
+            )
+
     def get_user(self, user_id):
+        """
+        Resuelve request.user en CADA request de un usuario con sesión
+        iniciada — o sea, es el camino más transitado de toda la app.
+
+        Medido (prompt 33c): sin la comprobación de abajo, cada página
+        sin conexión pagaba aquí 3.04s enteros — el connect_timeout
+        completo, en todas y cada una de las requests, incluidas las que
+        ni siquiera tocan la nube (403 por rol, /instrucciones/, el
+        sondeo del tablero cada 4s). El barrido de las 19 rutas con los
+        3 roles daba 3.04s constantes con 0 consultas a la base: el
+        tiempo no era la vista, era este get_user(). Eso es justo la
+        sensación de "ventana insensible" que se reportó en Windows.
+
+        Se consulta sin_conexion_reciente() —que solo LEE la caché— y no
+        hay_conexion(), que sondea. La diferencia importa mucho y se
+        midió: contra Neon, un hay_conexion() con la conexión sana
+        cuesta ~87ms (es un viaje de ida y vuelta por red), y ponerlo
+        aquí se los sumaría a TODAS las requests del uso normal, con
+        internet, para beneficiar solo al caso sin conexión. Cambiar
+        3040ms offline por 87ms online en cada página no es un buen
+        trato; leer la caché cuesta cero en ambos casos.
+
+        El precio de leer la caché en vez de sondear es que la PRIMERA
+        request tras caerse la red no sabe todavía que está caída y paga
+        el timeout aquí. Por eso el except la marca: así el
+        hay_conexion() que la vista hace justo después sale del caché en
+        vez de pagar el timeout una segunda vez en la misma request.
+        """
+        if sin_conexion_reciente():
+            usuario = usuario_offline_por_id(user_id)
+            if usuario is not None:
+                return usuario
+            # Sin fila cacheada no queda más que intentar la base: si
+            # tampoco responde, el except de abajo devuelve None y
+            # Django trata la sesión como anónima, que es lo correcto.
         try:
             return super().get_user(user_id)
         except ERRORES_DE_CONEXION:
+            marcar_sin_conexion()
             return usuario_offline_por_id(user_id)
 
 
@@ -700,6 +1130,16 @@ def encolar_pendiente(instance):
     """
     preparar_bases_locales()
     from .models import PendienteSincronizacion
+
+    # El instante real, ANTES de serializar (prompt 34). Esto se llama
+    # desde ColaOfflineMixin.form_valid() antes de guardar, así que
+    # ocurrido_en todavía es None y AnclaTemporalMixin.save() no ha
+    # corrido. Sin esta línea el payload viajaría sin instante y la fila
+    # remota se sellaría con la hora de SINCRONIZACIÓN — exactamente el
+    # bug que el prompt 34 vino a corregir, reintroducido por la puerta
+    # de atrás y solo en el camino offline, que es justo donde más duele.
+    if hasattr(instance, "ocurrido_en") and instance.ocurrido_en is None:
+        instance.ocurrido_en = timezone.now()
 
     PendienteSincronizacion.objects.using(ALIAS_LOCAL).update_or_create(
         uuid=instance.uuid,
@@ -1090,29 +1530,49 @@ def _fila_historial_a_payload(fila):
     return {
         "fecha": _serializar_valor(fila["fecha"]),
         "tipo": fila["tipo"],
+        "tipo_codigo": fila.get("tipo_codigo"),
         "producto_nombre": str(fila["producto"]),
         "cantidad": fila["cantidad"],
         "valor_unitario": _serializar_valor(fila["valor_unitario"]) if fila["valor_unitario"] is not None else None,
         "usuario": fila["usuario"],
+        "usuario_id": fila.get("usuario_id"),
         "detalle": fila["detalle"],
         "creado_en": _serializar_valor(fila["creado_en"]),
+        # .get(), no fila["ocurrido_en"]: por si algún día esto se llama
+        # sobre una fila armada a mano sin ese campo (ver el fallback
+        # simétrico en _payload_a_fila_historial).
+        "ocurrido_en": _serializar_valor(fila["ocurrido_en"]) if fila.get("ocurrido_en") else None,
         "tipo_registro": fila["tipo_registro"],
         "registro_id": fila["registro_id"],
     }
 
 
 def _payload_a_fila_historial(payload):
-    """Inverso de _fila_historial_a_payload(): reconstruye la fila lista para la plantilla historial.html."""
+    """
+    Inverso de _fila_historial_a_payload(): reconstruye la fila lista
+    para la plantilla historial.html.
+
+    "ocurrido_en"/"tipo_codigo"/"usuario_id" (prompt 35) se leen con
+    respaldo hacia "creado_en"/None/None: un MovimientoHistorialCache ya
+    guardado en el equipo de un usuario ANTES de este prompt no tiene
+    esas claves todavía, y esto no puede reventar hasta que el próximo
+    refrescar_historial_cache() (cada 5 minutos, con conexión) la
+    reemplace por una fila completa.
+    """
     valor_unitario = payload.get("valor_unitario")
+    ocurrido_en = payload.get("ocurrido_en")
     return {
         "fecha": _deserializar_valor(payload["fecha"]),
         "tipo": payload["tipo"],
+        "tipo_codigo": payload.get("tipo_codigo"),
         "producto": payload["producto_nombre"],
         "cantidad": payload["cantidad"],
         "valor_unitario": _deserializar_valor(valor_unitario) if valor_unitario is not None else None,
         "usuario": payload.get("usuario") or "",
+        "usuario_id": payload.get("usuario_id"),
         "detalle": payload.get("detalle") or "",
         "creado_en": _deserializar_valor(payload["creado_en"]),
+        "ocurrido_en": _deserializar_valor(ocurrido_en) if ocurrido_en else _deserializar_valor(payload["creado_en"]),
         "tipo_registro": payload["tipo_registro"],
         "registro_id": payload["registro_id"],
         "es_pendiente": False,
@@ -1151,6 +1611,32 @@ def refrescar_historial_cache():
             )
 
 
+def _tipo_codigo_pendiente(pendiente):
+    """
+    El TIPO_* (services.py, prompt 35) de un pendiente todavía sin
+    sincronizar — mismo criterio que _tipo_mostrado_pendiente(), pero el
+    código estable para filtrar en vez del texto para mostrar.
+
+    Un ConteoFisico recién encolado NUNCA puede tener tipo_codigo de
+    discrepancia (pendiente/resuelta/descartada): DiscrepanciaInventario
+    vive solo en "default", nunca en los alias locales (ver
+    db_router.MODELOS_PERMITIDOS_EN_LOCALES), y la crea una señal
+    post_save que solo corre cuando el conteo LLEGA a Neon — no puede
+    existir todavía mientras el conteo sigue en la cola de este equipo.
+    """
+    from .services import TIPO_AJUSTE_FALTANTE, TIPO_AJUSTE_SOBRANTE, TIPO_CONTEO, TIPO_ENTRADA, TIPO_MERMA, TIPO_VENTA
+
+    if pendiente.modelo == "LoteCompra":
+        return TIPO_ENTRADA
+    if pendiente.modelo == "ConteoFisico":
+        return TIPO_CONTEO
+    tipo = pendiente.payload.get("tipo")
+    if tipo == "ajuste":
+        cantidad = pendiente.payload.get("cantidad") or 0
+        return TIPO_AJUSTE_SOBRANTE if cantidad < 0 else TIPO_AJUSTE_FALTANTE
+    return {"venta": TIPO_VENTA, "merma": TIPO_MERMA}.get(tipo)
+
+
 def _fila_desde_pendiente_historial(pendiente, productos_por_id, usuarios_por_id):
     """
     Convierte un PendienteSincronizacion en una fila de historial —
@@ -1177,23 +1663,33 @@ def _fila_desde_pendiente_historial(pendiente, productos_por_id, usuarios_por_id
         valor_unitario = None
         detalle = payload.get("notas") or ""
 
+    # payload["ocurrido_en"] existe siempre que el pendiente venga de un
+    # modelo con AnclaTemporalMixin (LoteCompra/MovimientoSalida/
+    # ConteoFisico — o sea, siempre: son los únicos 3 modelos que se
+    # encolan) — encolar_pendiente() lo fija ANTES de serializar (prompt
+    # 34). El respaldo a pendiente.creado_en es solo para un pendiente
+    # que quedó en la cola de ANTES de ese arreglo, con un .exe viejo.
+    ocurrido_en = payload.get("ocurrido_en")
     return {
         "fecha": _deserializar_valor(payload.get("fecha")),
         "tipo": _tipo_mostrado_pendiente(pendiente),
+        "tipo_codigo": _tipo_codigo_pendiente(pendiente),
         "producto": producto_nombre,
         "producto_id": producto_id,
         "cantidad": cantidad,
         "valor_unitario": _deserializar_valor(valor_unitario) if valor_unitario is not None else None,
         "usuario": usuarios_por_id.get(payload.get("registrado_por_id"), ""),
+        "usuario_id": payload.get("registrado_por_id"),
         "detalle": detalle,
         "creado_en": pendiente.creado_en,
+        "ocurrido_en": _deserializar_valor(ocurrido_en) if ocurrido_en else pendiente.creado_en,
         "tipo_registro": pendiente.modelo,
         "registro_id": None,  # todavía no existe en Neon — no se puede editar/eliminar hasta que sincronice
         "es_pendiente": True,
     }
 
 
-def historial_offline(fecha_desde, fecha_hasta, producto_id=None):
+def historial_offline(fecha_desde, fecha_hasta, producto_id=None, tipo_movimiento=None, usuario_id=None):
     """
     Historial combinado sin conexión (prompt 19c, punto 1): los últimos
     movimientos ya sincronizados (MovimientoHistorialCache, refrescada
@@ -1209,6 +1705,15 @@ def historial_offline(fecha_desde, fecha_hasta, producto_id=None):
     filtro de fechas más viejo que lo cacheado simplemente no encuentra
     nada ahí, igual que pasaría si de verdad no hubiera movimientos en
     ese rango.
+
+    `tipo_movimiento`/`usuario_id` (prompt 35): a diferencia de fecha y
+    producto, NO son columnas propias de MovimientoHistorialCache — se
+    filtran en Python sobre el resultado. A propósito: el modelo ya
+    documenta que fecha/producto_id son los únicos dos criterios con
+    columna dedicada, y esta caché está acotada a
+    LIMITE_HISTORIAL_CACHE filas (300), así que filtrar el resto en
+    memoria after-the-fact no pesa nada y no vale la pena una migración
+    para un alias que ni siquiera es la fuente de verdad.
     """
     from .models import CredencialOfflineCache, MovimientoHistorialCache, PendienteSincronizacion, Producto
 
@@ -1217,7 +1722,12 @@ def historial_offline(fecha_desde, fecha_hasta, producto_id=None):
     if producto_id:
         cache_qs = cache_qs.filter(producto_id=producto_id)
     for fila_cache in cache_qs:
-        filas.append(_payload_a_fila_historial(fila_cache.payload))
+        fila = _payload_a_fila_historial(fila_cache.payload)
+        if tipo_movimiento and fila["tipo_codigo"] != tipo_movimiento:
+            continue
+        if usuario_id and fila["usuario_id"] != usuario_id:
+            continue
+        filas.append(fila)
 
     try:
         pendientes = list(PendienteSincronizacion.objects.using(ALIAS_LOCAL).all())
@@ -1234,9 +1744,16 @@ def historial_offline(fecha_desde, fecha_hasta, producto_id=None):
                 continue
             if not (fecha_desde <= fila["fecha"] <= fecha_hasta):
                 continue
+            if tipo_movimiento and fila["tipo_codigo"] != tipo_movimiento:
+                continue
+            if usuario_id and fila["usuario_id"] != usuario_id:
+                continue
             filas.append(fila)
 
-    filas.sort(key=lambda f: (f["fecha"], f["creado_en"]), reverse=True)
+    # ocurrido_en, no creado_en — mismo criterio que movimientos_periodo()
+    # (prompt 35): un pendiente sincronizado tarde debe aparecer donde
+    # ocurrió de verdad, no al final según cuándo se subió.
+    filas.sort(key=lambda f: (f["fecha"], f["ocurrido_en"]), reverse=True)
     return filas
 
 

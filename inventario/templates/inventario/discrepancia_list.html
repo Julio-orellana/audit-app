@@ -1,0 +1,64 @@
+{% extends "base.html" %}
+{% block title %}Diferencias de inventario — Auditoría Aylupita{% endblock %}
+{% block content %}
+
+<h1 class="form-card-title">Diferencias de inventario</h1>
+<p class="form-card-subtitle" style="margin-bottom:22px;">
+  Cada vez que un conteo físico no coincide con lo que el sistema tenía, queda registrado aquí hasta
+  que alguien lo revise. Nada se ajusta solo.
+</p>
+
+{% if discrepancias %}
+  <div class="form-card" style="padding:0;overflow:hidden;margin-bottom:32px;">
+    {% for d in discrepancias %}
+      <a href="{% url 'discrepancia_resolver' d.pk %}"
+         style="display:flex;gap:16px;align-items:center;padding:16px 20px;border-bottom:1px solid var(--border);text-decoration:none;color:inherit;">
+        <div style="flex:1;min-width:0;">
+          <div style="font-weight:600;">{{ d.producto }}</div>
+          <div style="color:var(--ink-faint);font-size:13px;">
+            Contado {{ d.contado }} el {{ d.conteo.fecha|date:"d/m/Y" }} a las
+            {{ d.conteo.ocurrido_en|time:"H:i:s" }}
+            {% if d.conteo.registrado_por %} por {{ d.conteo.registrado_por }}{% endif %}
+          </div>
+        </div>
+        {% if d.requiere_revision %}
+          <span class="badge-pill" style="background:var(--info-bg);color:var(--info-ink);">recalculada</span>
+        {% endif %}
+        {% if d.diferencia_vigente > 0 %}
+          <span class="badge-pill" style="background:var(--sobrante-bg);color:var(--sobrante-ink);">+{{ d.diferencia_vigente }} sobrante</span>
+        {% else %}
+          <span class="badge-pill" style="background:var(--danger-bg);color:var(--danger-ink);">{{ d.diferencia_vigente }} faltante</span>
+        {% endif %}
+        <span style="color:var(--ink-faint);">&rarr;</span>
+      </a>
+    {% endfor %}
+  </div>
+{% else %}
+  <div class="form-card" style="color:var(--ink-soft);margin-bottom:32px;">
+    No hay diferencias pendientes. Todos los conteos cuadran con lo que el sistema tenía, o ya fueron revisados.
+  </div>
+{% endif %}
+
+{% if resueltas %}
+  <h2 style="font-size:18px;margin:0 0 10px;">Ya revisadas</h2>
+  <div class="form-card" style="padding:0;overflow:hidden;">
+    {% for d in resueltas %}
+      <a href="{% url 'discrepancia_resolver' d.pk %}"
+         style="display:flex;gap:16px;align-items:center;padding:13px 20px;border-bottom:1px solid var(--border);text-decoration:none;color:inherit;">
+        <div style="flex:1;min-width:0;">
+          <div>{{ d.producto }} · <span class="num">{{ d.diferencia|stringformat:"+d" }}</span></div>
+          <div style="color:var(--ink-faint);font-size:13px;">
+            {{ d.conteo.fecha|date:"d/m/Y" }} ·
+            {% if d.ajuste %}ajustada en <span class="num">{{ d.cantidad_confirmada|stringformat:"+d" }}</span>{% else %}cerrada sin ajuste{% endif %}
+            {% if d.resuelta_por %} por {{ d.resuelta_por }}{% endif %}
+          </div>
+        </div>
+        <span class="badge-pill" style="background:var(--paper);color:var(--ink-faint);border:1px solid var(--border);">
+          {{ d.get_estado_display }}
+        </span>
+      </a>
+    {% endfor %}
+  </div>
+{% endif %}
+
+{% endblock %}

@@ -9,6 +9,12 @@ class InventarioConfig(AppConfig):
 
         respaldos.conectar_señales()
 
+        # Discrepancias de inventario (prompt 34): registrar la de cada
+        # conteo nuevo, y marcar las que quedan afectadas cuando llega un
+        # movimiento con fecha anterior. Importar el módulo basta — los
+        # @receiver se conectan solos.
+        from . import signals  # noqa: F401
+
         # Hilo de sincronización offline (prompt 19b, punto 2): antes
         # SOLO arrancaba desde app_desktop.py, así que levantar el
         # proyecto con `manage.py runserver` — justo como se prueba en

@@ -91,7 +91,8 @@ def _preparar_django():
             "inválida). La app arranca en modo local: todo lo que se registre "
             "queda en la cola de este equipo y NO llegará al sistema central "
             "hasta que se corrija la configuración. Esto NO se arregla "
-            "reconectando a internet."
+            "reconectando a internet. Motivo detectado: %s",
+            getattr(settings, "BD_MOTIVO_NO_CONFIGURADA", None) or "(sin detalle)",
         )
         from django.core.wsgi import get_wsgi_application
 
@@ -110,6 +111,17 @@ def _preparar_django():
             "equipo. Los movimientos se sincronizarán solos en cuanto "
             "vuelva internet."
         )
+        # Solo cuando ya falló: separa "la red es lenta y el timeout se
+        # quedó corto" de "algo bloquea el TLS" — dos causas que en el
+        # log se veían idénticas y se arreglan de formas opuestas
+        # (prompt 33c). Cuesta unos segundos, pero únicamente en el
+        # arranque que ya falló, nunca en el camino normal.
+        try:
+            from inventario.diagnostico import diagnosticar_conectividad_nube
+
+            diagnosticar_conectividad_nube()
+        except Exception:
+            log_arranque.exception("La sonda de conectividad falló (no impide arrancar).")
 
     from django.core.wsgi import get_wsgi_application
 
