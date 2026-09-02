@@ -16,6 +16,7 @@ from functools import wraps
 
 from django.contrib.auth.decorators import login_required
 from django.contrib.auth.mixins import LoginRequiredMixin, UserPassesTestMixin
+from django.contrib.auth.views import redirect_to_login
 from django.core.exceptions import PermissionDenied
 
 
@@ -74,10 +75,35 @@ def RequiereRol(*roles):
     oculto en el template).
     """
     class _RequiereRolMixin(LoginRequiredMixin, UserPassesTestMixin):
-        raise_exception = True
-
         def test_func(self):
             return _tiene_rol(self.request.user, roles)
+
+        def handle_no_permission(self):
+            """
+            Distingue "no eres tú" de "no tienes permiso" (prompt 37).
+
+            Antes esto era `raise_exception = True`, que es lo que la
+            documentación de Django recomienda para forzar el 403 — pero
+            UserPassesTestMixin lo aplica a los DOS casos, así que un
+            visitante sin sesión que abriera /historial/ recibía un 403
+            pelado en lugar del formulario de login. En el .exe eso es
+            peor que un detalle: cuando la sesión caduca, la persona ve
+            una página de error sin ninguna salida, en vez de que le
+            pidan entrar otra vez.
+
+            Las vistas de función nunca tuvieron el problema, porque
+            requiere_rol() envuelve con login_required() y ese corre
+            primero. Esto deja a las vistas de clase con el mismo
+            comportamiento, que además es el que permisos.py ya decía
+            tener escrito arriba.
+            """
+            if not self.request.user.is_authenticated:
+                return redirect_to_login(
+                    self.request.get_full_path(),
+                    self.get_login_url(),
+                    self.get_redirect_field_name(),
+                )
+            raise PermissionDenied
 
     return _RequiereRolMixin
 

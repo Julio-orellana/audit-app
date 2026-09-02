@@ -401,6 +401,18 @@ TIPO_CONTEO = "conteo"
 TIPO_DISCREPANCIA_PENDIENTE = "discrepancia_pendiente"
 TIPO_DISCREPANCIA_RESUELTA = "discrepancia_resuelta"
 TIPO_DISCREPANCIA_DESCARTADA = "discrepancia_descartada"
+# Nota automática (prompt 37): constancia de un conflicto de orden que el
+# sistema detectó y descartó por no cambiar ningún resultado. No es un
+# movimiento —no mueve stock ni dinero— pero vive en el Historial porque
+# es justo ahí donde explica por qué el orden es el que es.
+TIPO_NOTA_AUTOMATICA = "nota_automatica"
+
+# Tope de notas automáticas que se traen al Historial. Son constancias
+# informativas, no movimientos: si algún día hubiera miles (una tienda
+# trabajando semanas sin conexión), no deben desplazar del Historial a lo
+# que de verdad movió inventario. Las que queden fuera siguen completas
+# en la pantalla de Correcciones, que es su lugar natural.
+LIMITE_NOTAS_HISTORIAL = 500
 
 # Los 3 estados de discrepancia se exponen tal cual —ni más ni menos—
 # porque son justo los que ya distingue DiscrepanciaInventario.ESTADOS
@@ -417,6 +429,7 @@ OPCIONES_TIPO_MOVIMIENTO = [
     (TIPO_DISCREPANCIA_PENDIENTE, "· Discrepancia pendiente de revisión"),
     (TIPO_DISCREPANCIA_RESUELTA, "· Discrepancia resuelta"),
     (TIPO_DISCREPANCIA_DESCARTADA, "· Discrepancia descartada sin ajuste"),
+    (TIPO_NOTA_AUTOMATICA, "Nota automática del sistema"),
 ]
 
 
@@ -473,6 +486,7 @@ def movimientos_periodo(
         None, "", TIPO_CONTEO,
         TIPO_DISCREPANCIA_PENDIENTE, TIPO_DISCREPANCIA_RESUELTA, TIPO_DISCREPANCIA_DESCARTADA,
     )
+    incluir_notas = tipo_movimiento in (None, "", TIPO_NOTA_AUTOMATICA)
 
     lotes_qs = LoteCompra.objects.none()
     if incluir_lotes:
@@ -644,6 +658,9 @@ def movimientos_periodo(
                 }
             )
 
+    if incluir_notas:
+        filas.extend(_filas_de_notas_automaticas(fecha_inicio, fecha_fin, productos, usuario_id))
+
     # ocurrido_en, no creado_en (prompt 35): el orden cronológico real es
     # cuándo se registró en el equipo de quien lo hizo, no cuándo llegó a
     # la base. Con creado_en, un movimiento cargado sin conexión y
@@ -651,6 +668,77 @@ def movimientos_periodo(
     # hora de sincronización, en vez de en el lugar que le correspondía
     # según cuándo ocurrió de verdad — ver AnclaTemporalMixin (prompt 34).
     filas.sort(key=lambda f: (f["fecha"], f["ocurrido_en"]), reverse=descendente)
+    return filas
+
+
+def _filas_de_notas_automaticas(fecha_inicio, fecha_fin, productos=None, usuario_id=None):
+    """
+    Las notas automáticas del sistema como filas de Historial (prompt 37).
+
+    No son movimientos: no mueven stock ni dinero, y por eso no tienen
+    cantidad ni valor. Están en el Historial porque es exactamente ahí
+    donde hacen falta — explican por qué un movimiento aparece donde
+    aparece cuando llegó fuera de orden.
+
+    `usuario_id`: una nota la escribe el SISTEMA, no una persona
+    (realizado_por es NULL), así que filtrar por usuario las excluye
+    siempre. Es lo correcto: quien busca "todo lo de Ruth" no está
+    buscando notas que Ruth no escribió.
+    """
+    from .models import CorreccionHistorial, Producto
+
+    if usuario_id:
+        return []
+
+    notas = list(
+        CorreccionHistorial.objects
+        .filter(accion=CorreccionHistorial.ACCION_NOTA)
+        .order_by("-fecha")[:LIMITE_NOTAS_HISTORIAL]
+    )
+    if not notas:
+        return []
+
+    ids_producto = {n.datos_nuevos.get("producto_id") for n in notas if n.datos_nuevos}
+    ids_producto.discard(None)
+    productos_por_id = {p.pk: p for p in Producto.objects.filter(pk__in=ids_producto)}
+    ids_permitidos = {p.pk for p in productos} if productos is not None else None
+
+    filas = []
+    for nota in notas:
+        datos = nota.datos_nuevos or {}
+        producto = productos_por_id.get(datos.get("producto_id"))
+        if producto is None:
+            continue
+        if ids_permitidos is not None and producto.pk not in ids_permitidos:
+            continue
+        try:
+            fecha = date.fromisoformat(datos["fecha"])
+            ocurrido_en = datetime.fromisoformat(datos["ocurrido_en"])
+        except (KeyError, TypeError, ValueError):
+            # Nota escrita por una versión anterior, sin estos campos: se
+            # omite del Historial en vez de reventarlo. Sigue visible en
+            # la pantalla de Correcciones.
+            continue
+        if not (fecha_inicio <= fecha <= fecha_fin):
+            continue
+
+        filas.append(
+            {
+                "fecha": fecha,
+                "tipo": "Nota automática",
+                "tipo_codigo": TIPO_NOTA_AUTOMATICA,
+                "producto": producto,
+                "cantidad": 0,
+                "valor_unitario": None,
+                "usuario": "",          # la escribió el sistema
+                "usuario_id": None,
+                "detalle": nota.motivo,
+                "creado_en": nota.fecha,
+                "ocurrido_en": ocurrido_en,
+                "tipo_registro": "CorreccionHistorial",
+                "registro_id": nota.pk,
+            }
+        )
     return filas
 
 

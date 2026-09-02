@@ -77,7 +77,7 @@ def revisar_discrepancias_afectadas(sender, instance, created, raw=False, using=
     producto_id = producto.producto_base_id or producto.pk
 
     try:
-        marcar_afectadas_por(
+        afectadas = marcar_afectadas_por(
             producto_id, instance.fecha, instance.ocurrido_en,
             motivo=(
                 f"Se registró un movimiento con fecha {instance.fecha:%d/%m/%Y} "
@@ -88,5 +88,23 @@ def revisar_discrepancias_afectadas(sender, instance, created, raw=False, using=
     except Exception:
         logger.exception(
             "No se pudieron revisar las discrepancias afectadas por %s #%s.",
+            sender.__name__, instance.pk,
+        )
+        return
+
+    # Conflicto MENOR (prompt 34 punto 1, completado en el 37): el
+    # movimiento llegó fuera de orden pero no cambió ninguna diferencia
+    # pendiente. Se deja constancia y no se bloquea nada. Si SÍ hubiera
+    # cambiado alguna, `afectadas` sería > 0 y arriba ya quedó marcada
+    # para revisión humana — entonces esta nota no se escribe.
+    try:
+        from .discrepancias import registrar_nota_conflicto_menor
+
+        registrar_nota_conflicto_menor(instance, afectadas)
+    except Exception:
+        # Una nota informativa jamás puede tumbar el guardado del
+        # movimiento que la originó.
+        logger.exception(
+            "No se pudo registrar la nota de conflicto menor de %s #%s.",
             sender.__name__, instance.pk,
         )

@@ -13,8 +13,10 @@
 {% block content %}
 <div class="form-card" style="max-width:520px;margin:48px auto;text-align:center;">
   {% if bd_nube_no_configurada %}
-  {# Prompt 33: falta la configuración, no es un corte de red — decirlo
-     tal cual, para que nadie espere a que "vuelva el internet". #}
+  {% comment %}
+    Prompt 33: falta la configuración, no es un corte de red — decirlo
+    tal cual, para que nadie espere a que "vuelva el internet".
+  {% endcomment %}
   <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="var(--danger)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="margin-bottom:16px;"><path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0Z"/><path d="M12 9v4M12 17h.01"/></svg>
   <h1 class="form-card-title" style="text-align:center;">Falta la configuración del programa</h1>
   <p class="form-card-subtitle" style="text-align:center;">

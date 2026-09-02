@@ -499,7 +499,22 @@ class CorreccionHistorial(models.Model):
     crea uno de estos sin el cambio real aplicado en la misma transacción,
     ni viceversa (ver las vistas de corrección en views.py).
     """
-    ACCION_CHOICES = (("edicion", "Edición"), ("eliminacion", "Eliminación"))
+    # "nota" (prompt 37) es distinta de las otras dos: no la hace una
+    # persona corrigiendo algo, la escribe el sistema para dejar
+    # constancia de un conflicto de orden que detectó y descartó solo por
+    # no cambiar ningún resultado. Nunca bloquea ni pide revisión — para
+    # eso está DiscrepanciaInventario.requiere_revision. Se guarda aquí y
+    # no en una tabla nueva porque esta YA ES el rastro de auditoría de
+    # "qué le pasó a los registros", ya se muestra en la pantalla de
+    # Correcciones y tiene todos los campos que hacen falta.
+    ACCION_EDICION = "edicion"
+    ACCION_ELIMINACION = "eliminacion"
+    ACCION_NOTA = "nota"
+    ACCION_CHOICES = (
+        (ACCION_EDICION, "Edición"),
+        (ACCION_ELIMINACION, "Eliminación"),
+        (ACCION_NOTA, "Nota automática"),
+    )
 
     tipo_registro = models.CharField(max_length=30)  # "LoteCompra", "MovimientoSalida", "ConteoFisico"
     registro_id = models.PositiveIntegerField()

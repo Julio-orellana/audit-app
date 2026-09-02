@@ -1,3 +1,4 @@
+from contextlib import contextmanager
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 
@@ -2418,3 +2419,426 @@ class LoginConConexionRealTests(TransactionTestCase):
             "Esa es exactamente la regresión del prompt 33d.",
         )
         self.assertEqual(autenticado.username, "usuario33d")
+
+
+class NotaConflictoMenorTests(TestCase):
+    """
+    Prompt 34 punto 1, completado en el prompt 37.
+
+    El diseño del 34 prometía que un conflicto de orden MENOR —uno que no
+    cambia ningún resultado— dejara una nota informativa en vez de
+    bloquear, y esa pieza nunca se construyó: esos casos no hacían
+    absolutamente nada.
+
+    Al completarla se descubrió por qué había quedado a medias: la rama
+    que el 34 dejó preparada dentro de marcar_afectadas_por() ("si el
+    teórico recalculado da igual, no hagas nada") es INALCANZABLE.
+    Instrumentada, no se ejecutó ni una vez en las 75 pruebas de la
+    suite, y estructuralmente no puede: cualquier movimiento que caiga en
+    el pasado de una discrepancia pendiente siempre entra en el filtro de
+    stock_teorico(), así que el número SIEMPRE cambia. El conflicto menor
+    se detecta donde de verdad ocurre — cuando un movimiento sincroniza
+    tarde y, al colocarlo en su lugar cronológico, no altera ninguna
+    diferencia pendiente.
+    """
+
+    databases = {"default", "local_disco"}
+
+    def setUp(self):
+        from django.utils import timezone as tz
+
+        self.tz = tz
+        self.hoy = date(2026, 8, 31)
+        categoria = Categoria.objects.create(nombre="Cervezas 37")
+        self.gallo = Producto.objects.create(
+            nombre="Gallo 37", categoria=categoria, precio_venta_actual=Decimal("15.00")
+        )
+        self.ruth = User.objects.create_user(username="ruth37", password="x")
+
+    def _instante(self, hora, minuto=0):
+        return self.tz.make_aware(
+            datetime(self.hoy.year, self.hoy.month, self.hoy.day, hora, minuto),
+            self.tz.get_current_timezone(),
+        )
+
+    @contextmanager
+    def _montando_el_escenario(self):
+        """
+        Silencia la detección de desfase mientras se arma el escenario.
+
+        Hace falta por cómo funciona el reloj en una prueba, no por la
+        lógica: aquí se fija ocurrido_en en una fecha concreta del pasado
+        mientras creado_en es auto_now_add y queda en "ahora", así que
+        TODO objeto de andamiaje parecería haber sincronizado con horas de
+        desfase y generaría notas que en producción nunca existirían (una
+        escritura en línea real pone ocurrido_en = ahora dentro de
+        save(), y el desfase es de milisegundos). Con esto, la única nota
+        que puede aparecer es la del movimiento que la prueba SÍ está
+        midiendo.
+        """
+        from . import discrepancias
+
+        original = discrepancias.SEGUNDOS_DESFASE_PARA_NOTA
+        discrepancias.SEGUNDOS_DESFASE_PARA_NOTA = 10 ** 9
+        try:
+            yield
+        finally:
+            discrepancias.SEGUNDOS_DESFASE_PARA_NOTA = original
+
+    def _lote(self, cantidad, hora):
+        return LoteCompra.objects.create(
+            producto=self.gallo, fecha=self.hoy, cantidad=cantidad,
+            costo_unitario=Decimal("6.50"), registrado_por=self.ruth,
+            ocurrido_en=self._instante(hora),
+        )
+
+    def _conteo(self, cantidad, hora):
+        return ConteoFisico.objects.create(
+            producto=self.gallo, fecha=self.hoy, cantidad_contada=cantidad,
+            registrado_por=self.ruth, ocurrido_en=self._instante(hora),
+        )
+
+    def _venta_que_sincronizo_tarde(self, cantidad, hora, minutos_de_desfase):
+        """
+        Una venta registrada sin conexión que llegó tarde: su instante
+        real es anterior al momento en que la base la insertó. Ese desfase
+        es lo que la app ve como "esto llegó fuera de orden".
+
+        creado_en es auto_now_add, así que se fija después de crear y la
+        señal se dispara a mano — es la única forma de simular una llegada
+        tardía sin esperarla de verdad.
+        """
+        from .discrepancias import marcar_afectadas_por, registrar_nota_conflicto_menor
+
+        with self._montando_el_escenario():
+            venta = MovimientoSalida.objects.create(
+                producto=self.gallo, fecha=self.hoy, tipo="venta", cantidad=cantidad,
+                precio_venta_unitario=Decimal("15.00"), registrado_por=self.ruth,
+                ocurrido_en=self._instante(hora),
+            )
+        MovimientoSalida.objects.filter(pk=venta.pk).update(
+            creado_en=self._instante(hora) + timedelta(minutes=minutos_de_desfase)
+        )
+        venta.refresh_from_db()
+        afectadas = marcar_afectadas_por(
+            self.gallo.pk, venta.fecha, venta.ocurrido_en,
+            motivo="Movimiento que sincronizó tarde (prueba).",
+        )
+        registrar_nota_conflicto_menor(venta, afectadas)
+        return venta
+
+    def _escenario_con_conteo_cerrado(self):
+        """
+        Un conteo con faltante que YA se resolvió: su ajuste está aplicado
+        y su resultado contabilizado. Es el escenario donde un movimiento
+        que llega tarde produce un conflicto menor.
+        """
+        from .discrepancias import resolver_discrepancia
+        from .models import DiscrepanciaInventario
+
+        with self._montando_el_escenario():
+            self._lote(500, hora=8)
+            conteo = self._conteo(495, hora=18)
+            discrepancia = DiscrepanciaInventario.objects.get(conteo=conteo)
+            resolver_discrepancia(discrepancia, 5, self.ruth, "Faltante confirmado.")
+            discrepancia.refresh_from_db()
+        self.assertEqual(discrepancia.estado, DiscrepanciaInventario.RESUELTA)
+        return discrepancia
+
+    def test_un_conflicto_menor_deja_nota_y_no_bloquea_nada(self):
+        from .models import CorreccionHistorial
+
+        discrepancia = self._escenario_con_conteo_cerrado()
+        diferencia_antes = discrepancia.diferencia
+
+        # Llega tarde y cae ANTES del conteo ya cerrado.
+        venta = self._venta_que_sincronizo_tarde(3, hora=14, minutos_de_desfase=37)
+
+        notas = CorreccionHistorial.objects.filter(accion=CorreccionHistorial.ACCION_NOTA)
+        self.assertEqual(notas.count(), 1, "Un conflicto menor tiene que dejar constancia.")
+        nota = notas.first()
+        self.assertEqual(nota.registro_id, venta.pk)
+        self.assertIsNone(nota.realizado_por, "La escribió el sistema, no una persona.")
+        self.assertIn("37 minutos", nota.motivo)
+        self.assertIn("no hace falta que nadie revise", nota.motivo)
+
+        discrepancia.refresh_from_db()
+        self.assertFalse(
+            discrepancia.requiere_revision,
+            "Un conflicto MENOR no puede bloquear ni pedir revisión de nadie.",
+        )
+        self.assertEqual(
+            discrepancia.estado, discrepancia.RESUELTA,
+            "El conteo cerrado sigue cerrado: la nota no reabre nada.",
+        )
+        self.assertEqual(discrepancia.diferencia, diferencia_antes)
+        self.assertIsNone(
+            discrepancia.diferencia_recalculada,
+            "Nada se recalcula sobre un conteo cerrado: su ajuste ya está contabilizado.",
+        )
+
+    def test_un_movimiento_que_sincroniza_tarde_sin_alcanzar_nada_no_deja_nota(self):
+        """
+        El caso corriente y con diferencia el más frecuente: una venta
+        offline sincroniza horas después, pero no cae en el pasado de
+        ningún conteo. No hubo conflicto con nada, así que no hay nada que
+        anotar.
+
+        Esta prueba existe porque la primera versión de la nota SÍ se
+        disparaba aquí, y eso duplicaba las filas del Historial: cada
+        movimiento sincronizado desde la cola dejaba su propia nota.
+        """
+        from .models import CorreccionHistorial
+
+        with self._montando_el_escenario():
+            self._lote(500, hora=8)
+
+        self._venta_que_sincronizo_tarde(3, hora=14, minutos_de_desfase=120)
+
+        self.assertEqual(
+            CorreccionHistorial.objects.filter(accion=CorreccionHistorial.ACCION_NOTA).count(), 0,
+            "Sincronizar tarde por sí solo no es un conflicto: no puede llenar el Historial de notas.",
+        )
+
+    def test_un_conflicto_mayor_sigue_pidiendo_revision_y_no_deja_nota(self):
+        from .models import CorreccionHistorial, DiscrepanciaInventario
+
+        with self._montando_el_escenario():
+            self._lote(500, hora=8)
+            conteo = self._conteo(495, hora=18)
+        discrepancia = DiscrepanciaInventario.objects.get(conteo=conteo)
+        self.assertEqual(discrepancia.diferencia, -5)
+
+        # Movimiento tardío que SÍ cae antes del conteo: cambia su número.
+        self._venta_que_sincronizo_tarde(10, hora=12, minutos_de_desfase=90)
+
+        discrepancia.refresh_from_db()
+        self.assertTrue(
+            discrepancia.requiere_revision,
+            "Un conflicto MAYOR tiene que seguir marcándose para revisión humana.",
+        )
+        self.assertEqual(
+            discrepancia.diferencia_recalculada, 5,
+            "El teórico a las 18:00 pasa de 500 a 490 por la venta tardía de 10, así que "
+            "la diferencia va de −5 a 495 − 490 = +5.",
+        )
+        self.assertEqual(
+            CorreccionHistorial.objects.filter(accion=CorreccionHistorial.ACCION_NOTA).count(), 0,
+            "Si hace falta revisión humana, la nota informativa sería ruido al lado.",
+        )
+
+    def test_un_movimiento_registrado_en_linea_no_genera_nota(self):
+        from .models import CorreccionHistorial
+
+        with self._montando_el_escenario():
+            self._lote(500, hora=8)
+
+        # Sin desfase: ocurrido_en y creado_en son el mismo instante, que
+        # es lo que hace save() en una escritura en línea real.
+        venta = MovimientoSalida.objects.create(
+            producto=self.gallo, fecha=self.hoy, tipo="venta", cantidad=2,
+            precio_venta_unitario=Decimal("15.00"), registrado_por=self.ruth,
+        )
+        self.assertLess(
+            (venta.creado_en - venta.ocurrido_en).total_seconds(), 1,
+            "save() debe poner ocurrido_en = ahora cuando no viene de la cola offline.",
+        )
+        self.assertEqual(
+            CorreccionHistorial.objects.filter(accion=CorreccionHistorial.ACCION_NOTA).count(), 0,
+            "Sin desfase no hubo conflicto de orden: no hay nada que anotar.",
+        )
+
+    def test_la_nota_se_ve_en_historial_y_el_filtro_de_tipo_la_distingue(self):
+        from .services import TIPO_NOTA_AUTOMATICA, TIPO_VENTA, movimientos_periodo
+
+        self._escenario_con_conteo_cerrado()
+        self._venta_que_sincronizo_tarde(3, hora=14, minutos_de_desfase=45)
+
+        solo_notas = movimientos_periodo(self.hoy, self.hoy, tipo_movimiento=TIPO_NOTA_AUTOMATICA)
+        self.assertEqual(len(solo_notas), 1)
+        self.assertEqual(solo_notas[0]["tipo"], "Nota automática")
+        self.assertEqual(solo_notas[0]["producto"], self.gallo)
+
+        solo_ventas = movimientos_periodo(self.hoy, self.hoy, tipo_movimiento=TIPO_VENTA)
+        self.assertTrue(
+            all(f["tipo_codigo"] == TIPO_VENTA for f in solo_ventas),
+            "El filtro de ventas no debe traer notas automáticas.",
+        )
+
+        todo = movimientos_periodo(self.hoy, self.hoy)
+        tipos = {f["tipo_codigo"] for f in todo}
+        self.assertIn(TIPO_NOTA_AUTOMATICA, tipos, "Sin filtro, la nota debe verse en el Historial.")
+        self.assertIn(TIPO_VENTA, tipos)
+
+
+class MatrizDeRolesTests(TestCase):
+    """
+    Cada URL de la app, contra cada uno de los tres roles (prompts 16, 25
+    y 29; verificada de nuevo en el 37 punto 1).
+
+    Las pruebas de rol que existían eran puntuales —cuatro casos sueltos—
+    y por eso las vistas de discrepancias del prompt 34 llegaron a
+    producción sin ninguna. Esta clase fija la matriz COMPLETA y, además,
+    falla si aparece una ruta nueva que no esté en la tabla: así una vista
+    añadida más adelante no puede quedarse sin comprobación de permisos
+    por olvido.
+
+    Se comprueba "no es 403" en vez de "es 200" a propósito: varias rutas
+    son POST-only (405) o redirigen (302), y lo que esta prueba defiende
+    es el permiso, no el cuerpo de la respuesta.
+    """
+
+    #: nombre de ruta -> (kwargs, roles que SÍ pueden entrar)
+    TODOS = ("admin", "auditor", "vendedor")
+    MATRIZ = {
+        "home": ({}, TODOS),
+        "instrucciones": ({}, TODOS),
+        "estado_sincronizacion": ({}, TODOS),
+        "movimientosalida_create": ({}, TODOS),
+        "categoria_list": ({}, ("admin", "auditor")),
+        "categoria_create": ({}, ("admin", "auditor")),
+        "categoria_update": ({"pk": 1}, ("admin", "auditor")),
+        "categoria_toggle": ({"pk": 1}, ("admin", "auditor")),
+        "producto_list": ({}, ("admin", "auditor")),
+        "producto_create": ({}, ("admin", "auditor")),
+        "producto_update": ({"pk": 1}, ("admin", "auditor")),
+        "producto_toggle": ({"pk": 1}, ("admin", "auditor")),
+        "lotecompra_create": ({}, ("admin", "auditor")),
+        "conteofisico_create": ({}, ("admin", "auditor")),
+        "conteofisico_detail": ({"pk": 1}, ("admin", "auditor")),
+        "conteofisico_generar_ajuste": ({"pk": 1}, ("admin", "auditor")),
+        "discrepancias": ({}, ("admin", "auditor")),
+        "discrepancia_resolver": ({"pk": 1}, ("admin", "auditor")),
+        "historial": ({}, ("admin", "auditor")),
+        "reportes": ({}, ("admin", "auditor")),
+        "cola_sincronizacion": ({}, ("admin", "auditor")),
+        "cola_sincronizacion_reintentar": ({"pendiente_id": 1}, ("admin", "auditor")),
+        "cola_sincronizacion_reintentar_todos": ({}, ("admin", "auditor")),
+        # Editar y borrar lo ya registrado es exclusivo de administrador:
+        # ni el auditor puede (prompt 17).
+        "correcciones_historial": ({}, ("admin",)),
+        "lotecompra_correccion_editar": ({"pk": 1}, ("admin",)),
+        "lotecompra_correccion_eliminar": ({"pk": 1}, ("admin",)),
+        "movimientosalida_correccion_editar": ({"pk": 1}, ("admin",)),
+        "movimientosalida_correccion_eliminar": ({"pk": 1}, ("admin",)),
+        "conteofisico_correccion_editar": ({"pk": 1}, ("admin",)),
+        "conteofisico_correccion_eliminar": ({"pk": 1}, ("admin",)),
+    }
+
+    def setUp(self):
+        self.usuarios = {}
+        for rol in self.TODOS:
+            grupo, _ = Group.objects.get_or_create(name=rol)
+            u = User.objects.create_user(username=f"{rol}_matriz", password="clave-matriz")
+            u.groups.add(grupo)
+            self.usuarios[rol] = u
+
+    def test_la_tabla_cubre_todas_las_rutas_de_la_app(self):
+        from . import urls as urls_inventario
+
+        rutas = {p.name for p in urls_inventario.urlpatterns if p.name}
+        sin_cubrir = rutas - set(self.MATRIZ)
+        self.assertEqual(
+            sin_cubrir, set(),
+            "Rutas sin comprobación de permisos en MATRIZ. Toda vista nueva tiene que "
+            "declarar aquí quién puede entrar antes de darse por terminada.",
+        )
+        sobrantes = set(self.MATRIZ) - rutas
+        self.assertEqual(sobrantes, set(), "La tabla nombra rutas que ya no existen.")
+
+    def test_cada_rol_solo_entra_donde_le_corresponde(self):
+        from django.urls import reverse
+
+        problemas = []
+        for nombre, (kwargs, permitidos) in sorted(self.MATRIZ.items()):
+            url = reverse(nombre, kwargs=kwargs)
+            for rol in self.TODOS:
+                self.client.force_login(self.usuarios[rol])
+                codigo = self.client.get(url).status_code
+                self.client.logout()
+                if rol in permitidos and codigo == 403:
+                    problemas.append(f"{nombre}: {rol} debería entrar y recibió 403")
+                if rol not in permitidos and codigo != 403:
+                    problemas.append(
+                        f"{nombre}: {rol} NO debería entrar y recibió {codigo} en vez de 403"
+                    )
+        self.assertEqual(problemas, [], "\n".join(problemas))
+
+    def test_sin_sesion_todo_redirige_al_login_y_nada_responde_contenido(self):
+        from django.urls import reverse
+
+        problemas = []
+        for nombre, (kwargs, _) in sorted(self.MATRIZ.items()):
+            url = reverse(nombre, kwargs=kwargs)
+            respuesta = self.client.get(url)
+            if respuesta.status_code != 302 or "/login" not in respuesta.headers.get("Location", ""):
+                problemas.append(
+                    f"{nombre}: sin sesión devolvió {respuesta.status_code} "
+                    f"-> {respuesta.headers.get('Location', '(sin Location)')}"
+                )
+        self.assertEqual(problemas, [], "\n".join(problemas))
+
+
+class PlantillasSanasTests(SimpleTestCase):
+    """
+    Errores de plantilla que Django no reporta: se ven en pantalla y ya.
+    """
+
+    def test_ningun_comentario_de_almohadilla_esta_partido_en_dos_lineas(self):
+        """
+        {# ... #} es de UNA sola línea en Django. Partido en dos, deja de
+        ser un comentario y el texto se IMPRIME en la pantalla del
+        usuario, sin ningún error ni aviso.
+
+        Pasó de verdad dos veces: en el Historial (la nota automática del
+        prompt 37 salía con el comentario del código pegado delante) y en
+        la pantalla de "falta la configuración" del prompt 33, que es
+        justo una de las que ve el usuario final cuando algo va mal. Para
+        varias líneas va {% comment %}.
+        """
+        import pathlib
+
+        raiz = pathlib.Path(__file__).resolve().parent.parent
+        partidos = []
+        for archivo in sorted(raiz.rglob("*.html")):
+            if {"venv", "staticfiles", "build", "dist"} & set(archivo.parts):
+                continue
+            for numero, linea in enumerate(archivo.read_text(errors="replace").splitlines(), 1):
+                if "{#" in linea and "#}" not in linea.split("{#", 1)[1]:
+                    partidos.append(f"{archivo.relative_to(raiz)}:{numero}")
+        self.assertEqual(
+            partidos, [],
+            "Comentario {# #} partido en varias líneas: se imprimirá en pantalla. "
+            "Usa {% comment %} ... {% endcomment %}. En: " + ", ".join(partidos),
+        )
+
+
+class SelectoresEnEspanolTests(TestCase):
+    """
+    Django 6 estrenó BLANK_CHOICE_LABEL ("- Select an option -") y todavía
+    no viene traducida al español, así que cualquier desplegable de clave
+    foránea que no fije empty_label sale en INGLÉS en una app que está
+    entera en español. Pasaba en los cuatro formularios de uso diario
+    (producto, entrada, salida, conteo) y en el filtro de Historial.
+    """
+
+    def test_ningun_desplegable_muestra_el_texto_en_ingles_de_django(self):
+        from .forms import (
+            ConteoFisicoForm, HistorialFiltroForm, LoteCompraForm,
+            MovimientoSalidaForm, ProductoForm,
+        )
+
+        en_ingles = []
+        for clase in (ProductoForm, LoteCompraForm, MovimientoSalidaForm,
+                      ConteoFisicoForm, HistorialFiltroForm):
+            for nombre, campo in clase().fields.items():
+                etiqueta = getattr(campo, "empty_label", None)
+                if etiqueta is None:
+                    continue
+                if "Select an option" in str(etiqueta) or str(etiqueta) == "---------":
+                    en_ingles.append(f"{clase.__name__}.{nombre} -> {etiqueta!r}")
+        self.assertEqual(
+            en_ingles, [],
+            "Desplegables con el texto por defecto de Django en vez de uno en español: "
+            + ", ".join(en_ingles),
+        )

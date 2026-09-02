@@ -62,6 +62,15 @@
           <span class="badge-pill" style="background:var(--danger-bg);color:var(--danger-ink);">{{ fila.tipo }}</span>
         {% elif fila.tipo == "Conteo físico" %}
           <span class="badge-pill" style="background:var(--slate-bg);color:var(--slate);">Conteo físico</span>
+        {% elif fila.tipo == "Nota automática" %}
+          {% comment %}
+            Prompt 37: constancia del sistema, no un movimiento. Se ve
+            distinta a propósito — no mueve stock ni dinero.
+            Comentario de bloque y no el de almohadilla: ese es de UNA
+            sola línea, y al partirlo en dos se imprimía tal cual en la
+            pantalla del Historial.
+          {% endcomment %}
+          <span class="badge-pill" style="background:var(--info-bg);color:var(--info-ink);border:1px solid var(--info-border);">Nota automática</span>
         {% else %}
           <span class="badge-pill" style="background:var(--slate-bg);color:var(--slate);">{{ fila.tipo }}</span>
         {% endif %}
@@ -70,7 +79,7 @@
         {% endif %}
       </div>
       <div style="font-weight:600;">{{ fila.producto }}</div>
-      <div class="num">{{ fila.cantidad }}</div>
+      <div class="num">{% if fila.tipo_codigo == "nota_automatica" %}—{% else %}{{ fila.cantidad }}{% endif %}</div>
       <div class="num">{% if fila.valor_unitario is not None %}Q{{ fila.valor_unitario }}{% else %}—{% endif %}</div>
       <div style="color:var(--ink-soft);font-size:13.5px;">{{ fila.usuario|default:"—" }}</div>
       <div style="color:var(--ink-soft);font-size:13.5px;">

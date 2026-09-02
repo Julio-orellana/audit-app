@@ -128,6 +128,159 @@ def marcar_afectadas_por(producto_id, fecha, ocurrido_en, motivo, excluir_id=Non
     return marcadas
 
 
+# Un movimiento que llega con este desfase o más entre su instante REAL
+# (ocurrido_en) y el momento en que la base lo insertó (creado_en) no se
+# registró en línea: venía de la cola offline y sincronizó tarde. Ese es
+# el caso en que un movimiento se INSERTA EN EL PASADO de cosas que ya
+# estaban en el sistema — el conflicto de orden del prompt 34.
+#
+# 60 segundos para no confundirlo con la latencia normal de una escritura
+# en línea (medida contra Neon: ~120 ms por consulta).
+SEGUNDOS_DESFASE_PARA_NOTA = 60
+
+
+def registrar_nota_conflicto_menor(instance, discrepancias_afectadas):
+    """
+    Deja constancia de un conflicto de orden que el sistema detectó y
+    descartó SOLO porque no cambió ningún resultado (prompt 34 punto 1,
+    completado en el 37).
+
+    Qué es un conflicto MENOR aquí, con precisión — las tres condiciones
+    se exigen juntas:
+
+    1. El movimiento llegó fuera de orden: su instante real es anterior
+       al momento en que la base lo recibió, o sea que venía de la cola
+       offline y sincronizó tarde.
+    2. Cae en el pasado de al menos un conteo YA CERRADO (resuelto o
+       descartado) del mismo producto, y de verdad le mueve el teórico.
+    3. No afectó a ninguna discrepancia PENDIENTE.
+
+    La condición 2 es la que hace que esto valga la pena escribirlo. Un
+    conteo cerrado no se reabre: su ajuste ya está aplicado y su
+    resultado financiero ya está contabilizado — esa fue la decisión del
+    prompt 34, y no se cambia aquí. Pero el número con el que se cerró se
+    calculó sin este movimiento. Nadie tiene que hacer nada, y aun así el
+    historial no puede quedarse mudo al respecto. Eso es exactamente una
+    nota informativa: constancia sin bloqueo.
+
+    El caso MAYOR —el movimiento tardío cambia el teórico congelado de
+    una discrepancia PENDIENTE— ya lo cubre marcar_afectadas_por()
+    poniendo requiere_revision, y entonces aquí no se escribe nada: sería
+    ruido al lado de algo que sí exige a una persona.
+
+    Y el caso corriente —una venta offline que sincroniza tarde y no cae
+    en el pasado de ningún conteo— no genera nada. Esto importa: sin la
+    condición 2, CADA movimiento sincronizado desde la cola dejaría una
+    nota, y el Historial quedaría inservible de tanto ruido (se comprobó:
+    duplicaba el número de filas de la pantalla).
+
+    NOTA SOBRE EL DISEÑO ORIGINAL (importante para quien lea esto
+    después): el prompt 34 dejó preparada una rama para el conflicto
+    menor dentro de marcar_afectadas_por() —"si el teórico recalculado da
+    igual, no hagas nada"— y al completar esto se comprobó que esa rama
+    es INALCANZABLE: instrumentada, no se ejecutó ni una vez en las 75
+    pruebas de la suite, y estructuralmente no puede ejecutarse, porque
+    cualquier movimiento que caiga en el pasado de una discrepancia
+    pendiente siempre entra en el filtro de stock_teorico() y por lo
+    tanto siempre cambia el número. Rellenar aquella rama habría sido
+    construir algo que nunca se ejecuta. El conflicto menor se detecta
+    donde de verdad ocurre: al sincronizar tarde.
+    """
+    from .models import CorreccionHistorial
+
+    ocurrido_en = getattr(instance, "ocurrido_en", None)
+    creado_en = getattr(instance, "creado_en", None)
+    if ocurrido_en is None or creado_en is None:
+        return None
+    desfase = (creado_en - ocurrido_en).total_seconds()
+    if desfase < SEGUNDOS_DESFASE_PARA_NOTA:
+        return None            # se registró en línea: no hubo conflicto de orden
+    if discrepancias_afectadas:
+        return None            # es un conflicto MAYOR: ya hay requiere_revision
+
+    cerradas = _cerradas_alcanzadas_por(instance)
+    if not cerradas:
+        return None            # sincronizó tarde, pero no alcanzó a ningún conteo cerrado
+
+    minutos = desfase / 60
+    nota = CorreccionHistorial.objects.create(
+        tipo_registro=type(instance).__name__,
+        registro_id=instance.pk,
+        accion=CorreccionHistorial.ACCION_NOTA,
+        datos_anteriores={},
+        datos_nuevos={
+            "ocurrido_en": ocurrido_en.isoformat(),
+            "creado_en": creado_en.isoformat(),
+            "desfase_segundos": round(desfase),
+            "producto_id": instance.producto_id,
+            # La fecha contable del movimiento, para que la nota se pueda
+            # ubicar en el Historial sin volver a consultar su tabla.
+            "fecha": instance.fecha.isoformat(),
+            "conteos_cerrados_alcanzados": [d.pk for d in cerradas],
+        },
+        motivo=(
+            f"Conflicto de orden menor: este movimiento se registró {_texto_desfase(minutos)} "
+            f"antes de llegar al sistema (venía sin conexión), así que quedó insertado en el "
+            f"pasado del historial, por detrás de "
+            f"{len(cerradas)} conteo{'s' if len(cerradas) > 1 else ''} que ya estaba"
+            f"{'n' if len(cerradas) > 1 else ''} cerrado{'s' if len(cerradas) > 1 else ''}. "
+            f"Esos conteos no se reabren y su ajuste sigue en pie, así que no hace falta que "
+            f"nadie revise nada ni cambia ningún resultado. Queda esta constancia para que el "
+            f"orden del historial sea explicable."
+        ),
+        realizado_por=None,     # lo escribió el sistema, no una persona
+    )
+    logger.info(
+        "Nota automática #%d: %s #%d llegó con %.0f min de desfase, por detrás de "
+        "%d conteo(s) ya cerrado(s) %s, y no afectó a ninguna diferencia pendiente. "
+        "Se registró la constancia; no se bloqueó nada.",
+        nota.pk, type(instance).__name__, instance.pk, minutos,
+        len(cerradas), [d.pk for d in cerradas],
+    )
+    return nota
+
+
+def _cerradas_alcanzadas_por(instance):
+    """
+    Discrepancias YA CERRADAS del producto que este movimiento deja
+    desactualizadas: las que anclan en el mismo instante o después, y a
+    las que este movimiento de verdad les mueve el teórico.
+
+    Solo lee y compara; no marca ni recalcula nada guardado — un conteo
+    cerrado no cambia, esa es justamente la premisa.
+    """
+    from .models import DiscrepanciaInventario
+
+    candidatas = (
+        DiscrepanciaInventario.objects
+        .filter(producto_id=instance.producto_id)
+        .exclude(estado=DiscrepanciaInventario.PENDIENTE)
+        .select_related("conteo", "producto")
+    )
+    alcanzadas = []
+    for discrepancia in candidatas:
+        conteo = discrepancia.conteo
+        if (conteo.fecha, conteo.ocurrido_en) < (instance.fecha, instance.ocurrido_en):
+            continue
+        teorico_ahora = conteo.producto.stock_teorico(
+            hasta_fecha=conteo.fecha, hasta_instante=conteo.ocurrido_en
+        )
+        if teorico_ahora == discrepancia.teorico_al_conteo:
+            continue
+        alcanzadas.append(discrepancia)
+    return alcanzadas
+
+
+def _texto_desfase(minutos):
+    """'unos 3 minutos' / 'unas 2 horas' — para que la nota se lea sola."""
+    if minutos < 60:
+        return f"unos {round(minutos)} minutos"
+    horas = minutos / 60
+    if horas < 24:
+        return f"unas {round(horas)} horas"
+    return f"unos {round(horas / 24)} días"
+
+
 @transaction.atomic
 def resolver_discrepancia(discrepancia, cantidad_ajuste, usuario, nota=""):
     """

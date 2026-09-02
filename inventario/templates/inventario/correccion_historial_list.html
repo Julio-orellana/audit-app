@@ -14,7 +14,15 @@
         <span class="badge-pill" style="background:{% if correccion.accion == 'eliminacion' %}var(--danger-bg){% else %}var(--accent-tint){% endif %};color:{% if correccion.accion == 'eliminacion' %}var(--danger-ink){% else %}var(--accent-dark){% endif %};">{{ correccion.get_accion_display }}</span>
         <strong style="margin-left:8px;">{{ correccion.tipo_registro }} #{{ correccion.registro_id }}</strong>
       </div>
-      <span style="color:var(--ink-faint);font-size:13px;">{{ correccion.fecha }} · {{ correccion.realizado_por.username|default:"(usuario eliminado)" }}</span>
+      {% comment %}
+        Una nota automática no la escribió nadie: realizado_por es null a
+        propósito. Sin este caso aparte se mostraba "(usuario eliminado)",
+        que además de ser falso le diría a quien audita que se borró una
+        cuenta — lo peor que puede sugerir una pantalla de auditoría.
+      {% endcomment %}
+      <span style="color:var(--ink-faint);font-size:13px;">{{ correccion.fecha }} ·
+        {% if correccion.accion == "nota" %}registrado por el sistema{% else %}{{ correccion.realizado_por.username|default:"(usuario eliminado)" }}{% endif %}
+      </span>
     </div>
     <p style="margin:0 0 12px;font-size:17px;"><strong>Motivo:</strong> {{ correccion.motivo }}</p>
 
@@ -35,6 +43,15 @@
           {% endfor %}
         </tbody>
       </table>
+    {% elif correccion.accion == "nota" %}
+      {% comment %}
+        Una nota no cambió ningún campo — decir "sin cambios detectados"
+        sonaría a que se intentó una corrección y falló. Se muestran los
+        dos instantes, que es de lo que trata la nota.
+      {% endcomment %}
+      <p style="margin:0;color:var(--ink-faint);font-size:13px;">
+        Ningún dato fue modificado: esta entrada solo deja constancia.
+      </p>
     {% else %}
       <p style="margin:0;color:var(--ink-faint);font-size:13px;">Sin cambios detectados en los campos guardados.</p>
     {% endif %}

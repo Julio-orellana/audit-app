@@ -110,6 +110,12 @@ class ProductoForm(forms.ModelForm):
         if self.instance.pk:
             queryset_base = queryset_base.exclude(pk=self.instance.pk)
         self.fields["producto_base"].queryset = queryset_base
+        # empty_label explícito (prompt 37): Django 6 estrenó la constante
+        # BLANK_CHOICE_LABEL y todavía no viene traducida al español, así
+        # que estos desplegables mostraban "- Select an option -" en
+        # inglés en medio de pantallas que están todas en español.
+        self.fields["categoria"].empty_label = "Selecciona una categoría"
+        self.fields["producto_base"].empty_label = "Ninguno — es un producto base"
 
 
 class LoteCompraForm(forms.ModelForm):
@@ -124,6 +130,11 @@ class LoteCompraForm(forms.ModelForm):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.fields["producto"].queryset = _queryset_producto_base_activo_o_actual(self.instance)
+        # empty_label explícito (prompt 37): Django 6 estrenó la constante
+        # BLANK_CHOICE_LABEL y todavía no viene traducida al español, así
+        # que estos desplegables mostraban "- Select an option -" en
+        # inglés en medio de pantallas que están todas en español.
+        self.fields["producto"].empty_label = "Selecciona un producto"
         # El selector ya oculta los derivados (ver el queryset de arriba),
         # pero si de todas formas llega uno en el POST (HTML manipulado a
         # mano, o un registro ya editado que apuntaba a un derivado desde
@@ -147,6 +158,10 @@ class MovimientoSalidaForm(forms.ModelForm):
     def __init__(self, *args, permitir_todos_los_tipos=True, **kwargs):
         super().__init__(*args, **kwargs)
         self.fields["producto"].queryset = _queryset_producto_activo_o_actual(self.instance)
+        # empty_label explícito (prompt 37): Django 6 estrenó la constante
+        # BLANK_CHOICE_LABEL y todavía no viene traducida al español, así
+        # que este desplegable mostraba "- Select an option -" en inglés.
+        self.fields["producto"].empty_label = "Selecciona un producto"
         self.permitir_todos_los_tipos = permitir_todos_los_tipos
         if not permitir_todos_los_tipos:
             # Un vendedor solo puede registrar ventas: se restringe la
@@ -232,6 +247,8 @@ class ConteoFisicoForm(forms.ModelForm):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.fields["producto"].queryset = _queryset_producto_base_activo_o_actual(self.instance)
+        # Ver el mismo comentario en LoteCompraForm.__init__ sobre empty_label.
+        self.fields["producto"].empty_label = "Selecciona un producto"
         # Ver el mismo comentario en LoteCompraForm.__init__ — mensaje
         # claro (prompt 28b, punto 1) incluso si un derivado llega en el
         # POST más allá de lo que ya oculta el selector.
@@ -247,6 +264,12 @@ class HistorialFiltroForm(forms.Form):
     producto = forms.ModelChoiceField(
         queryset=Producto.objects.all(),
         required=False,
+        # empty_label explícito (prompt 37): sin esto Django pone su
+        # texto por defecto, que sale en INGLÉS ("- Select an option -")
+        # en medio de una pantalla enteramente en español. Los otros dos
+        # filtros ya decían "Todos los tipos" / "Todos los usuarios";
+        # este se había quedado atrás.
+        empty_label="Todos los productos",
         widget=forms.Select(attrs={"class": "form-select"}),
     )
     # ChoiceField llano, no ModelChoiceField (prompt 35): sin conexión no

@@ -251,6 +251,23 @@ def _interpretar_url_de_nube(url):
         return None, f"DATABASE_URL no apunta a PostgreSQL (motor detectado: {motor or 'ninguno'})"
     if not cfg.get("HOST") or not cfg.get("NAME"):
         return None, "DATABASE_URL no incluye host y/o nombre de base de datos"
+
+    # TLS es obligatorio (ssl_require=True arriba) y así se queda para
+    # cualquier host remoto: Neon lo exige y una conexión sin cifrar a
+    # través de internet expondría las credenciales.
+    #
+    # La única excepción es un Postgres corriendo en esta misma máquina,
+    # que por omisión no habla SSL: sin esto no había forma de correr la
+    # regresión contra Postgres de verdad en local, y quedaba la
+    # disyuntiva de probar contra SQLite (que no reproduce el motor real)
+    # o contra Neon (que cuesta y toca datos que no son de prueba).
+    # Se exige que las DOS cosas se cumplan —host local Y sslmode=disable
+    # escrito a mano en la URL— para que un sslmode=disable copiado por
+    # error a una URL de producción no baje el cifrado en silencio.
+    host = (cfg.get("HOST") or "").lower()
+    if host in ("localhost", "127.0.0.1", "::1") and "sslmode=disable" in str(url).lower():
+        cfg.setdefault("OPTIONS", {})["sslmode"] = "disable"
+
     return cfg, None
 
 
