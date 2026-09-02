@@ -5,6 +5,12 @@ prompt 37 y lo que el prompt pide verificar en la VM. Las pruebas del
 motor offline en profundidad siguen en `checklist_pruebas_manuales_windows.md`
 y las del navbar en `checklist_pruebas_navbar_windows.md`.
 
+> **El sistema está vacío desde la limpieza del prompt 31.** No hay
+> productos ni movimientos: solo las 3 categorías, los usuarios y la
+> configuración. Para las pruebas 6, 7 y 8 tendrás que **crear un par de
+> productos primero** (Productos → Nuevo). Eso también sirve para
+> comprobar que la pantalla de alta funciona en el build final.
+
 ## Antes de empezar
 
 1. En la VM, dentro de la carpeta del proyecto:
@@ -92,8 +98,8 @@ Como Ruth, en Historial:
 
 - El desplegable de **Producto** debe decir "Todos los productos" en
   español, no "- Select an option -".
-- Filtra por **Tipo → "Nota automática del sistema"**. Puede que no haya
-  ninguna todavía: eso es correcto y esperado. Lo que importa es que la
+- Filtra por **Tipo → "Nota automática del sistema"**. No habrá ninguna:
+  el historial está vacío tras la limpieza. Eso es correcto y esperado. Lo que importa es que la
   opción exista en la lista y que filtrar no dé error.
 - Los formularios de Registrar entrada / salida / conteo físico deben
   decir **"Selecciona un producto"**, también en español.
@@ -110,7 +116,9 @@ Como Ruth, en Historial:
 
 Con internet, como Ruth:
 
-1. Registra un conteo físico de un producto con una cantidad distinta a
+0. Si todavía no lo hiciste, crea un producto y regístrale una entrada
+   (Registrar entrada) para que tenga stock.
+1. Registra un conteo físico de ese producto con una cantidad distinta a
    la que dice el sistema.
 2. Debe aparecer en el tablero, en **"Requieren atención"**, y en la
    pantalla de **Diferencias**.
@@ -129,12 +137,20 @@ Con internet, como Ruth:
 - Captura de la pantalla de inicio de **Ventas** (punto 3).
 - Si algo falla, el `diagnostico.log` que queda junto al `.exe`.
 
-## Pendiente de decidir (no es una prueba)
+## Ya resuelto
 
-En Neon hay **9 conteos con diferencia y ningún registro de
-discrepancia**: son anteriores al prompt 34 y por eso el tablero no
-avisa de ellos. Hay un comando listo y probado para registrarlos
-(`manage.py registrar_discrepancias_faltantes`, con `--dry-run` para ver
-qué haría sin escribir). **No se ha ejecutado.** Tiene sentido decidirlo
-después de la limpieza de datos del prompt 31, que podría llevarse esos
-mismos conteos por delante.
+Los 9 conteos sin registro de discrepancia desaparecieron con la
+limpieza del prompt 31: se borraron junto con el resto de movimientos de
+prueba. El comando `registrar_discrepancias_faltantes` queda en el
+proyecto por si alguna vez vuelve a hacer falta, pero ahora mismo no hay
+nada que rellenar.
+
+## Lo primero que tiene que hacer Ruth al recibirlo
+
+Crear el catálogo: los 25 productos que había eran de prueba y se
+borraron a petición. Las 3 categorías (Cervezas, Cubetazos, Gaseosas)
+siguen ahí. Ojo con los 6 cubetazos y "Sprite colaboradores": son
+productos **derivados**, hay que crearlos indicando su producto base y su
+factor de equivalencia (por ejemplo, Cubeta normal gallo = Gallo x7).
+Si hiciera falta consultar los valores anteriores, están en el respaldo
+`~/Desktop/respaldo-ANTES-DE-LIMPIEZA-FINAL-2026-09-01/`.
