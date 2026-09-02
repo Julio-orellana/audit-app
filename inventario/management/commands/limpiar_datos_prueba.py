@@ -20,7 +20,7 @@ from django.core.management.base import BaseCommand
 from django.db import transaction
 
 from inventario.models import (
-    ConteoFisico, CorreccionHistorial, DiscrepanciaInventario, LoteCompra,
+    Categoria, ConteoFisico, CorreccionHistorial, DiscrepanciaInventario, LoteCompra,
     MovimientoSalida, Producto,
 )
 from seguridad_entorno_pruebas import EntornoNoSeguroError, confirmar_operacion_riesgosa
@@ -39,6 +39,15 @@ LISTA_BLANCA = (
     ("CorreccionHistorial", CorreccionHistorial),
 )
 
+# Producto sale de aquí SOLO si se pasa --borrar-productos (prompt 31 lo
+# tenía como intocable; el usuario pidió después vaciar el catálogo
+# dejando las categorías). Nunca por omisión.
+#
+# Todas las claves foráneas hacia Producto son PROTECT, no CASCADE: si
+# quedara un solo movimiento apuntando a un producto, la base RECHAZA el
+# borrado en vez de arrastrarlo en silencio. Eso vuelve imposible perder
+# datos por orden equivocado, y obliga a borrar primero los movimientos.
+#
 # Se cuentan antes y después para dejar constancia de que NO cambiaron.
 # Nunca se escriben; están aquí solo como evidencia (prompt 31, punto 0).
 LISTA_NEGRA_SQL = (
@@ -73,6 +82,11 @@ class Command(BaseCommand):
 
     def add_arguments(self, parser):
         parser.add_argument(
+            "--borrar-productos", action="store_true", dest="borrar_productos",
+            help=("Además, vacía el catálogo de Producto (las Categoria se conservan). "
+                  "Fuera de lo normal: por omisión el catálogo NO se toca."),
+        )
+        parser.add_argument(
             "--dry-run", action="store_true", dest="dry_run",
             help="Solo cuenta y lista lo que se borraría. No escribe absolutamente nada.",
         )
@@ -84,8 +98,14 @@ class Command(BaseCommand):
     def handle(self, *args, **options):
         from django.db import connection
 
+        borrar_productos = options["borrar_productos"]
         antes_blanca = {nombre: modelo.objects.count() for nombre, modelo in LISTA_BLANCA}
         antes_negra = _conteo_lista_negra()
+        # Los derivados apuntan a su producto base con PROTECT, así que se
+        # borran primero; si no, la base rechazaría el borrado del base.
+        derivados = Producto.objects.filter(producto_base__isnull=False)
+        bases = Producto.objects.filter(producto_base__isnull=True)
+        n_derivados, n_bases = derivados.count(), bases.count()
 
         self.stdout.write("")
         self.stdout.write(f"  Base de datos: {connection.settings_dict.get('NAME')}")
@@ -95,6 +115,12 @@ class Command(BaseCommand):
         for nombre, _ in LISTA_BLANCA:
             self.stdout.write(f"    {nombre:26} {antes_blanca[nombre]:>5}")
         self.stdout.write(f"    {'TOTAL':26} {sum(antes_blanca.values()):>5}")
+        if borrar_productos:
+            self.stdout.write("")
+            self.stdout.write("  CATÁLOGO — se borraría también (--borrar-productos):")
+            self.stdout.write(f"    {'Producto (derivados)':26} {n_derivados:>5}")
+            self.stdout.write(f"    {'Producto (base)':26} {n_bases:>5}")
+            self.stdout.write(f"    {'Categoria':26} {'0':>5}   (se conservan todas)")
         self.stdout.write("")
         self.stdout.write("  LISTA NEGRA — no se tocan (se vuelven a contar al final):")
         for tabla, n in antes_negra.items():
@@ -125,9 +151,14 @@ class Command(BaseCommand):
         with transaction.atomic():
             for nombre, modelo in LISTA_BLANCA:
                 borradas[nombre] = modelo.objects.all().delete()[0]
+            if borrar_productos:
+                # Dentro de la MISMA transacción: si el catálogo fallara,
+                # tampoco se pierden los movimientos.
+                borradas["Producto (derivados)"] = derivados.delete()[0]
+                borradas["Producto (base)"] = bases.delete()[0]
 
         self.stdout.write(self.style.SUCCESS("Eliminados:"))
-        for nombre, _ in LISTA_BLANCA:
+        for nombre in borradas:
             self.stdout.write(f"    {nombre:26} {borradas[nombre]:>5}")
 
         # Verificación: sin compras ni salidas, stock_teorico() debe dar 0 para
@@ -136,7 +167,14 @@ class Command(BaseCommand):
         productos = list(Producto.objects.all())
         con_stock_residual = [p for p in productos if p.stock_teorico() != 0]
 
-        if con_stock_residual:
+        if borrar_productos and not productos:
+            # Con el catálogo vacío no hay stock que comprobar: el mensaje
+            # de "todos en cero" sonaría a que se verificó algo.
+            self.stdout.write(self.style.SUCCESS(
+                f"Catálogo VACIADO a petición: no queda ningún producto. Se conservan "
+                f"las {Categoria.objects.count()} categoría(s)."
+            ))
+        elif con_stock_residual:
             detalle = ", ".join(f"{p.nombre} ({p.stock_teorico()})" for p in con_stock_residual)
             self.stderr.write(self.style.ERROR(
                 f"ADVERTENCIA: {len(con_stock_residual)} producto(s) NO quedaron en stock 0: {detalle}"
@@ -147,19 +185,27 @@ class Command(BaseCommand):
                 f"stock_teorico() = 0."
             ))
 
-        self.stdout.write(self.style.SUCCESS(
-            f"Catálogo conservado sin cambios: {Producto.objects.count()} productos en "
-            f"{Producto.objects.values('categoria').distinct().count()} categoría(s) con productos."
-        ))
+        if not borrar_productos:
+            self.stdout.write(self.style.SUCCESS(
+                f"Catálogo conservado sin cambios: {Producto.objects.count()} productos en "
+                f"{Producto.objects.values('categoria').distinct().count()} categoría(s) con productos."
+            ))
 
         # Evidencia final: ninguna tabla intocable cambió de tamaño.
         despues_negra = _conteo_lista_negra()
+        esperadas = {"inventario_producto"} if borrar_productos else set()
         cambiadas = {t: (antes_negra[t], despues_negra[t])
-                     for t in LISTA_NEGRA_SQL if antes_negra[t] != despues_negra[t]}
+                     for t in LISTA_NEGRA_SQL
+                     if antes_negra[t] != despues_negra[t] and t not in esperadas}
         self.stdout.write("")
         self.stdout.write("  LISTA NEGRA — antes / después:")
         for tabla in LISTA_NEGRA_SQL:
-            igual = "OK" if antes_negra[tabla] == despues_negra[tabla] else "*** CAMBIÓ ***"
+            if antes_negra[tabla] == despues_negra[tabla]:
+                igual = "OK"
+            elif tabla in esperadas:
+                igual = "vaciado a propósito (--borrar-productos)"
+            else:
+                igual = "*** CAMBIÓ ***"
             self.stdout.write(f"    {tabla:36} {antes_negra[tabla]:>5} -> {despues_negra[tabla]:>5}  {igual}")
         if cambiadas:
             self.stderr.write(self.style.ERROR(f"\nADVERTENCIA: cambiaron tablas intocables: {cambiadas}"))
